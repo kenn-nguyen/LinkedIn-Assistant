@@ -57,15 +57,23 @@
   }
 
   function isGenerating() {
+    const directStopButton = document.querySelector(
+      "button[data-testid='stop-button'], button[aria-label*='Stop generating' i], button[aria-label*='Stop streaming' i]"
+    );
+    if (directStopButton) {
+      return true;
+    }
+
     return Boolean(
       queryButtons().find((button) => {
         const label = normalizeWhitespace(
           button.getAttribute("aria-label") ||
+          button.getAttribute("data-testid") ||
           button.innerText ||
           button.textContent ||
           ""
         );
-        return /stop|cancel/i.test(label);
+        return /^(stop generating|stop streaming|stop)$/i.test(label);
       })
     );
   }

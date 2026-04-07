@@ -1,5 +1,6 @@
 (function initLinkedInContent() {
   const shared = globalThis.LinkedInAssistantShared;
+  const linkedInCommands = globalThis.LinkedInAssistantLinkedInCommands;
   const { MESSAGE_TYPES, firstNameFromFullName, normalizeLinkedInProfileUrl, normalizeWhitespace, truncate, uniqueStrings } = shared;
   const PROFILE_SECTION_PATTERNS = [
     /^about$/i,
@@ -31,6 +32,11 @@
     return style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0;
   }
 
+  function allowHiddenMessagingDomRead() {
+    return /\/preload\/?$/i.test(normalizeWhitespace(window.location.pathname || ""))
+      || Boolean(document.querySelector("[data-view-name='message-overlay-conversation-bubble-item'], [data-msg-overlay-conversation-bubble-open], .msg-overlay-conversation-bubble, .msg-s-message-list-content"));
+  }
+
   function queryVisible(selector) {
     return Array.from(document.querySelectorAll(selector)).find(isVisible) || null;
   }
@@ -40,18 +46,45 @@
   }
 
   function queryVisibleWithin(root, selector) {
+    if (allowHiddenMessagingDomRead()) {
+      return queryFirstWithin(root, selector);
+    }
     return Array.from((root || document).querySelectorAll(selector)).find(isVisible) || null;
   }
 
+  function queryFirstWithin(root, selector) {
+    const scope = root || document;
+    if (!scope || typeof scope.querySelector !== "function") {
+      return null;
+    }
+    return scope.querySelector(selector);
+  }
+
+  function queryFirst(selectors, root) {
+    for (const selector of selectors) {
+      const match = queryFirstWithin(root || document, selector);
+      if (match) {
+        return match;
+      }
+    }
+    return null;
+  }
+
   function visibleText(element) {
-    if (!element || !isVisible(element)) {
+    if (!element) {
+      return "";
+    }
+    if (!isVisible(element) && !allowHiddenMessagingDomRead()) {
       return "";
     }
     return normalizeWhitespace(element.innerText || element.textContent || "");
   }
 
   function visibleMultilineText(element) {
-    if (!element || !isVisible(element)) {
+    if (!element) {
+      return "";
+    }
+    if (!isVisible(element) && !allowHiddenMessagingDomRead()) {
       return "";
     }
     return String(element.innerText || element.textContent || "")
@@ -246,7 +279,16 @@
       "main .scaffold-layout__detail .msg-thread",
       "main .scaffold-layout__detail .msg-convo-wrapper",
       "main .msg-s-message-list-container"
-    ], main));
+    ], main)) || Boolean(queryFirst([
+      ".msg-overlay-bubble",
+      ".msg-overlay-bubble__content",
+      ".msg-overlay-conversation-bubble__content-wrapper",
+      ".msg-overlay-bubble-header",
+      ".msg-overlay-conversation-bubble",
+      "[data-view-name='message-overlay-conversation-bubble-item']",
+      ".msg-s-message-list-container",
+      ".msg-s-message-list-content"
+    ], document));
   }
 
   function isSupportedMessagingPage() {
@@ -1016,95 +1058,7 @@
   }
 
   function extractSelfProfile() {
-    if (!isSupportedProfilePage()) {
-      return {
-        supported: false,
-        pageType: "unsupported",
-        pageUrl: window.location.href,
-        title: document.title
-      };
-    }
-
-    const root = getProfileRoot();
-    const profileColumn = queryVisibleWithin(
-      document,
-      ".scaffold-layout__main, .scaffold-layout__content, main"
-    ) || root;
-    const topCard = locateProfileTopCard(profileColumn) || root;
-    const topCardIdentity = extractTopCardIdentity(profileColumn);
-    const headingName = visibleText(findVisibleProfileHeading(topCard) || findVisibleProfileHeading(profileColumn) || queryVisibleWithin(topCard, "h1, h2") || queryVisibleWithin(profileColumn, "h1, h2"));
-    const titleName = normalizeProfileTitleName();
-    const fallbackSlugName = fallbackNameFromProfileUrl();
-    const name = headingName || topCardIdentity.name || titleName || fallbackSlugName;
-    const headline = visibleText(
-      queryVisibleWithin(topCard, ".text-body-medium.break-words") ||
-      queryVisibleWithin(profileColumn, ".text-body-medium.break-words") ||
-      queryVisibleWithin(profileColumn, ".pv-text-details__left-panel .text-body-medium")
-    ) || topCardIdentity.headline || extractHeadlineNearHeading(profileColumn);
-    const location = visibleText(
-      queryVisibleWithin(topCard, ".text-body-small.inline.t-black--light.break-words") ||
-      queryVisibleWithin(profileColumn, ".text-body-small.inline.t-black--light.break-words") ||
-      queryVisibleWithin(profileColumn, ".pv-text-details__left-panel .text-body-small")
-    ) || topCardIdentity.location;
-    const topCardSnapshot = extractTopCardSnapshot(profileColumn);
-    const activitySnippets = extractActivitySnippets(3, name);
-    const sectionSnapshots = getProfileSections(profileColumn)
-      .map((section) => {
-        const heading = sectionHeadingText(section);
-        if (!heading) {
-          return "";
-        }
-        if (/^(activity|featured|posts?)$/i.test(heading)) {
-          const items = activitySnippets;
-          return items.length ? `Activity: ${items.join(" | ")}` : "";
-        }
-        const body = sectionText(section, sectionSnapshotLimit(heading));
-        return body ? `${heading}: ${body}` : "";
-      })
-      .filter(Boolean);
-    const rawSnapshot = truncate(uniqueStrings([
-      topCardSnapshot,
-      ...sectionSnapshots
-    ]).join("\n\n"), 18000);
-    const connectionStatus = detectConnectionStatus(root);
-    const profileSummary = buildProfileSummary({
-      headline,
-      location,
-      about: "",
-      experienceHighlights: [],
-      educationHighlights: [],
-      activitySnippets: [],
-      languageSnippets: []
-    });
-
-    return {
-      supported: Boolean(rawSnapshot && rawSnapshot.length > 120),
-      pageType: "linkedin-profile",
-      pageUrl: window.location.href,
-      title: document.title,
-      reason: rawSnapshot && rawSnapshot.length > 120 ? "" : "Loading profile...",
-      profile: {
-        firstName: firstNameFromFullName(name),
-        fullName: name,
-        profileUrl: normalizeLinkedInProfileUrl(window.location.href) || window.location.href,
-        headline,
-        profileSummary,
-        about: "",
-        location,
-        connectionStatus,
-        experienceHighlights: [],
-        educationHighlights: [],
-        activitySnippets: [],
-        languageSnippets: [],
-        visibleSignals: {
-          companies: [],
-          schools: [],
-          locations: uniqueStrings([location]).slice(0, 3),
-          languages: []
-        },
-        rawSnapshot
-      }
-    };
+    return extractProfile();
   }
 
   function buildMyProfileDraft(profile) {
@@ -1112,6 +1066,367 @@
       manualNotes: "",
       rawSnapshot: profile.rawSnapshot,
       updatedAt: ""
+    };
+  }
+
+  function findProfileMessageAction() {
+    const actionRoot = queryAny([
+      ".pv-top-card-v2-ctas",
+      ".pvs-profile-actions",
+      ".pv-s-profile-actions",
+      "main"
+    ], document) || document;
+    const candidates = Array.from(actionRoot.querySelectorAll("button, a, [role='button']"))
+      .filter(isVisible);
+
+    return candidates.find((node) => {
+      const text = normalizeWhitespace([
+        node.innerText || node.textContent || "",
+        node.getAttribute?.("aria-label") || "",
+        node.getAttribute?.("data-control-name") || ""
+      ].join(" "));
+      return Boolean(text) && /\bmessage\b/i.test(text) && !/\bcompose message\b/i.test(text);
+    }) || null;
+  }
+
+  function hasMessagingOverlaySurface() {
+    return Boolean(queryFirst([
+      ".msg-overlay-bubble",
+      ".msg-overlay-bubble__content",
+      ".msg-overlay-conversation-bubble",
+      ".msg-overlay-conversation-bubble-header",
+      ".msg-overlay-conversation-bubble__content-wrapper",
+      "[data-msg-overlay-conversation-bubble-open]",
+      "[data-view-name='message-overlay-conversation-bubble-item']",
+      ".msg-s-message-list-container",
+      ".msg-s-message-list-content",
+      ".msg-form__contenteditable",
+      ".msg-form__msg-content-container"
+    ], document));
+  }
+
+  function messagingSurfaceSnapshot() {
+    const overlayRoot = queryFirst([
+      "[data-view-name='message-overlay-conversation-bubble-item']",
+      "[data-msg-overlay-conversation-bubble-open]",
+      ".msg-convo-wrapper.msg-overlay-conversation-bubble",
+      ".msg-overlay-conversation-bubble--is-active",
+      ".msg-overlay-conversation-bubble",
+      ".msg-overlay-bubble"
+    ], document);
+    const messageListRoot = queryFirst([
+      ".msg-s-message-list-content",
+      ".msg-s-message-list-container",
+      ".msg-s-message-list"
+    ], overlayRoot || document);
+    const eventNodes = Array.from((messageListRoot || overlayRoot || document).querySelectorAll(
+      ".msg-s-message-list__event, [data-event-urn], .msg-s-event-listitem"
+    ));
+    const composerVisible = Boolean(queryFirst([
+      ".msg-form__contenteditable",
+      ".msg-form__msg-content-container"
+    ], overlayRoot || document));
+    return {
+      href: normalizeWhitespace(window.location.href),
+      overlayPresent: Boolean(overlayRoot),
+      messageListPresent: Boolean(messageListRoot),
+      eventCount: eventNodes.length,
+      composerVisible
+    };
+  }
+
+  async function waitForMessagingSurfaceAfterClick(timeoutMs) {
+    const startedAt = nowMs();
+    const snapshots = [];
+
+    function captureSnapshot(label) {
+      const snapshot = {
+        label,
+        elapsedMs: roundMs(nowMs() - startedAt),
+        ...messagingSurfaceSnapshot()
+      };
+      snapshots.push(snapshot);
+      return snapshot;
+    }
+
+    const initial = captureSnapshot("initial");
+    if (initial.overlayPresent || initial.messageListPresent || initial.composerVisible) {
+      return { snapshot: initial, snapshots };
+    }
+
+    return new Promise((resolve) => {
+      let resolved = false;
+      const finish = (label) => {
+        if (resolved) {
+          return;
+        }
+        resolved = true;
+        observer.disconnect();
+        window.clearTimeout(timerId);
+        resolve({
+          snapshot: captureSnapshot(label),
+          snapshots
+        });
+      };
+      const observer = new MutationObserver(() => {
+        const next = captureSnapshot("mutation");
+        if (next.overlayPresent || next.messageListPresent || next.composerVisible) {
+          finish("detected");
+        }
+      });
+      observer.observe(document.documentElement || document.body || document, {
+        childList: true,
+        subtree: true,
+        attributes: true
+      });
+      const timerId = window.setTimeout(() => finish("timeout"), timeoutMs);
+    });
+  }
+
+  function openMessagesFromCurrentProfile() {
+    if (!isSupportedProfilePage()) {
+      return {
+        ok: false,
+        error: "Open the recipient's LinkedIn profile before opening messages."
+      };
+    }
+    const action = findProfileMessageAction();
+    if (!action) {
+      return {
+        ok: false,
+        error: "Could not find LinkedIn's Message button on this profile."
+      };
+    }
+    action.click();
+    return {
+      ok: true,
+      actionHref: normalizeWhitespace(action.href || action.getAttribute?.("href") || ""),
+      actionText: normalizeWhitespace(
+        action.getAttribute?.("aria-label")
+        || action.innerText
+        || action.textContent
+        || "Message"
+      )
+    };
+  }
+
+  async function openMessagesFromCurrentProfileAndWait() {
+    const clicked = openMessagesFromCurrentProfile();
+    if (!clicked?.ok) {
+      return clicked;
+    }
+
+    const waitResult = await waitForMessagingSurfaceAfterClick(8000);
+    const workspaceContext = linkedInCommands.extractWorkspaceContext(buildLinkedInCommandDeps());
+    const visibleMessageCount = Array.isArray(workspaceContext?.conversation?.allVisibleMessages)
+      ? workspaceContext.conversation.allVisibleMessages.length
+      : Array.isArray(workspaceContext?.conversation?.recentMessages)
+        ? workspaceContext.conversation.recentMessages.length
+        : 0;
+    const composeVisible = hasMessagingOverlaySurface();
+    const extractedMessaging = workspaceContext?.pageType === "linkedin-messaging";
+    const attempts = (waitResult?.snapshots || []).map((snapshot) => ({
+      label: snapshot.label,
+      elapsedMs: snapshot.elapsedMs,
+      href: snapshot.href,
+      overlayPresent: snapshot.overlayPresent,
+      messageListPresent: snapshot.messageListPresent,
+      eventCount: snapshot.eventCount,
+      composerVisible: snapshot.composerVisible
+    }));
+    if (extractedMessaging || composeVisible || waitResult?.snapshot?.eventCount > 0) {
+        return {
+          ok: true,
+          actionHref: clicked.actionHref || "",
+          actionText: clicked.actionText,
+          surfaceResult: extractedMessaging
+            ? (visibleMessageCount > 0 ? "thread_visible" : "messaging_surface_no_messages")
+            : (waitResult?.snapshot?.eventCount > 0 || composeVisible ? "compose_overlay_visible" : "no_surface_detected"),
+        workspaceContext: extractedMessaging ? workspaceContext : null,
+        debug: {
+          attempts,
+          finalHref: normalizeWhitespace(window.location.href),
+          finalComposeVisible: composeVisible,
+          finalExtractedPageType: normalizeWhitespace(workspaceContext?.pageType || ""),
+          finalVisibleMessageCount: visibleMessageCount,
+          finalOverlayPresent: Boolean(waitResult?.snapshot?.overlayPresent),
+          finalMessageListPresent: Boolean(waitResult?.snapshot?.messageListPresent),
+          finalEventCount: Number(waitResult?.snapshot?.eventCount || 0)
+        }
+      };
+    }
+
+    return {
+      ok: true,
+      actionHref: clicked.actionHref || "",
+      actionText: clicked.actionText,
+      surfaceResult: "no_surface_detected",
+      workspaceContext: null,
+      debug: {
+        attempts,
+        finalHref: normalizeWhitespace(window.location.href),
+        finalComposeVisible: hasMessagingOverlaySurface(),
+        finalExtractedPageType: isSupportedMessagingPage() ? "linkedin-messaging" : "linkedin-profile",
+        finalVisibleMessageCount: 0,
+        finalOverlayPresent: false,
+        finalMessageListPresent: false,
+        finalEventCount: 0
+      }
+    };
+  }
+
+  function extractOpenMessageBubbleWorkspace() {
+    const overlayRoot = queryFirst([
+      "[data-view-name='message-overlay-conversation-bubble-item']",
+      "[data-msg-overlay-conversation-bubble-open]",
+      ".msg-overlay-conversation-bubble",
+      ".msg-overlay-bubble",
+      ".relative.display-flex.flex-column.flex-grow-1"
+    ], document);
+    const contentWrapper = queryFirst([
+      ".msg-overlay-conversation-bubble__content-wrapper"
+    ], overlayRoot || document);
+    const messageList = queryFirst([
+      ".msg-s-message-list-content",
+      ".msg-s-message-list-container",
+      ".msg-s-message-list"
+    ], contentWrapper || overlayRoot || document);
+    const messageNodes = Array.from((contentWrapper || messageList || document).querySelectorAll(
+      "[data-event-urn], .msg-s-event-listitem, .msg-s-message-list__event"
+    ));
+    const header = queryFirst([
+      ".msg-overlay-conversation-bubble-header",
+      ".msg-overlay-bubble-header"
+    ], overlayRoot || document);
+    const profileCard = queryFirst([
+      ".msg-s-profile-card",
+      ".msg-s-profile-card-one-to-one"
+    ], overlayRoot || document);
+    const profileAnchor = queryFirst([
+      "a[href*='/in/']"
+    ], header || profileCard || overlayRoot || document);
+    const fullName = normalizeWhitespace(
+      visibleText(queryFirst([
+        ".msg-overlay-bubble-header__title .hoverable-link-text",
+        ".msg-overlay-bubble-header__title",
+        "h1",
+        "h2",
+        "h3"
+      ], header || overlayRoot))
+      || visibleText(queryFirst([
+        ".profile-card-one-to-one__profile-link",
+        ".artdeco-entity-lockup__title a",
+        ".truncate"
+      ], profileCard || overlayRoot))
+      || profileAnchor?.getAttribute("title")
+      || profileAnchor?.getAttribute("aria-label")
+      || profileAnchor?.querySelector("img[alt]")?.getAttribute("alt")
+    ).replace(/\s+Profile$/i, "");
+    const headline = visibleText(queryFirst([
+      ".artdeco-entity-lockup__subtitle",
+      ".msg-thread__entity-lockup__subtitle",
+      ".t-14"
+    ], profileCard || header || overlayRoot));
+    const profileUrl = normalizeLinkedInProfileUrl(profileAnchor?.href || "") || normalizeWhitespace(profileAnchor?.href || "");
+    const connectionStatusText = visibleText(profileCard);
+
+    function inferDatePrefix(label) {
+      const now = new Date();
+      now.setSeconds(0, 0);
+      const normalized = normalizeWhitespace(label).toLowerCase();
+      if (!normalized) {
+        return "";
+      }
+      if (normalized === "today") {
+        return now.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
+      }
+      if (normalized === "yesterday") {
+        now.setDate(now.getDate() - 1);
+        return now.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
+      }
+      const weekdays = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"];
+      const weekdayIndex = weekdays.indexOf(normalized);
+      if (weekdayIndex >= 0) {
+        const daysBack = (now.getDay() - weekdayIndex + 7) % 7;
+        now.setDate(now.getDate() - daysBack);
+        return now.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
+      }
+      const parsed = new Date(normalized);
+      if (!Number.isNaN(parsed.getTime())) {
+        return parsed.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
+      }
+      return normalizeWhitespace(label);
+    }
+
+    const chronologicalMessages = messageNodes
+      .map((node) => {
+        const container = node.closest(".msg-s-message-list__event, li, article") || node.parentElement || node;
+        const dateLabel = visibleText(queryFirst([".msg-s-message-list__time-heading"], container));
+        const timeText = visibleText(queryFirst([".msg-s-message-group__timestamp"], node))
+          || normalizeWhitespace(queryFirst([
+            ".msg-s-event-with-indicator__sending-indicator[title]",
+            "[data-test-msg-cross-pillar-message-sending-indicator-presenter__container][title]"
+          ], node)?.getAttribute("title") || "").replace(/^sent at\s*/i, "");
+        const sender = normalizeWhitespace(
+          visibleText(queryFirst([".msg-s-message-group__name"], node))
+          || node.querySelector("img[alt]")?.getAttribute("alt")
+        ).replace(/\s+Profile$/i, "");
+        const body = normalizeWhitespace(
+          Array.from(node.querySelectorAll(".msg-s-event-listitem__body"))
+            .map((element) => element.innerText || element.textContent || "")
+            .join("\n\n")
+        );
+        const attachmentNames = Array.from(node.querySelectorAll(".ui-attachment__filename"))
+          .map((element) => normalizeWhitespace(element.innerText || element.textContent || ""))
+          .filter(Boolean);
+        const text = normalizeWhitespace([body, ...attachmentNames.map((name) => `Attachment: ${name}`)].filter(Boolean).join("\n\n"));
+        const timestamp = dateLabel && timeText ? `${inferDatePrefix(dateLabel)} ${timeText}` : timeText;
+        return {
+          sender,
+          text,
+          timestamp: normalizeWhitespace(timestamp)
+        };
+      })
+      .filter((entry) => entry.sender && entry.text);
+
+    const latestFirstMessages = chronologicalMessages.slice().reverse();
+    const lastEntry = latestFirstMessages[0] || null;
+    const connectionStatus = /\b1st\b|\b1st degree connection\b/i.test(connectionStatusText) ? "connected" : "unknown";
+    const rawThreadText = chronologicalMessages.map((entry) => `${entry.sender}: ${entry.text}`).join("\n");
+
+    return {
+      supported: Boolean(fullName && profileUrl),
+      pageType: "linkedin-messaging",
+      pageUrl: normalizeLinkedInProfileUrl(window.location.href) || window.location.href,
+      title: document.title,
+      reason: fullName && profileUrl ? "" : "Loading selected conversation...",
+      person: linkedInCommands.buildPersonIdentity({
+        firstName: firstNameFromFullName(fullName),
+        fullName,
+        profileUrl,
+        messagingThreadUrl: "",
+        headline,
+        location: "",
+        connectionStatus,
+        profileSummary: headline,
+        rawSnapshot: normalizeWhitespace([fullName, headline].filter(Boolean).join("\n"))
+      }),
+      conversation: {
+        recipientName: fullName,
+        threadUrl: "",
+        recentMessages: latestFirstMessages.slice(0, 8),
+        allVisibleMessages: latestFirstMessages,
+        lastSpeaker: normalizeWhitespace(lastEntry?.sender),
+        lastMessageAt: normalizeWhitespace(lastEntry?.timestamp),
+        rawThreadText: normalizeWhitespace(rawThreadText)
+      },
+      debug: {
+        bubble_workspace_overlay_present: Boolean(overlayRoot),
+        bubble_workspace_content_wrapper_present: Boolean(contentWrapper),
+        bubble_workspace_message_list_present: Boolean(messageList),
+        bubble_workspace_message_node_count: messageNodes.length,
+        bubble_workspace_message_count: latestFirstMessages.length
+      }
     };
   }
 
@@ -1604,17 +1919,23 @@
 
   function extractConversationMessageNodes(conversationRoot) {
     const root = conversationRoot || document;
-    const groups = Array.from(root.querySelectorAll(
+    const allGroups = Array.from(root.querySelectorAll(
       ".msg-s-message-group, .msg-s-event-listitem, li[data-event-urn], div[data-event-urn], article"
-    )).filter(isVisible);
+    ));
+    const groups = allowHiddenMessagingDomRead()
+      ? allGroups
+      : allGroups.filter(isVisible);
 
     const nodes = [];
     const seen = new Set();
 
     for (const group of groups) {
-      const bubbleNodes = Array.from(group.querySelectorAll(
+      const allBubbleNodes = Array.from(group.querySelectorAll(
         ".msg-s-message-group__message-bubble, .msg-s-message-group__msg-content, .msg-s-event-listitem__message-bubble, .msg-s-event-with-indicator"
-      )).filter(isVisible);
+      ));
+      const bubbleNodes = allowHiddenMessagingDomRead()
+        ? allBubbleNodes
+        : allBubbleNodes.filter(isVisible);
 
       if (bubbleNodes.length) {
         bubbleNodes.forEach((node) => {
@@ -1638,7 +1959,7 @@
 
     return Array.from(root.querySelectorAll(
       ".msg-s-event-listitem__message-bubble, .msg-s-event-with-indicator, .msg-s-event-listitem__body, .msg-s-message-group__message-bubble, .msg-s-message-group__msg-content, .msg-s-event-listitem, li[data-event-urn], div[data-event-urn], article"
-    )).filter(isVisible).map((node) => ({ node, contextNode: node }));
+    )).filter((node) => allowHiddenMessagingDomRead() || isVisible(node)).map((node) => ({ node, contextNode: node }));
   }
 
   function extractMessageBodyText(node) {
@@ -1729,305 +2050,39 @@
     };
   }
 
-  function extractMessagingContext() {
-    if (!isSupportedMessagingPage()) {
-      return {
-        supported: false,
-        pageType: "unsupported",
-        pageUrl: window.location.href,
-        title: document.title
-      };
-    }
-
-    const messagingRoot = document.querySelector("main") || document;
-    const detailRoot = queryAny([
-      ".scaffold-layout__detail .msg-convo-wrapper",
-      ".scaffold-layout__detail .msg-thread.msg-thread--pillar",
-      ".scaffold-layout__detail .msg-thread",
-      ".scaffold-layout__detail"
-    ], messagingRoot) || messagingRoot;
-    const header = queryAny([
-      ".msg-title-bar",
-      ".shared-title-bar",
-      ".msg-thread__thread-top-card",
-      ".msg-thread__thread-header",
-      ".msg-thread__topcard",
-      ".msg-overlay-bubble-header",
-      ".msg-conversations-container__convo-details",
-      ".msg-thread-bubble-header"
-    ], detailRoot);
-    const conversationRoot = queryAny([
-      ".msg-s-message-list-container",
-      ".msg-s-message-list",
-      ".msg-thread__content",
-      ".msg-thread__messages-container",
-      ".msg-thread",
-      ".msg-overlay-bubble__content"
-    ], detailRoot) || detailRoot;
-    const activeConversationIdentity = extractActiveConversationIdentity();
-    const headerIdentity = extractMessagingHeaderIdentity(header);
-    const recipientAnchor = queryAny([
-      ".msg-thread__link-to-profile",
-      ".msg-title-bar .msg-thread__link-to-profile",
-      ".msg-entity-lockup a[href*='/in/']",
-      "a[href*='/in/']",
-      ".msg-thread__topcard-link",
-      "[data-control-name='view_profile']"
-    ], header || detailRoot);
-    const headerRecipientName = visibleTextFromSelectors([
-      ".msg-entity-lockup__entity-title",
-      ".msg-entity-lockup__entity-title-wrapper h2",
-      ".msg-thread__participant-names",
-      ".msg-thread__thread-title",
-      ".msg-thread__topcard-title",
-      "h1",
-      "h2",
-      "h3"
-    ], header || detailRoot);
-    const recipientName = [
-      normalizeWhitespace(headerIdentity?.name),
-      normalizeWhitespace(activeConversationIdentity?.name),
-      visibleText(recipientAnchor),
-      headerRecipientName
-    ].find((value) => isLikelyMessagingRecipientName(value)) || "";
-    const headline = visibleTextFromSelectors([
-      ".msg-entity-lockup__entity-info",
-      ".msg-entity-lockup__presence-status",
-      ".msg-thread__entity-lockup__subtitle",
-      ".msg-thread__topcard-subtitle",
-      ".artdeco-entity-lockup__subtitle",
-      ".t-14"
-    ], header || detailRoot) || normalizeWhitespace(headerIdentity?.headline) || normalizeWhitespace(activeConversationIdentity?.headline);
-    const profileUrl = normalizeWhitespace(recipientAnchor?.href || activeConversationIdentity?.profileUrl || "");
-    const messagingThreadUrl = normalizeWhitespace(activeConversationIdentity?.threadUrl || window.location.href);
-    const profileCard = queryAny([
-      ".msg-s-profile-card",
-      ".msg-thread__thread-top-card",
-      ".msg-thread__topcard",
-      ".msg-title-bar"
-    ], detailRoot) || header || detailRoot;
-    const allVisibleMessages = extractRecentMessagesFromConversation(conversationRoot, recipientName, 20);
-    const recentMessages = allVisibleMessages.slice(0, 8);
-    const lastEntry = recentMessages[0] || null;
-    const rawThreadText = truncate(
-      allVisibleMessages.length
-        ? allVisibleMessages.map((entry) => `${entry.sender}: ${entry.text}`).join("\n")
-        : visibleText(conversationRoot),
-      7000
-    );
-    const firstName = firstNameFromFullName(recipientName);
-    const personId = shared.personIdFromProfileUrl(profileUrl, recipientName);
-    const connectionStatus = detectConnectionStatus(header || document);
-    const hasCriticalMessagingIdentity = Boolean(normalizeWhitespace(recipientName) && normalizeWhitespace(profileUrl));
-    const recipientSnapshot = truncate(uniqueStrings([
-      recipientName,
-      headline
-    ]).join("\n"), 1000);
-
+  function buildLinkedInCommandDeps() {
     return {
-      supported: hasCriticalMessagingIdentity,
-      pageType: "linkedin-messaging",
-      pageUrl: window.location.href,
-      title: document.title,
-      reason: hasCriticalMessagingIdentity ? "" : "Loading selected conversation...",
-      debug: messagingDebugSummary(
-        header,
-        detailRoot,
-        conversationRoot,
-        activeConversationIdentity,
-        headerIdentity,
-        recipientAnchor,
-        recipientName,
-        profileUrl,
-        headline,
-        allVisibleMessages
-      ),
-      person: {
-        personId,
-        firstName,
-        fullName: recipientName,
-        profileUrl,
-        messagingThreadUrl,
-        headline,
-        location: "",
-        connectionStatus,
-        profileSummary: truncate(uniqueStrings([headline]).join(" | "), 600),
-        rawSnapshot: recipientSnapshot || truncate(visibleText(profileCard), 1000)
-      },
-      conversation: {
-        recipientName,
-        threadUrl: messagingThreadUrl,
-        recentMessages,
-        allVisibleMessages,
-        lastSpeaker: normalizeWhitespace(lastEntry?.sender),
-        lastMessageAt: normalizeWhitespace(lastEntry?.timestamp),
-        rawThreadText
-      }
+      autoScrollProfile,
+      buildMyProfileDraft,
+      delay,
+      expandInlineTextSections,
+      detectConnectionStatus,
+      extractActiveConversationIdentity,
+      extractMessagingHeaderIdentity,
+      extractOpenMessageBubbleWorkspace,
+      extractProfile,
+      extractRecentMessagesFromConversation,
+      hidePageActivityOverlay,
+      isLinkedInProfileSubpage,
+      isLikelyMessagingRecipientName,
+      isSupportedMessagingPage,
+      isSupportedProfilePage,
+      messagingDebugSummary,
+      mergeDebugInfo,
+      nowMs,
+      openMessagesFromCurrentProfile,
+      openMessagesFromCurrentProfileAndWait,
+      queryAny,
+      queryFirst,
+      roundMs,
+      scrollProfileToBottomAndWaitForStable,
+      showPageActivityOverlay,
+      truncate,
+      visibleText,
+      visibleTextFromSelectors,
+      waitForProfilePageReady,
+      waitForStableProfileTopCard
     };
-  }
-
-  function extractWorkspaceContext() {
-    if (isSupportedProfilePage()) {
-      const extracted = extractProfile();
-      const extractedPerson = extracted.profile
-        ? {
-          personId: shared.personIdFromProfileUrl(extracted.profile.profileUrl, extracted.profile.fullName),
-          firstName: extracted.profile.firstName,
-          fullName: extracted.profile.fullName,
-          profileUrl: extracted.profile.profileUrl,
-          headline: extracted.profile.headline,
-          location: extracted.profile.location,
-          connectionStatus: extracted.profile.connectionStatus,
-          profileSummary: extracted.profile.profileSummary,
-          rawSnapshot: extracted.profile.rawSnapshot
-        }
-        : null;
-      return {
-        supported: extracted.supported,
-        pageType: extracted.pageType,
-        pageUrl: extracted.pageUrl,
-        title: extracted.title,
-        person: extractedPerson,
-        profile: extracted.profile || null,
-        conversation: null,
-        debug: {
-          page_kind: "profile",
-          person_found: Boolean(extracted.profile?.fullName),
-          connection_status: extracted.profile?.connectionStatus || ""
-        }
-      };
-    }
-
-    if (isSupportedMessagingPage()) {
-      const messaging = extractMessagingContext();
-      return {
-        ...messaging,
-        profile: messaging.person || null
-      };
-    }
-
-    return {
-      supported: false,
-      pageType: "unsupported",
-      pageUrl: window.location.href,
-      title: document.title
-    };
-  }
-
-  async function extractProfileWithRetries(options) {
-    const lightweight = Boolean(options?.lightweight);
-    const attempts = lightweight ? 2 : 3;
-    const startedAtMs = nowMs();
-    const timing = {
-      page_kind: "profile",
-      profile_timing_mode: lightweight ? "lightweight" : "full",
-      profile_fast_path: false,
-      profile_attempts_planned: attempts,
-      profile_attempts_completed: 0,
-      profile_initial_extract_ms: 0,
-      profile_wait_ready_ms: 0,
-      profile_wait_stable_ms: 0,
-      profile_auto_scroll_ms: 0,
-      profile_expand_inline_ms: 0,
-      profile_extract_ms: 0,
-      profile_total_ms: 0
-    };
-    let latest = null;
-    let stepStartedAtMs = nowMs();
-    latest = extractProfile();
-    timing.profile_initial_extract_ms = roundMs(nowMs() - stepStartedAtMs);
-    if (latest?.supported && normalizeWhitespace(latest?.profile?.fullName) && normalizeWhitespace(latest?.profile?.headline)) {
-      timing.profile_fast_path = true;
-      timing.profile_total_ms = roundMs(nowMs() - startedAtMs);
-      return mergeDebugInfo(latest, timing);
-    }
-
-    for (let attempt = 1; attempt <= attempts; attempt += 1) {
-      timing.profile_attempts_completed = attempt;
-      stepStartedAtMs = nowMs();
-      await waitForProfilePageReady(lightweight ? 3 : 6);
-      timing.profile_wait_ready_ms += roundMs(nowMs() - stepStartedAtMs);
-      stepStartedAtMs = nowMs();
-      await waitForStableProfileTopCard(lightweight ? 2 : 4);
-      timing.profile_wait_stable_ms += roundMs(nowMs() - stepStartedAtMs);
-      if (!lightweight) {
-        stepStartedAtMs = nowMs();
-        await autoScrollProfile();
-        await autoScrollProfile();
-        timing.profile_auto_scroll_ms += roundMs(nowMs() - stepStartedAtMs);
-        stepStartedAtMs = nowMs();
-        await expandInlineTextSections();
-        await expandInlineTextSections();
-        timing.profile_expand_inline_ms += roundMs(nowMs() - stepStartedAtMs);
-      }
-      stepStartedAtMs = nowMs();
-      latest = extractProfile();
-      timing.profile_extract_ms += roundMs(nowMs() - stepStartedAtMs);
-      if (latest?.supported && normalizeWhitespace(latest?.profile?.fullName) && normalizeWhitespace(latest?.profile?.headline)) {
-        timing.profile_total_ms = roundMs(nowMs() - startedAtMs);
-        return mergeDebugInfo(latest, timing);
-      }
-      if (attempt < attempts) {
-        await delay(lightweight ? 140 * attempt : 220 * attempt);
-      }
-    }
-    timing.profile_total_ms = roundMs(nowMs() - startedAtMs);
-    return mergeDebugInfo(latest || extractProfile(), timing);
-  }
-
-  async function extractSelfProfileWithRetries() {
-    const warmupAttempts = 8;
-    let latest = null;
-    for (let attempt = 1; attempt <= warmupAttempts; attempt += 1) {
-      latest = extractSelfProfile();
-      if (latest?.supported && normalizeWhitespace(latest?.profile?.rawSnapshot)) {
-        break;
-      }
-      if (attempt < warmupAttempts) {
-        await delay(250 * attempt);
-      }
-    }
-
-    await autoScrollProfile();
-    await expandInlineTextSections();
-    await autoScrollProfile();
-    await expandInlineTextSections();
-
-    const fullExtract = extractSelfProfile();
-    if (fullExtract?.supported && normalizeWhitespace(fullExtract?.profile?.rawSnapshot)) {
-      return fullExtract;
-    }
-
-    return latest || extractSelfProfile();
-  }
-
-  async function extractRecipientProfileWithFullRetries() {
-    const extracted = await extractSelfProfileWithRetries();
-    return mergeDebugInfo(extracted, {
-      ...(extracted?.debug || {}),
-      profile_timing_mode: "sender_equivalent_full"
-    });
-  }
-
-  async function extractMessagingContextWithRetries() {
-    let latest = extractWorkspaceContext();
-    if (latest?.pageType !== "linkedin-messaging") {
-      return latest;
-    }
-
-    const retryDelays = [180, 400, 800, 1400, 2200, 3200, 4500];
-    for (const delayMs of retryDelays) {
-      const ready = latest?.supported
-        && normalizeWhitespace(latest?.person?.fullName)
-        && normalizeWhitespace(latest?.person?.profileUrl);
-      if (ready) {
-        return latest;
-      }
-      await delay(delayMs);
-      latest = extractWorkspaceContext();
-    }
-
-    return latest;
   }
 
   function getScrollableHeight() {
@@ -2082,16 +2137,23 @@
   }
 
   function scrollToPosition(container, top) {
-    if (isDocumentScroller(container)) {
-      window.scrollTo(0, Math.max(0, top));
-      return;
+    const nextTop = Math.max(0, top);
+    if (container && !isDocumentScroller(container)) {
+      if (typeof container.scrollTo === "function") {
+        container.scrollTo(0, nextTop);
+      } else {
+        container.scrollTop = nextTop;
+      }
     }
-    if (container && typeof container.scrollTo === "function") {
-      container.scrollTo(0, Math.max(0, top));
-      return;
-    }
-    if (container) {
-      container.scrollTop = Math.max(0, top);
+    try {
+      if (document.scrollingElement) {
+        document.scrollingElement.scrollTop = nextTop;
+      }
+      document.documentElement.scrollTop = nextTop;
+      document.body.scrollTop = nextTop;
+      window.scrollTo(0, nextTop);
+    } catch (_error) {
+      // Ignore scroll write failures and continue with the best available scroller.
     }
   }
 
@@ -2313,7 +2375,7 @@
   }
 
   function currentContextSignature() {
-    const extracted = extractWorkspaceContext();
+    const extracted = linkedInCommands.extractWorkspaceContext(buildLinkedInCommandDeps());
     const recentMessages = Array.isArray(extracted?.conversation?.recentMessages) ? extracted.conversation.recentMessages : [];
     const lastMessage = recentMessages[0] || null;
     const activeConversationIdentity = isSupportedMessagingPage() ? extractActiveConversationIdentity() : null;
@@ -2452,151 +2514,7 @@
   setupContextChangeNotifications();
 
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-    (async () => {
-      try {
-        if (message.type === MESSAGE_TYPES.GET_PAGE_CONTEXT) {
-          const extracted = isSupportedMessagingPage()
-            ? await extractMessagingContextWithRetries()
-            : isSupportedProfilePage()
-              ? await extractProfileWithRetries({ lightweight: true })
-              : extractWorkspaceContext();
-          const unsupportedReason = isLinkedInProfileSubpage()
-            ? "Open the main LinkedIn profile page, not an activity or details subpage."
-            : !isSupportedProfilePage() && !isSupportedMessagingPage()
-              ? "Open a LinkedIn profile or 1:1 messaging thread."
-              : undefined;
-          const extractedPerson = extracted?.profile
-            ? {
-              personId: shared.personIdFromProfileUrl(extracted.profile.profileUrl, extracted.profile.fullName),
-              firstName: extracted.profile.firstName,
-              fullName: extracted.profile.fullName,
-              profileUrl: extracted.profile.profileUrl,
-              headline: extracted.profile.headline,
-              location: extracted.profile.location,
-              connectionStatus: extracted.profile.connectionStatus,
-              profileSummary: extracted.profile.profileSummary,
-              rawSnapshot: extracted.profile.rawSnapshot
-            }
-            : null;
-          sendResponse({
-            ok: true,
-            supported: extracted.supported,
-            pageType: extracted.pageType,
-            pageUrl: extracted.pageUrl,
-            title: extracted.title,
-            person: extracted.person || extractedPerson || null,
-            profile: extracted.profile || null,
-            conversation: extracted.conversation || null,
-            debug: extracted.debug || null,
-            reason: extracted.supported ? undefined : (extracted.reason || unsupportedReason)
-          });
-          return;
-        }
-
-        if (message.type === MESSAGE_TYPES.SHOW_PAGE_ACTIVITY_OVERLAY) {
-          showPageActivityOverlay(message.title, message.message, message.autoHideMs);
-          sendResponse({ ok: true });
-          return;
-        }
-
-        if (message.type === MESSAGE_TYPES.HIDE_PAGE_ACTIVITY_OVERLAY) {
-          hidePageActivityOverlay();
-          sendResponse({ ok: true });
-          return;
-        }
-
-        if (message.type === MESSAGE_TYPES.EXTRACT_WORKSPACE_CONTEXT) {
-          const workspaceStartedAtMs = nowMs();
-          if (isSupportedProfilePage()) {
-            const extracted = await extractRecipientProfileWithFullRetries();
-            const extractedPerson = extracted?.profile
-              ? {
-                personId: shared.personIdFromProfileUrl(extracted.profile.profileUrl, extracted.profile.fullName),
-                firstName: extracted.profile.firstName,
-                fullName: extracted.profile.fullName,
-                profileUrl: extracted.profile.profileUrl,
-                headline: extracted.profile.headline,
-                location: extracted.profile.location,
-                connectionStatus: extracted.profile.connectionStatus,
-                profileSummary: extracted.profile.profileSummary,
-                rawSnapshot: extracted.profile.rawSnapshot
-              }
-              : null;
-            sendResponse({
-              ok: true,
-              supported: extracted.supported,
-              pageType: extracted.pageType,
-              pageUrl: extracted.pageUrl,
-              title: extracted.title,
-              person: extractedPerson,
-              profile: extracted.profile || null,
-              conversation: null,
-              debug: {
-                ...(extracted.debug || {}),
-                page_kind: "profile",
-                person_found: Boolean(extracted.profile?.fullName),
-                connection_status: extracted.profile?.connectionStatus || "",
-                workspace_context_total_ms: roundMs(nowMs() - workspaceStartedAtMs),
-                workspace_context_scroll_mode: "sender_equivalent_full",
-                workspace_context_extract_ms: roundMs(extracted.debug?.profile_extract_ms || 0)
-              }
-            });
-            return;
-          }
-
-          const workspaceTiming = {
-            workspace_context_total_ms: 0,
-            workspace_context_scroll_mode: "none",
-            workspace_context_scroll_pass_1_ms: 0,
-            workspace_context_expand_pass_1_ms: 0,
-            workspace_context_scroll_pass_2_ms: 0,
-            workspace_context_expand_pass_2_ms: 0,
-            workspace_context_scroll_stability_wait_ms: 0,
-            workspace_context_scroll_stability_checks: 0,
-            workspace_context_extract_ms: 0
-          };
-          const extractStartedAtMs = nowMs();
-          const extracted = extractWorkspaceContext();
-          workspaceTiming.workspace_context_extract_ms = roundMs(nowMs() - extractStartedAtMs);
-          workspaceTiming.workspace_context_total_ms = roundMs(nowMs() - workspaceStartedAtMs);
-          if (!extracted.supported) {
-            sendResponse({ ok: false, error: "This LinkedIn page is not supported yet." });
-            return;
-          }
-          sendResponse({
-            ok: true,
-            ...extracted,
-            debug: {
-              ...(extracted.debug || {}),
-              ...workspaceTiming
-            }
-          });
-          return;
-        }
-
-        if (message.type === MESSAGE_TYPES.EXTRACT_RECIPIENT) {
-          const extracted = await extractRecipientProfileWithFullRetries();
-          if (!extracted.supported) {
-            sendResponse({ ok: false, error: "This page is not a supported LinkedIn profile." });
-            return;
-          }
-          sendResponse({ ok: true, profile: extracted.profile });
-          return;
-        }
-
-        if (message.type === MESSAGE_TYPES.EXTRACT_SELF_PROFILE) {
-          const extracted = await extractSelfProfileWithRetries();
-          if (!extracted.supported) {
-            sendResponse({ ok: false, error: "This page is not a supported LinkedIn profile." });
-            return;
-          }
-          sendResponse({ ok: true, draft: buildMyProfileDraft(extracted.profile), profile: extracted.profile });
-          return;
-        }
-      } catch (error) {
-        sendResponse({ ok: false, error: error.message || String(error) });
-      }
-    })();
+    linkedInCommands.handleMessage(buildLinkedInCommandDeps(), message, sendResponse);
     return true;
   });
 })();

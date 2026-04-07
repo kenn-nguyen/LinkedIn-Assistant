@@ -8,6 +8,12 @@
   </head>
   <body>
     <div class="app-shell">
+      <div id="panel-loading-overlay" class="panel-loading-overlay hidden" aria-hidden="true">
+        <div class="panel-loading-overlay__sheet">
+          <div class="panel-loading-spinner"></div>
+          <p id="panel-loading-text" class="panel-loading-text">Loading LinkedIn data…</p>
+        </div>
+      </div>
       <div id="top-toolbar" class="top-toolbar hidden">
         <div class="mode-toggle" role="tablist" aria-label="App views">
           <button id="workspace-view-button" class="toolbar-pill is-active" type="button">Person</button>
@@ -20,10 +26,28 @@
       <section id="status-card" class="status-card hidden">
         <div class="person-header">
           <div class="person-copy">
-            <h1><a id="person-name" class="person-name-link" href="#" target="_blank" rel="noreferrer">Checking current page…</a></h1>
+            <div class="person-title-row">
+              <h1><a id="person-name" class="person-name-link" href="#" target="_blank" rel="noreferrer">Checking current page…</a></h1>
+              <button id="person-card-edit-button" type="button" class="link-button hidden">Edit</button>
+            </div>
             <p id="person-subtitle" class="muted-text">Open a LinkedIn profile or messaging thread.</p>
             <div class="button-row compact-row header-chip-row">
               <span id="connection-status-pill" class="status-pill secondary-pill">Unknown</span>
+            </div>
+            <p id="unsupported-page-message" class="meta-text unsupported-page-message hidden"></p>
+            <div id="person-card-editor" class="person-card-editor hidden">
+              <textarea id="person-note-input" rows="2" aria-label="Person note" placeholder="Add a note about this person"></textarea>
+              <div class="person-card-editor__goal-row">
+                <select id="person-goal-select">
+                  <option value="">Choose a goal</option>
+                  <option value="ask_referral">Ask for referral</option>
+                  <option value="build_relationship">Build relationship</option>
+                  <option value="get_advice">Get advice</option>
+                  <option value="ask_intro">Ask for intro</option>
+                  <option value="job_insight">Get job insight</option>
+                </select>
+                <button id="save-person-note-button" type="button" class="secondary-button">Save</button>
+              </div>
             </div>
             <p id="conversation-import-meta" class="meta-text header-freshness"></p>
             <p id="last-updated-meta" class="meta-text subtle-meta hidden"></p>
@@ -64,157 +88,68 @@
           <h2>Next Step</h2>
           <span id="action-pill" class="status-pill secondary-pill">Waiting</span>
         </div>
-        <p id="recommendation-reason" class="status-text">Ready when you are.</p>
-        <p id="referral-readiness" class="workspace-status hidden"></p>
-        <div id="identity-resolution-prompt" class="identity-resolution-prompt hidden">
-          <p id="identity-resolution-copy" class="meta-text">Allow one quick background check to link this person.</p>
-          <div class="button-row compact-row">
-            <button id="identity-resolution-allow-once" type="button" class="secondary-button">Allow once</button>
-            <button id="identity-resolution-allow-always" type="button" class="secondary-button">Always allow</button>
-            <button id="identity-resolution-not-now" type="button" class="ghost-button">Not now</button>
-          </div>
+        <div id="next-step-evidence" class="next-step-evidence hidden"></div>
+        <div class="next-step-context">
+          <textarea id="extra-context-input" rows="1" aria-label="Extra context for this draft" placeholder="Extra context for the next draft"></textarea>
         </div>
         <div class="button-row">
           <button id="next-action-button" type="button">Draft message</button>
+          <button id="next-helper-button" type="button" class="ghost-button hidden">Open profile</button>
         </div>
         <div class="feedback-stack">
-          <p id="page-status" class="status-text hidden">Checking current page…</p>
+          <p id="page-status" class="status-text workspace-status hidden">Checking current page…</p>
           <p id="workspace-status" class="workspace-status hidden"></p>
         </div>
+        <p id="recommendation-reason" class="status-text">Ready when you are.</p>
+        <p id="referral-readiness" class="workspace-status hidden"></p>
       </section>
 
       <section id="draft-section" class="panel hidden">
         <div class="section-heading">
           <h2>Draft</h2>
           <div class="button-row compact-row">
-            <button id="refresh-draft-button" type="button" class="link-button">Refresh</button>
             <button id="toggle-alternatives-button" type="button" class="link-button hidden">More options</button>
           </div>
         </div>
-        <div id="primary-draft-card" class="result-card">
-          <div class="section-heading">
+        <div id="primary-draft-card" class="draft-surface">
+          <div class="draft-toolbar">
             <strong id="primary-draft-label">Best option</strong>
-            <button id="copy-primary-draft-button" type="button" class="icon-button">Copy</button>
+            <button id="copy-primary-draft-button" type="button" class="icon-button draft-copy-button">Copy</button>
           </div>
-          <textarea id="primary-draft-input" rows="4"></textarea>
-          <p id="primary-draft-metrics" class="result-meta draft-metrics"></p>
-          <p id="primary-draft-reason" class="result-meta"></p>
+          <textarea id="primary-draft-input" class="draft-editor" rows="4"></textarea>
+          <div class="draft-footer">
+            <p id="primary-draft-metrics" class="result-meta draft-metrics"></p>
+            <p id="primary-draft-reason" class="result-meta draft-reason"></p>
+          </div>
         </div>
         <div id="alternative-drafts" class="results-list hidden"></div>
       </section>
 
       <section id="context-section" class="panel hidden">
         <div class="section-heading">
-          <h2>Context tools</h2>
+          <h2>Context</h2>
         </div>
 
         <div id="recipient-summary-card" class="summary-card hidden">
-          <strong>Recipient summary</strong>
+          <div class="summary-card-header">
+            <strong>Profile summary</strong>
+            <button id="recipient-profile-refresh-link" type="button" class="link-button hidden">Refresh full profile</button>
+          </div>
+          <p id="recipient-profile-meta" class="meta-text hidden"></p>
           <p id="recipient-summary-text"></p>
+          <div id="recipient-activity-block" class="recipient-activity hidden">
+            <div class="recipient-activity-header">
+              <span class="meta-text">Recent activity</span>
+              <span id="recipient-activity-meta" class="meta-text hidden"></span>
+            </div>
+            <ul id="recipient-activity-list" class="recipient-activity-list"></ul>
+          </div>
         </div>
 
         <div id="conversation-card" class="summary-card hidden">
           <strong>Recent conversation</strong>
           <div id="conversation-list" class="conversation-list"></div>
         </div>
-
-        <details class="workspace-tools-details">
-          <summary>Personalize prompts</summary>
-          <div class="workspace-tools-body">
-            <label>
-              Person note
-              <textarea id="person-note-input" rows="4" placeholder="What matters about this person"></textarea>
-            </label>
-            <label>
-              Goal for this person
-              <select id="person-goal-select">
-                <option value="">Select goal</option>
-                <option value="ask_referral">Ask for referral</option>
-                <option value="build_relationship">Build relationship</option>
-                <option value="get_advice">Get advice</option>
-                <option value="ask_intro">Ask for intro</option>
-                <option value="job_insight">Get job insight</option>
-              </select>
-            </label>
-            <div class="button-row compact-row">
-              <button id="save-person-note-button" type="button" class="secondary-button">Save person context</button>
-            </div>
-
-            <label>
-              Extra context for this draft
-              <textarea id="extra-context-input" rows="4" placeholder="Optional. Used for the next draft only."></textarea>
-            </label>
-            <p class="meta-text">Only used for the next draft.</p>
-          </div>
-        </details>
-
-        <details id="sender-context-details" class="workspace-tools-details">
-          <summary>Sender context</summary>
-          <div class="workspace-tools-body">
-            <p class="meta-text">Saved locally.</p>
-            <form id="profile-form" class="profile-form">
-              <label>
-                Personal notes about you
-                <textarea id="profile-manual-notes" name="manualNotes" rows="4" placeholder="Optional notes about you"></textarea>
-              </label>
-              <label>
-                Raw LinkedIn profile text
-                <textarea id="profile-raw-snapshot" name="rawSnapshot" rows="14"></textarea>
-              </label>
-              <div class="button-row">
-                <button id="save-profile-button" type="submit">Save sender context</button>
-              </div>
-            </form>
-          </div>
-        </details>
-
-        <details class="workspace-tools-details">
-          <summary>Workspace tools</summary>
-          <div class="workspace-tools-body">
-            <div class="button-row compact-row">
-              <div class="button-with-meta">
-                <button id="update-profile-button" type="button" class="secondary-button">Update Profile</button>
-                <span id="update-profile-meta" class="meta-text subtle-meta"></span>
-              </div>
-            </div>
-            <details id="technical-details" class="technical-details hidden">
-              <summary id="technical-details-summary">Technical details</summary>
-              <div id="manual-recovery-section" class="technical-details-body">
-                <div class="section-heading">
-                  <h2>Troubleshooting</h2>
-                  <button id="read-latest-response-button" type="button" class="link-button">Read latest response</button>
-                </div>
-                <p class="meta-text">Open when something looks wrong.</p>
-                <label>
-                  LinkedIn page diagnostics
-                  <textarea id="page-diagnostics" rows="8" readonly></textarea>
-                </label>
-                <label>
-                  Saved sender profile text
-                  <textarea id="sender-profile-extracted" rows="10" readonly></textarea>
-                </label>
-                <label>
-                  Prompt sent to provider
-                  <textarea id="manual-prompt" rows="8" readonly></textarea>
-                </label>
-                <label>
-                  Raw model output
-                  <textarea id="manual-raw-output" rows="8" readonly></textarea>
-                </label>
-              </div>
-            </details>
-          </div>
-        </details>
-
-        <details class="workspace-tools-details">
-          <summary>Conversation tools</summary>
-          <div class="workspace-tools-body">
-            <div class="button-row compact-row">
-              <button id="import-conversation-button" type="button" class="ghost-button hidden">Import conversation</button>
-              <button id="clear-conversation-button" type="button" class="ghost-button hidden">Clear imported history</button>
-            </div>
-          </div>
-        </details>
       </section>
 
       <p id="person-record-uuid" class="person-record-uuid hidden"></p>
@@ -296,11 +231,11 @@
           <form id="prompt-settings-form" class="profile-form settings-form">
           <label>
             Profile URL
-            <input id="sender-profile-settings-url" type="url" placeholder="https://www.linkedin.com/in/your-profile/">
+            <div class="settings-inline-row">
+              <input id="sender-profile-settings-url" class="settings-readonly-url" type="url" placeholder="https://www.linkedin.com/in/your-profile/" readonly>
+              <button id="open-sender-profile-link" type="button" class="secondary-button">Edit</button>
+            </div>
           </label>
-          <div class="button-row compact-row">
-            <button id="open-sender-profile-link" type="button" class="secondary-button">Open profile</button>
-          </div>
           <label>
             Provider
             <select id="llm-provider-settings-select">
@@ -318,14 +253,6 @@
             <textarea id="strategy-guidance" rows="8" placeholder="Optional. Add your own tone, caution, or networking preferences."></textarea>
           </label>
           <p class="meta-text settings-help">Adds your preferences only. Core prompt rules stay fixed.</p>
-          <label>
-            Background lookup
-            <select id="identity-resolution-settings-select">
-              <option value="ask">Ask first</option>
-              <option value="always_allow">Always allow</option>
-            </select>
-          </label>
-          <p class="meta-text settings-help">Whether hidden LinkedIn lookups need approval.</p>
           <details class="fixed-tail-details">
             <summary>First-message default</summary>
             <div class="fixed-tail-editor">
@@ -343,9 +270,40 @@
           </form>
         </div>
       </section>
+
+      <div id="global-logs-panel" class="technical-details-inline-shell">
+        <details id="global-diagnostics-details" class="technical-details-inline">
+          <summary id="global-diagnostics-summary">Technical details</summary>
+          <div id="manual-recovery-section" class="workspace-tools-body technical-details-body">
+            <div class="technical-details-actions">
+              <button id="read-latest-response-button" type="button" class="link-button">Read latest response</button>
+              <button id="copy-technical-details-button" type="button" class="link-button">Copy log</button>
+              <button id="clear-technical-details-button" type="button" class="link-button">Clear</button>
+            </div>
+            <label>
+              LinkedIn page diagnostics
+              <textarea id="page-diagnostics" rows="8" readonly></textarea>
+            </label>
+            <label>
+              Saved sender profile text
+              <textarea id="sender-profile-extracted" rows="10" readonly></textarea>
+            </label>
+            <label>
+              Prompt sent to provider
+              <textarea id="manual-prompt" rows="8" readonly></textarea>
+            </label>
+            <label>
+              Raw model output
+              <textarea id="manual-raw-output" rows="8" readonly></textarea>
+            </label>
+          </div>
+        </details>
+      </div>
     </div>
 
+    <script src="identity.js"></script>
     <script src="shared.js"></script>
+    <script src="prompt.js"></script>
     <script src="sidepanel.js"></script>
   </body>
 </html>

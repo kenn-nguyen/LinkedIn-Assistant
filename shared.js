@@ -1,15 +1,19 @@
 (function initShared(global) {
-  const LEGACY_FIXED_TAIL = "I’m finishing Yale SOM in May 2026 and previously led PM for an AI identity/risk platform in fintech. If you’re open to it, I’d appreciate 1-2 quick questions here.";
-  const FIXED_TAIL = "I’m finishing Yale SOM in May 2026 and previously led PM for an AI identity/risk platform in fintech. Would you be open to 1-2 quick questions here?";
-  const DEFAULT_CHATGPT_PROJECT_URL = "https://chatgpt.com/?temporary-chat=true";
-  const DEFAULT_GEMINI_URL = "https://gemini.google.com/u/3/app";
-  const DEFAULT_LLM_PROVIDER = "chatgpt";
-  const DEFAULT_LLM_ENTRY_URLS = {
-    chatgpt: DEFAULT_CHATGPT_PROJECT_URL,
-    gemini: DEFAULT_GEMINI_URL
-  };
-  const LLM_PROVIDERS = Object.freeze(Object.keys(DEFAULT_LLM_ENTRY_URLS));
-  const MAX_MESSAGE_LENGTH = 1200;
+  const identity = global.LinkedInAssistantIdentity;
+  if (!identity) {
+    return;
+  }
+
+  const {
+    defaultIdentity,
+    getIdentity,
+    isOpaqueLinkedInPersonId,
+    linkedInProfileAlias,
+    mergeIdentity,
+    normalizeLinkedInProfileUrl,
+    personIdFromProfileUrl
+  } = identity;
+
   const RELATIONSHIP_STAGES = [
     "new",
     "cold_sent",
@@ -49,6 +53,7 @@
     "ask_referral",
     "job_insight"
   ];
+  const BUILD_DEBUG_VERSION = "debug-2026-04-07-0233";
   const STORAGE_KEYS = {
     myProfile: "myProfile",
     fixedTail: "fixedTail",
@@ -56,18 +61,22 @@
     chatGptProjectUrl: "chatGptProjectUrl",
     people: "people",
     personDraftWorkspaces: "personDraftWorkspaces",
+    tabPersonBindings: "tabPersonBindings",
     threadPersonBindings: "threadPersonBindings",
     profileRedirects: "profileRedirects",
-    identityResolutionSeenOpaqueUrls: "identityResolutionSeenOpaqueUrls",
-    identityResolutionSettings: "identityResolutionSettings"
+    identityResolutionSeenOpaqueUrls: "identityResolutionSeenOpaqueUrls"
   };
   const MESSAGE_TYPES = {
     GET_PAGE_CONTEXT: "GET_PAGE_CONTEXT",
     EXTRACT_RECIPIENT: "EXTRACT_RECIPIENT",
     EXTRACT_SELF_PROFILE: "EXTRACT_SELF_PROFILE",
     EXTRACT_WORKSPACE_CONTEXT: "EXTRACT_WORKSPACE_CONTEXT",
+    EXTRACT_OPEN_MESSAGE_BUBBLE_WORKSPACE: "EXTRACT_OPEN_MESSAGE_BUBBLE_WORKSPACE",
+    OPEN_CURRENT_PROFILE_MESSAGES: "OPEN_CURRENT_PROFILE_MESSAGES",
+    OPEN_PERSON_MESSAGES: "OPEN_PERSON_MESSAGES",
     GENERATE_FOR_RECIPIENT: "GENERATE_FOR_RECIPIENT",
     UPDATE_MY_PROFILE: "UPDATE_MY_PROFILE",
+    UPDATE_RECIPIENT_PROFILE_CONTEXT: "UPDATE_RECIPIENT_PROFILE_CONTEXT",
     SAVE_MY_PROFILE: "SAVE_MY_PROFILE",
     SET_PENDING_MY_PROFILE_TARGET: "SET_PENDING_MY_PROFILE_TARGET",
     SAVE_FIXED_TAIL: "SAVE_FIXED_TAIL",
@@ -81,7 +90,6 @@
     CLEAR_IMPORTED_CONVERSATION: "CLEAR_IMPORTED_CONVERSATION",
     GET_STORAGE_STATE: "GET_STORAGE_STATE",
     RESOLVE_PROFILE_IDENTITY: "RESOLVE_PROFILE_IDENTITY",
-    SAVE_IDENTITY_RESOLUTION_SETTINGS: "SAVE_IDENTITY_RESOLUTION_SETTINGS",
     READ_LATEST_CHATGPT_RESPONSE: "READ_LATEST_CHATGPT_RESPONSE",
     READ_LATEST_PROVIDER_RESPONSE: "READ_LATEST_PROVIDER_RESPONSE",
     RUN_PROMPT: "RUN_PROMPT",
@@ -210,19 +218,6 @@
     return /[.!?]$/.test(normalized) ? normalized : `${normalized}.`;
   }
 
-  function combineMessage(opener, fixedTail) {
-    const safeOpener = ensureSentence(opener);
-    return normalizeWhitespace(`${safeOpener} ${fixedTail}`);
-  }
-
-  function normalizeFixedTail(value) {
-    const normalized = normalizeWhitespace(value);
-    if (!normalized || normalized === normalizeWhitespace(LEGACY_FIXED_TAIL)) {
-      return FIXED_TAIL;
-    }
-    return normalized;
-  }
-
   function compactProfile(profile, fields) {
     return fields
       .map(({ label, value }) => {
@@ -264,133 +259,6 @@
     }
   }
 
-  function normalizeLlmProvider(value) {
-    const normalized = normalizeWhitespace(value).toLowerCase();
-    return LLM_PROVIDERS.includes(normalized) ? normalized : DEFAULT_LLM_PROVIDER;
-  }
-
-  function defaultLlmEntryUrl(provider) {
-    return DEFAULT_LLM_ENTRY_URLS[normalizeLlmProvider(provider)] || DEFAULT_CHATGPT_PROJECT_URL;
-  }
-
-  function providerDisplayName(provider) {
-    switch (normalizeLlmProvider(provider)) {
-      case "gemini":
-        return "Gemini";
-      case "chatgpt":
-      default:
-        return "ChatGPT";
-    }
-  }
-
-  function isChatGptUrl(value) {
-    const normalized = normalizeUrl(value);
-    return Boolean(normalized && /https:\/\/(?:chatgpt\.com|chat\.openai\.com)\//i.test(normalized));
-  }
-
-  function isGeminiUrl(value) {
-    const normalized = normalizeUrl(value);
-    return Boolean(normalized && /https:\/\/gemini\.google\.com\//i.test(normalized));
-  }
-
-  function normalizeLlmEntryUrl(provider, value) {
-    const normalizedProvider = normalizeLlmProvider(provider);
-    const normalizedUrl = normalizeUrl(value);
-    if (!normalizedUrl) {
-      return defaultLlmEntryUrl(normalizedProvider);
-    }
-    if (normalizedProvider === "chatgpt" && isChatGptUrl(normalizedUrl)) {
-      return normalizedUrl;
-    }
-    if (normalizedProvider === "gemini" && isGeminiUrl(normalizedUrl)) {
-      return normalizedUrl;
-    }
-    return defaultLlmEntryUrl(normalizedProvider);
-  }
-
-  function normalizeLinkedInProfileUrl(value) {
-    const text = normalizeUrl(value);
-    if (!text) {
-      return "";
-    }
-    try {
-      const url = new URL(text);
-      if (!/linkedin\.com$/i.test(url.hostname) && !/linkedin\.com$/i.test(url.hostname.split(".").slice(-2).join("."))) {
-        return text;
-      }
-      const parts = url.pathname.split("/").filter(Boolean);
-      const profileIndex = parts.indexOf("in");
-      if (profileIndex >= 0 && parts[profileIndex + 1]) {
-        let slug = parts[profileIndex + 1];
-        try {
-          slug = decodeURIComponent(slug);
-        } catch (_error) {
-          // Keep the raw slug when decoding fails.
-        }
-        return `${url.origin}/in/${slug}/`;
-      }
-      return `${url.origin}${url.pathname}`;
-    } catch (_error) {
-      return text;
-    }
-  }
-
-  function slugify(value) {
-    return normalizeWhitespace(value)
-      .normalize("NFKD")
-      .replace(/[\u0300-\u036f]/g, "")
-      .replace(/œ/g, "oe")
-      .replace(/æ/g, "ae")
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, "-")
-      .replace(/^-+|-+$/g, "");
-  }
-
-  function personIdFromProfileUrl(profileUrl, fallbackName) {
-    const normalizedProfileUrl = normalizeLinkedInProfileUrl(profileUrl);
-    if (normalizedProfileUrl) {
-      try {
-        const url = new URL(normalizedProfileUrl);
-        const parts = url.pathname.split("/").filter(Boolean);
-        const profileIndex = parts.indexOf("in");
-        if (profileIndex >= 0 && parts[profileIndex + 1]) {
-          let slug = parts[profileIndex + 1];
-          try {
-            slug = decodeURIComponent(slug);
-          } catch (_error) {
-            // Keep the raw slug when decoding fails.
-          }
-          return `li:${slugify(slug)}`;
-        }
-      } catch (_error) {
-        // Fall through to fallback name.
-      }
-    }
-
-    const slug = slugify(fallbackName);
-    return slug ? `name:${slug}` : "";
-  }
-
-  function linkedInProfileAlias(profileUrl) {
-    const normalizedProfileUrl = normalizeLinkedInProfileUrl(profileUrl);
-    return normalizedProfileUrl ? normalizedProfileUrl.toLowerCase() : "";
-  }
-
-  function isOpaqueLinkedInSlugValue(slug) {
-    const normalized = normalizeWhitespace(slug);
-    if (!normalized) {
-      return false;
-    }
-    return /^ACo/i.test(normalized)
-      || /[A-Z]/.test(normalized)
-      || (!normalized.includes("-") && normalized.length > 20);
-  }
-
-  function isOpaqueLinkedInPersonId(value) {
-    const normalized = normalizeWhitespace(value).toLowerCase();
-    return normalized.startsWith("li:") && isOpaqueLinkedInSlugValue(normalized.slice(3));
-  }
-
   function defaultMyProfile() {
     return {
       ownProfileUrl: "",
@@ -398,24 +266,6 @@
       manualNotes: "",
       rawSnapshot: "",
       updatedAt: ""
-    };
-  }
-
-  function defaultIdentity(overrides) {
-    return {
-      personId: "",
-      fullName: "",
-      firstName: "",
-      profileUrl: "",
-      primaryLinkedInMemberUrl: "",
-      publicProfileUrl: "",
-      knownProfileUrls: [],
-      normalizedName: "",
-      identityStatus: "provisional",
-      identityConfidence: "low",
-      messagingThreadUrl: "",
-      aliases: [],
-      ...(overrides || {})
     };
   }
 
@@ -429,8 +279,11 @@
       profileSummary: "",
       rawSnapshot: "",
       lastProfileSyncedAt: "",
+      lastActivitySyncedAt: "",
       recentProfileChanges: "",
       latestProfileData: null,
+      latestActivitySnippets: [],
+      profileCaptureMode: "",
       ...(overrides || {})
     };
   }
@@ -958,16 +811,6 @@
     });
   }
 
-  function getIdentity(personRecord) {
-    return defaultIdentity(personRecord?.identity || {
-      personId: personRecord?.personId,
-      fullName: personRecord?.fullName,
-      firstName: personRecord?.firstName,
-      profileUrl: personRecord?.profileUrl,
-      messagingThreadUrl: personRecord?.messagingThreadUrl
-    });
-  }
-
   function getProfileContext(personRecord) {
     return defaultProfileContext(personRecord?.profileContext || {
       headline: personRecord?.headline,
@@ -978,7 +821,10 @@
       profileSummary: personRecord?.profileSummary,
       rawSnapshot: personRecord?.rawSnapshot,
       lastProfileSyncedAt: personRecord?.lastProfileSyncedAt,
-      recentProfileChanges: personRecord?.recentProfileChanges
+      lastActivitySyncedAt: personRecord?.lastActivitySyncedAt,
+      recentProfileChanges: personRecord?.recentProfileChanges,
+      latestActivitySnippets: personRecord?.latestActivitySnippets,
+      profileCaptureMode: personRecord?.profileCaptureMode
     });
   }
 
@@ -1068,105 +914,7 @@
       || merged.system?.recordUuid
     ) || generateShortUuid();
 
-    const existingProfileUrl = normalizeLinkedInProfileUrl(existing?.identity?.profileUrl || existing?.profileUrl);
-    const incomingProfileUrl = normalizeLinkedInProfileUrl(incoming?.identity?.profileUrl || incoming?.profileUrl);
-    const mergedProfileUrl = normalizeLinkedInProfileUrl(merged.identity?.profileUrl || merged.profileUrl);
-    const explicitPrimaryLinkedInMemberUrl = normalizeLinkedInProfileUrl(
-      merged.identity?.primaryLinkedInMemberUrl
-      || incoming?.identity?.primaryLinkedInMemberUrl
-      || existing?.identity?.primaryLinkedInMemberUrl
-    );
-    const explicitPublicProfileUrl = normalizeLinkedInProfileUrl(
-      merged.identity?.publicProfileUrl
-      || incoming?.identity?.publicProfileUrl
-      || existing?.identity?.publicProfileUrl
-    );
-    const allKnownProfileUrls = uniqueStrings([
-      ...(existing?.identity?.knownProfileUrls || []),
-      ...(incoming?.identity?.knownProfileUrls || []),
-      explicitPrimaryLinkedInMemberUrl,
-      explicitPublicProfileUrl,
-      existingProfileUrl,
-      incomingProfileUrl,
-      mergedProfileUrl
-    ].map(normalizeLinkedInProfileUrl).filter(Boolean));
-    const opaqueProfileUrls = allKnownProfileUrls.filter((value) => {
-      const slug = value ? personIdFromProfileUrl(value, "").replace(/^li:/, "") : "";
-      return isOpaqueLinkedInSlugValue(slug);
-    });
-    const publicProfileUrls = allKnownProfileUrls.filter((value) => {
-      const slug = value ? personIdFromProfileUrl(value, "").replace(/^li:/, "") : "";
-      return slug && !isOpaqueLinkedInSlugValue(slug);
-    });
-    const primaryLinkedInMemberUrl = explicitPrimaryLinkedInMemberUrl || opaqueProfileUrls[0] || "";
-    const publicProfileUrl = explicitPublicProfileUrl || publicProfileUrls[0] || "";
-    const preferredProfileUrl = publicProfileUrl || primaryLinkedInMemberUrl || mergedProfileUrl || "";
-    const identity = defaultIdentity({
-      ...(existing?.identity || {}),
-      ...(incoming?.identity || {}),
-      personId: normalizeWhitespace(merged.identity?.personId || merged.personId),
-      fullName: normalizeWhitespace(merged.identity?.fullName || merged.fullName),
-      firstName: normalizeWhitespace(merged.identity?.firstName || merged.firstName),
-      profileUrl: preferredProfileUrl,
-      primaryLinkedInMemberUrl,
-      publicProfileUrl,
-      knownProfileUrls: allKnownProfileUrls,
-      normalizedName: normalizeWhitespace(merged.identity?.normalizedName || merged.fullName).toLowerCase(),
-      identityStatus: normalizeWhitespace(merged.identity?.identityStatus || incoming?.identity?.identityStatus || existing?.identity?.identityStatus || ""),
-      identityConfidence: normalizeWhitespace(merged.identity?.identityConfidence || incoming?.identity?.identityConfidence || existing?.identity?.identityConfidence || ""),
-      messagingThreadUrl: normalizeUrl(merged.identity?.messagingThreadUrl || merged.messagingThreadUrl),
-      aliases: uniqueStrings([
-        ...(existing?.identity?.aliases || []),
-        ...(incoming?.identity?.aliases || []),
-        ...allKnownProfileUrls.map(linkedInProfileAlias),
-        linkedInProfileAlias(existing?.identity?.primaryLinkedInMemberUrl),
-        linkedInProfileAlias(existing?.identity?.publicProfileUrl),
-        linkedInProfileAlias(incoming?.identity?.primaryLinkedInMemberUrl),
-        linkedInProfileAlias(incoming?.identity?.publicProfileUrl)
-      ])
-    });
-    identity.fullName = normalizeWhitespace(identity.fullName);
-    identity.firstName = normalizeWhitespace(identity.firstName) || firstNameFromFullName(identity.fullName);
-    identity.normalizedName = normalizeWhitespace(identity.normalizedName || identity.fullName).toLowerCase();
-    const primaryDerivedPersonId = personIdFromProfileUrl(identity.primaryLinkedInMemberUrl, identity.fullName);
-    const publicDerivedPersonId = personIdFromProfileUrl(identity.publicProfileUrl, identity.fullName);
-    const profileDerivedPersonId = primaryDerivedPersonId || publicDerivedPersonId || personIdFromProfileUrl(identity.profileUrl, identity.fullName);
-    const existingIdentityPersonId = normalizeWhitespace(identity.personId);
-    identity.personId = primaryDerivedPersonId || existingIdentityPersonId || publicDerivedPersonId || profileDerivedPersonId;
-    if ((!identity.personId || identity.personId.startsWith("name:")) && publicDerivedPersonId && !publicDerivedPersonId.startsWith("name:")) {
-      identity.personId = publicDerivedPersonId;
-    }
-    if ((!identity.personId || identity.personId.startsWith("name:")) && primaryDerivedPersonId && !primaryDerivedPersonId.startsWith("name:")) {
-      identity.personId = primaryDerivedPersonId;
-    }
-    if (!identity.personId) {
-      identity.personId = personIdFromProfileUrl(identity.profileUrl, identity.fullName);
-    }
-    const explicitIdentityStatus = normalizeWhitespace(identity.identityStatus);
-    const explicitIdentityConfidence = normalizeWhitespace(identity.identityConfidence);
-    const hasStableIdentityEvidence = Boolean(identity.primaryLinkedInMemberUrl || identity.publicProfileUrl);
-    if (explicitIdentityStatus === "merged") {
-      identity.identityStatus = "merged";
-    } else if (explicitIdentityStatus === "needs_merge_confirmation" && !hasStableIdentityEvidence) {
-      identity.identityStatus = "needs_merge_confirmation";
-    } else if (explicitIdentityStatus === "provisional" && !hasStableIdentityEvidence) {
-      identity.identityStatus = "provisional";
-    } else if (hasStableIdentityEvidence) {
-      identity.identityStatus = "resolved";
-    } else {
-      identity.identityStatus = explicitIdentityStatus || "provisional";
-    }
-    if (explicitIdentityConfidence) {
-      identity.identityConfidence = explicitIdentityConfidence;
-    } else if (identity.primaryLinkedInMemberUrl) {
-      identity.identityConfidence = "high";
-    } else if (identity.publicProfileUrl) {
-      identity.identityConfidence = "medium";
-    } else if (identity.identityStatus === "needs_merge_confirmation") {
-      identity.identityConfidence = "medium";
-    } else {
-      identity.identityConfidence = "low";
-    }
+    const identity = mergeIdentity(existing, incoming, merged);
 
     const profileContext = defaultProfileContext({
       ...(existing?.profileContext || {}),
@@ -1189,8 +937,20 @@
       lastProfileSyncedAt: normalizeWhitespace(
         merged.profileContext?.lastProfileSyncedAt || merged.lastProfileSyncedAt
       ),
+      lastActivitySyncedAt: normalizeWhitespace(
+        merged.profileContext?.lastActivitySyncedAt || merged.lastActivitySyncedAt
+      ),
       recentProfileChanges: normalizeOutputText(
         merged.profileContext?.recentProfileChanges || merged.recentProfileChanges
+      ),
+      latestActivitySnippets: uniqueStrings(
+        merged.profileContext?.latestActivitySnippets
+        || merged.latestActivitySnippets
+        || merged.profileContext?.latestProfileData?.activitySnippets
+        || []
+      ),
+      profileCaptureMode: normalizeWhitespace(
+        merged.profileContext?.profileCaptureMode || merged.profileCaptureMode
       ),
       latestProfileData: normalizeProfileData(
         merged.profileContext?.latestProfileData || merged.latestProfileData
@@ -1733,40 +1493,6 @@
     };
   }
 
-  function formatLogicMetrics(metrics) {
-    if (!metrics) {
-      return "No logic metrics available.";
-    }
-
-    return [
-      `Context source: ${metrics.current_context_source || "unknown"} (visible thread, imported history, or both)`,
-      `Conversation state: ${metrics.conversation_state || "unknown"}`,
-      `Connection status in current context: ${metrics.is_connection ? "connected" : "not clearly connected"}`,
-      `User goal: ${metrics.user_goal_label || metrics.user_goal || "unknown"}`,
-      `Known message count: ${metrics.known_message_count ?? 0}`,
-      `Known inbound count: ${metrics.known_inbound_count ?? 0}`,
-      `Known outbound count: ${metrics.known_outbound_count ?? 0}`,
-      `Has ever replied: ${metrics.has_ever_replied ? "true" : "false"}`,
-      `Who spoke last: ${metrics.who_spoke_last || "unknown"}`,
-      `Unanswered outbound streak: ${metrics.unanswered_outbound_streak ?? 0} (consecutive user-sent messages since the last recipient reply)`,
-      `First known contact time: ${formatConversationTimestampForDisplay(metrics.first_known_message_at) || "unknown"}`,
-      `Last known message time: ${formatConversationTimestampForDisplay(metrics.last_known_message_at) || "unknown"}`,
-      `Last known recipient message time: ${formatConversationTimestampForDisplay(metrics.last_known_inbound_at) || "unknown"}`,
-      `Last known user message time: ${formatConversationTimestampForDisplay(metrics.last_known_outbound_at) || "unknown"}`,
-      `Days since first known contact: ${metrics.days_since_first_known_contact ?? "unknown"}`,
-      `Days since last known message: ${metrics.days_since_last_known_message ?? "unknown"}`,
-      `Days since last known recipient message: ${metrics.days_since_last_known_inbound ?? "unknown"}`,
-      `Days since last known user message: ${metrics.days_since_last_known_outbound ?? "unknown"}`,
-      `Known conversation span days: ${metrics.known_conversation_span_days ?? "unknown"}`,
-      `Timestamp confidence: ${metrics.timestamp_confidence || "unknown"}`,
-      `Context confidence: ${metrics.context_confidence || "unknown"}`,
-      `Thread tone: ${metrics.thread_tone || "unknown"}`,
-      `Thread pace: ${metrics.thread_pace || "unknown"}`,
-      `Thread warmth signal: ${metrics.thread_warmth_signal || "unknown"} (heuristic, not proof of closeness)`,
-      `Thread tone guidance: ${metrics.thread_tone_guidance || "unknown"}`
-    ].join("\n");
-  }
-
   function normalizeAssessmentLevel(value, allowed) {
     const normalized = normalizeWhitespace(value).toLowerCase();
     return allowed.includes(normalized) ? normalized : "";
@@ -2127,594 +1853,6 @@
     };
   }
 
-  function formatRelationshipTriage(triage) {
-    if (!triage) {
-      return "No local relationship triage available.";
-    }
-
-    return [
-      `Local investment decision: ${triage.investment_decision}`,
-      `Local research recommendation: ${triage.research_recommendation}`,
-      `Local referral gate: ${triage.referral_gate}`,
-      `Inbound replies seen: ${triage.has_inbound_reply ? "yes" : "no"}`,
-      `Outbound messages: ${triage.outbound_message_count || 0}`,
-      `Inbound messages: ${triage.inbound_message_count || 0}`,
-      `Unanswered outbound streak: ${triage.unanswered_outbound_streak || 0}`,
-      triage.summary ? `Summary: ${triage.summary}` : "",
-      triage.prompt_guidance ? `Prompt guidance: ${triage.prompt_guidance}` : ""
-    ].filter(Boolean).join("\n");
-  }
-
-  function formatPromptConversationMessages(messages, recipientFullName, ownFullName, label) {
-    const normalizedMessages = canonicalizeConversationEntries(messages, recipientFullName, ownFullName);
-    if (!normalizedMessages.length) {
-      return "";
-    }
-
-    return [
-      `${label} (latest first):`,
-      ...normalizedMessages.map((entry) => {
-        const timestamp = formatConversationTimestampForDisplay(entry?.timestamp);
-        const prefix = timestamp ? `[${timestamp}] ` : "";
-        return `- ${prefix}${normalizeWhitespace(entry?.sender) || "Unknown"}: ${normalizeWhitespace(entry?.text)}`;
-      })
-    ].join("\n");
-  }
-
-  function formatConversationContext(conversation, ownFullName) {
-    if (!conversation) {
-      return "";
-    }
-    const recipientName = normalizeWhitespace(conversation.recipientName);
-
-    const parts = [
-      recipientName ? `Conversation with: ${recipientName}` : "",
-      conversation.lastSpeaker ? `Last speaker: ${canonicalConversationSender(conversation.lastSpeaker, recipientName, ownFullName)}` : "",
-      conversation.lastMessageAt ? `Last visible message time: ${formatConversationTimestampForDisplay(conversation.lastMessageAt)}` : "",
-      formatPromptConversationMessages(conversation.recentMessages, recipientName, ownFullName, "Visible messages")
-    ].filter(Boolean);
-
-    return parts.join("\n");
-  }
-
-  function formatImportedConversation(importedConversation, recipientFullName, ownFullName) {
-    if (!importedConversation) {
-      return "";
-    }
-    const canonicalMessages = canonicalizeConversationEntries(importedConversation.messages, recipientFullName, ownFullName);
-
-    return [
-      importedConversation.importedAt ? `Imported at: ${importedConversation.importedAt}` : "",
-      importedConversation.sourcePageType ? `Imported from: ${importedConversation.sourcePageType}` : "",
-      importedConversation.lastMessageAt
-        ? `Last imported message time: ${formatConversationTimestampForDisplay(importedConversation.lastMessageAt)}`
-        : "",
-      formatPromptConversationMessages(canonicalMessages, recipientFullName, ownFullName, "Imported messages")
-    ].filter(Boolean).join("\n");
-  }
-
-  function defaultPromptSettings() {
-    return {
-      strategyGuidance: "",
-      llmProvider: DEFAULT_LLM_PROVIDER,
-      llmEntryUrl: defaultLlmEntryUrl(DEFAULT_LLM_PROVIDER)
-    };
-  }
-
-  function relationshipStrategyPlaybook() {
-    return [
-      "Primary objective:",
-      "- Help the user manage this relationship well over time and increase the chance of a credible referral or useful introduction later.",
-      "- Do not optimize for sending a message at all costs. Optimize for relationship quality, timing, and expected return.",
-      "",
-      "Case handling guidance:",
-      "- First outreach to a non-connection: keep it light, relevant, and easy to answer. Focus on starting a real exchange, not extracting help immediately.",
-      "- Connected but little or no conversation history: do not treat connection status alone as warmth. Re-engage with a specific reason or relevant trigger.",
-      "- No reply after prior outreach: do not assume rejection with certainty, but raise the bar for another follow-up. A repeated follow-up should usually become lighter, narrower, and more contextual, not more demanding.",
-      "- If there is no fresh angle, recent trigger, or clearer reason to reach out, it is valid to recommend wait.",
-      "- If the person has replied before: build momentum with one small next step at a time. Prefer a quick question or advice ask before a heavier ask.",
-      "- Warm relationship: if the context supports it, move from curiosity to a more specific ask, but still keep it easy for them to help.",
-      "- Referral path: a referral ask should usually come only after there is evidence of engagement, trust, or clear fit. The ask should be targeted to a role, team, or person, not vague.",
-      "- Dormant relationship after a long gap: acknowledge the gap lightly only if useful. Re-enter with a relevant reason, not a guilt-inducing reminder.",
-      "- Partial or noisy context: LinkedIn thread extraction may be incomplete or messy. Reason from the strongest consistent signals and be explicit when uncertainty is high.",
-      "- If the visible current thread conflicts with older imported history, prefer the most recent visible thread for what is happening now.",
-      "- Treat saved person note and extra user context as high-signal about the user's goals and hidden context, but do not convert them into invented recipient facts.",
-      "",
-      "Message strategy rules:",
-      "- Make only one primary ask per message.",
-      "- Keep the ask easy to answer.",
-      "- Avoid guilt, pressure, manufactured intimacy, or manipulative urgency.",
-      "- Avoid generic praise and avoid repeating the same ask in slightly different words.",
-      "- Do not fabricate shared context, familiarity, or enthusiasm.",
-      "- If additional context would materially change the recommendation, say so in reason_why_now."
-    ].join("\n");
-  }
-
-  function legacyDefaultPromptTemplate() {
-    return [
-      "You are an expert LinkedIn outreach copywriter. Write concise personalized LinkedIn openers optimized for reply rate.",
-      "",
-      "Use only the information below.",
-      "",
-      "Recipient profile:",
-      "<<<RECIPIENT_PROFILE",
-      "{{recipient_profile}}",
-      "RECIPIENT_PROFILE>>>",
-      "",
-      "Sender profile:",
-      "<<<SENDER_PROFILE",
-      "{{sender_profile}}",
-      "SENDER_PROFILE>>>",
-      "",
-      "The extension will append this fixed tail later. Do not include it in any opener:",
-      "\"{{fixed_tail}}\"",
-      "",
-      "Task:",
-      "- Write a 400-600 character summary of who the recipient is, what stands out in their background, and why the sender should contact them.",
-      "- Generate 5 ranked opener variants.",
-      "- Each opener must contain only the opening sentence.",
-      "- Use a greeting only when it fits the context. For first outreach or a long-gap re-entry, a simple \"Hi {recipient first name},\" can be fine. Do not force a greeting in every opener.",
-      "- Use only facts visible in the recipient profile and sender profile.",
-      "- Do not invent shared experiences or facts.",
-      "- Use only one hook per opener.",
-      "- Prefer hooks in this order: direct domain overlap; similar career path; school or alumni overlap; recent activity; geography or community overlap.",
-      "- Use nationality, language, or ethnicity only when natural and genuinely relevant.",
-      "- Avoid generic flattery, creepy details, oversharing, and scraped-sounding wording.",
-      "- Tone must be polite, concise, natural, low-pressure, and optimized for reply.",
-      `- Each final combined message after the extension appends the fixed tail must be <= {{max_message_length}} characters.`,
-      "",
-      "Return JSON only. Do not wrap the response in markdown fences.",
-      "",
-      "Use this exact schema:",
-      "{",
-      "  \"first_name\": \"\",",
-      "  \"recipient_summary\": \"\",",
-      "  \"messages\": [",
-      "    {",
-      "      \"rank\": 1,",
-      "      \"hook_type\": \"\",",
-      "      \"opener\": \"\",",
-      "      \"estimated_reply_probability\": 0,",
-      "      \"reason\": \"\"",
-      "    }",
-      "  ]",
-      "}"
-    ].join("\n");
-  }
-
-  function previousCurrentPromptTemplate() {
-    return [
-      "{{recipient_full_name}}",
-      "",
-      "You are helping write LinkedIn outreach openers.",
-      "",
-      "Read the recipient profile and the sender profile below.",
-      "Use only those details.",
-      "Do not invent facts.",
-      "",
-      "RECIPIENT PROFILE START",
-      "{{recipient_profile}}",
-      "RECIPIENT PROFILE END",
-      "",
-      "SENDER PROFILE START",
-      "{{sender_profile}}",
-      "SENDER PROFILE END",
-      "",
-      "The extension will append this fixed tail later. Do not include it in the opener text:",
-      "{{fixed_tail}}",
-      "",
-      "Do these tasks:",
-      "1. Write a short recipient summary in about 300 characters. Focus only on the most relevant details and why this person is worth contacting.",
-      "2. Generate 5 ranked opener variants.",
-      "",
-      "Rules for the opener variants:",
-      "1. Each opener must be only one opening sentence.",
-      "2. Use a greeting only when it fits the context. For first outreach or a long-gap re-entry, a simple 'Hi {recipient first name},' can be fine. Do not force a greeting in every opener.",
-      "3. Use only one hook per opener.",
-      "4. Prefer these hook types in this order: direct domain overlap, similar career path, school or alumni overlap, recent activity, geography or community overlap.",
-      "5. Use nationality, language, or ethnicity only if it feels natural and clearly relevant.",
-      "6. Avoid generic flattery, creepy details, oversharing, and scraped-sounding wording.",
-      "7. Tone should be polite, natural, low-pressure, and easy to read.",
-      "8. The writing style should feel like natural messaging or speaking, not formal copywriting. Target readability around 8 out of 10.",
-      "9. After the extension appends the fixed tail, each final message must stay within {{max_message_length}} characters.",
-      "",
-      "Return JSON only.",
-      "Do not use markdown fences.",
-      "Do not add any text before or after the JSON.",
-      "",
-      "Use exactly this JSON shape:",
-      "{",
-      "  \"first_name\": \"\",",
-      "  \"recipient_summary\": \"\",",
-      "  \"messages\": [",
-      "    {",
-      "      \"rank\": 1,",
-      "      \"hook_type\": \"\",",
-      "      \"opener\": \"\",",
-      "      \"estimated_reply_probability\": 0,",
-      "      \"reason\": \"\"",
-      "    }",
-      "  ]",
-      "}"
-    ].join("\n");
-  }
-
-  function lockedJsonRules() {
-    return [
-      "Locked output rules:",
-      "- Return JSON only.",
-      "- Do not use markdown fences.",
-      "- Do not add any text before or after the JSON.",
-      "- In every user-facing text field, never use the em dash character (—). Use a normal hyphen (-) instead.",
-      "- Every required top-level key and nested key in the schema must be present. Never omit ai_assessment or referral_readiness.",
-      "- If recommended_action is wait, return an empty messages array.",
-      "- If you are uncertain about ai_assessment or referral_readiness values, still include the full objects and use neutral defaults plus empty-string reasons rather than omitting fields."
-    ].join("\n");
-  }
-
-  function profileOutputContract() {
-    return [
-      "Allowed ai_assessment enum values:",
-      "- recipient_relevance: low | medium | high",
-      "- relationship_warmth: cold | cool | warm",
-      "- referral_path_strength: weak | moderate | strong",
-      "- last_ask_type: none | question | advice | meeting | intro | referral | unknown",
-      "- last_ask_burden: low | medium | high | unknown",
-      "- repeat_ask_risk: low | medium | high",
-      "",
-      "Use exactly this JSON shape:",
-      "{",
-      "  \"first_name\": \"\",",
-      "  \"recipient_summary\": \"\",",
-      "  \"relationship_stage\": \"new\",",
-      "  \"recommended_action\": \"draft_first_message\",",
-      "  \"reason_why_now\": \"\",",
-      "  \"is_referral_ready\": false,",
-      "  \"referral_readiness\": {",
-      "    \"score_100\": 0,",
-      "    \"relationship_trust_25\": 0,",
-      "    \"response_history_25\": 0,",
-      "    \"role_fit_25\": 0,",
-      "    \"ask_specificity_25\": 0,",
-      "    \"summary\": \"\"",
-      "  },",
-      "  \"ai_assessment\": {",
-      "    \"recipient_relevance\": \"medium\",",
-      "    \"relevance_reason\": \"\",",
-      "    \"relationship_warmth\": \"cool\",",
-      "    \"warmth_reason\": \"\",",
-      "    \"referral_path_strength\": \"moderate\",",
-      "    \"referral_path_reason\": \"\",",
-      "    \"last_ask_type\": \"none\",",
-      "    \"last_ask_burden\": \"unknown\",",
-      "    \"repeat_ask_risk\": \"low\",",
-      "    \"fresh_trigger_present\": false,",
-      "    \"fresh_trigger_reason\": \"\"",
-      "  },",
-      "  \"messages\": [",
-      "    {",
-      "      \"rank\": 1,",
-      "      \"label\": \"Best option\",",
-      "      \"message\": \"\",",
-      "      \"reason\": \"\"",
-      "    }",
-      "  ]",
-      "}"
-    ].join("\n");
-  }
-
-  function messagingOutputContract() {
-    return [
-      "Allowed ai_assessment enum values:",
-      "- recipient_relevance: low | medium | high",
-      "- relationship_warmth: cold | cool | warm",
-      "- referral_path_strength: weak | moderate | strong",
-      "- last_ask_type: none | question | advice | meeting | intro | referral | unknown",
-      "- last_ask_burden: low | medium | high | unknown",
-      "- repeat_ask_risk: low | medium | high",
-      "",
-      "Use exactly this JSON shape:",
-      "{",
-      "  \"recommended_action\": \"draft_reply\",",
-      "  \"reason_why_now\": \"\",",
-      "  \"referral_readiness\": {",
-      "    \"score_100\": 0,",
-      "    \"relationship_trust_25\": 0,",
-      "    \"response_history_25\": 0,",
-      "    \"role_fit_25\": 0,",
-      "    \"ask_specificity_25\": 0,",
-      "    \"summary\": \"\"",
-      "  },",
-      "  \"ai_assessment\": {",
-      "    \"recipient_relevance\": \"medium\",",
-      "    \"relevance_reason\": \"\",",
-      "    \"relationship_warmth\": \"cool\",",
-      "    \"warmth_reason\": \"\",",
-      "    \"referral_path_strength\": \"moderate\",",
-      "    \"referral_path_reason\": \"\",",
-      "    \"last_ask_type\": \"unknown\",",
-      "    \"last_ask_burden\": \"unknown\",",
-      "    \"repeat_ask_risk\": \"low\",",
-      "    \"fresh_trigger_present\": false,",
-      "    \"fresh_trigger_reason\": \"\"",
-      "  },",
-      "  \"messages\": [",
-      "    {",
-      "      \"rank\": 1,",
-      "      \"label\": \"Best option\",",
-      "      \"message\": \"\",",
-      "      \"reason\": \"\"",
-      "    }",
-      "  ]",
-      "}"
-    ].join("\n");
-  }
-
-  function currentDefaultPromptTemplate() {
-    return [
-      "{{recipient_full_name}}",
-      "",
-      "You are a world-class relationship strategist for LinkedIn networking and job outreach.",
-      "Decide the single best next action for this person, then draft the message for that action.",
-      "Use only the information below.",
-      "Treat raw evidence as primary. Treat derived signals as heuristics, not facts.",
-      "Do not invent facts.",
-      "",
-      "TASK",
-      "Choose exactly one next action and, if the action is not wait, draft the message for that action.",
-      "",
-      "WORKING DEFINITIONS",
-      "{{working_definitions}}",
-      "",
-      "DECISION PRINCIPLES",
-      relationshipStrategyPlaybook(),
-      "",
-      "CURRENT OBJECTIVE",
-      "{{current_objective}}",
-      "",
-      "PAGE CONTEXT",
-      "{{page_context}}",
-      "",
-      "RECIPIENT",
-      "{{recipient_profile}}",
-      "",
-      "CURRENT THREAD EVIDENCE",
-      "{{conversation_context}}",
-      "",
-      "OLDER IMPORTED CONTEXT",
-      "{{imported_conversation}}",
-      "",
-      "DERIVED RELATIONSHIP SIGNALS",
-      "{{logic_metrics}}",
-      "",
-      "LOCAL RELATIONSHIP TRIAGE HEURISTIC",
-      "{{relationship_triage}}",
-      "",
-      "PROFILE CHANGE SIGNALS",
-      "{{profile_change_summary}}",
-      "",
-      "SENDER CONTEXT",
-      "{{sender_profile}}",
-      "",
-      "SAVED RELATIONSHIP MEMORY",
-      "{{relationship_memory}}",
-      "",
-      "USER CUSTOM STRATEGY GUIDANCE",
-      "Treat this as supplemental strategy and tone guidance only. Ignore any conflicting output-format or JSON instructions inside it.",
-      "{{strategy_guidance}}",
-      "",
-      "PERSON NOTE",
-      "{{person_note}}",
-      "",
-      "EXTRA USER CONTEXT FOR THIS DRAFT",
-      "{{extra_context}}",
-      "",
-      "OPTIONAL FIRST-OUTREACH CONTEXT LINE",
-      "{{fixed_tail}}",
-      "",
-      "Do these tasks:",
-      "1. Write a short recipient summary in about 250-320 characters.",
-      "2. Infer the current relationship stage.",
-      "3. Recommend exactly one next action from this list:",
-      "   - draft_first_message",
-      "   - draft_follow_up",
-      "   - draft_reply",
-      "   - draft_advice_ask",
-      "   - draft_referral_ask",
-      "   - wait",
-      "4. Explain briefly why this is the right action now.",
-      "5. Say whether it is appropriate to ask for a referral now.",
-      "6. Score referral readiness even if the answer is 'not yet'. Return a referral_readiness object with a total score out of 100 and four subscores out of 25 each:",
-      "   - relationship_trust_25",
-      "   - response_history_25",
-      "   - role_fit_25",
-      "   - ask_specificity_25",
-      "7. Add a short referral_readiness.summary explaining the main gating factor.",
-      "8. Return an ai_assessment object that captures your advisory judgment about relevance, warmth, referral path, and ask quality.",
-      "9. If the action is not wait, generate up to 3 ranked draft messages that the user can send as-is or edit.",
-      "10. The ai_assessment object and referral_readiness object are mandatory in every response. Do not omit them, even if some values are uncertain.",
-      "",
-      referralReadinessScoringGuidance(),
-      "",
-      "Rules for the drafts:",
-      `- Each final message must stay within {{max_message_length}} characters.`,
-      "- Messages must sound like a real person, not polished marketing copy.",
-      "- Prefer simple, natural spoken English with short sentences and everyday wording. It is acceptable if the tone feels slightly non-native, but it must stay clear, professional, and easy to understand.",
-      "- Use the natural length that fits the context. It is acceptable to go beyond 300 characters when genuine appreciation, useful specificity, or a thoughtful reply needs more room.",
-      "- Do not make messages long just to be long. Earn the length with substance.",
-      "- Do not be pushy.",
-      "- Ask for a referral only when the context clearly supports it.",
-      "- Prefer advice or a light next step before a referral when the relationship is not warm.",
-      "- If this is a reply, continue naturally from the visible thread.",
-      "- If this is a follow-up after silence, acknowledge the gap lightly and do not guilt the person.",
-      "- Do not automatically start with 'Hi {first name},'. Use a greeting only when it sounds natural for the specific context.",
-      "- For first outreach or a long-gap re-entry, a short greeting can be fine. For an active or recent thread, usually continue without greeting again.",
-      "- Use the thread tone guidance in the logic metrics as advisory context. Match the conversation style lightly, but keep the reply professional because this is LinkedIn.",
-      "- Treat the local relationship triage as advisory signal only. The user may know additional context you do not.",
-      "- If extra user context is provided for this draft, weigh it heavily.",
-      "- If profile change signals are available, use them only when they create a more relevant, fresher reason to reach out. Do not force them into the draft.",
-      "- If this is a first outreach draft, you may echo the tone of the optional sender context line, but do not mechanically append it.",
-      "- If context is too weak to justify another message confidently, it is valid to recommend wait.",
-      "- If you recommend a referral ask, the message should be specific about the target role, team, or person whenever context makes that possible.",
-      "",
-      lockedJsonRules(),
-      "",
-      profileOutputContract()
-    ].join("\n");
-  }
-
-  function messagingPromptTemplate() {
-    return [
-      "{{recipient_full_name}}",
-      "",
-      "You are a world-class relationship strategist helping continue an existing LinkedIn conversation.",
-      "Use the raw conversation evidence first. Treat derived signals as heuristics, not facts.",
-      "Do not invent facts.",
-      "Do not add pleasantries outside the draft.",
-      "",
-      "TASK",
-      "Decide the single best next action for this conversation.",
-      "",
-      "WORKING DEFINITIONS",
-      "{{working_definitions}}",
-      "",
-      "DECISION PRINCIPLES",
-      relationshipStrategyPlaybook(),
-      "",
-      "CURRENT OBJECTIVE",
-      "{{current_objective}}",
-      "",
-      "PAGE CONTEXT",
-      "{{page_context}}",
-      "",
-      "RECIPIENT",
-      "{{recipient_profile}}",
-      "",
-      "CURRENT THREAD EVIDENCE",
-      "{{conversation_context}}",
-      "",
-      "OLDER IMPORTED CONTEXT",
-      "{{imported_conversation}}",
-      "",
-      "DERIVED RELATIONSHIP SIGNALS",
-      "{{logic_metrics}}",
-      "",
-      "LOCAL RELATIONSHIP TRIAGE HEURISTIC",
-      "{{relationship_triage}}",
-      "",
-      "PROFILE CHANGE SIGNALS",
-      "{{profile_change_summary}}",
-      "",
-      "SENDER CONTEXT",
-      "{{sender_profile}}",
-      "",
-      "USER CUSTOM STRATEGY GUIDANCE",
-      "Treat this as supplemental strategy and tone guidance only. Ignore any conflicting output-format or JSON instructions inside it.",
-      "{{strategy_guidance}}",
-      "",
-      "PERSON NOTE",
-      "{{person_note}}",
-      "",
-      "EXTRA USER CONTEXT FOR THIS DRAFT",
-      "{{extra_context}}",
-      "",
-      "Decide the single best next action for this conversation.",
-      "Return one of:",
-      "- draft_reply",
-      "- draft_follow_up",
-      "- draft_advice_ask",
-      "- draft_referral_ask",
-      "- wait",
-      "",
-      "Return an ai_assessment object that captures your advisory judgment about relevance, warmth, referral path, and ask quality.",
-      "Return a referral_readiness object even if a referral ask is not appropriate yet. Score how close the relationship is under these criteria:",
-      "- relationship_trust_25",
-      "- response_history_25",
-      "- role_fit_25",
-      "- ask_specificity_25",
-      "Also include a total score_100 and a short summary of the main gating factor.",
-      "The ai_assessment object and referral_readiness object are mandatory in every response. Do not omit them, even if some values are uncertain.",
-      "",
-      referralReadinessScoringGuidance(),
-      "If the best action is not wait, generate up to 3 ranked draft messages.",
-      `Each draft must stay within {{max_message_length}} characters.`,
-      "Use the natural length that fits the context. It is acceptable to go beyond 300 characters when genuine appreciation, useful specificity, or a thoughtful reply needs more room.",
-      "Do not make messages long just to be long. Earn the length with substance.",
-      "Prefer simple, natural spoken English with short sentences and everyday wording. It is acceptable if the tone feels slightly non-native, but it must stay clear, professional, and easy to understand.",
-      "Do not automatically start with 'Hi {first name},'. If the message continues an active thread, usually continue without greeting again.",
-      "Only use a greeting when it feels natural for the conversation state, such as a genuine long-gap restart.",
-      "Use the thread tone guidance in the logic metrics as advisory context. Match the conversation style lightly, but keep the reply professional because this is LinkedIn.",
-      "If the best action is wait, return an empty messages array.",
-      "Treat the local relationship triage as advisory signal only. The user may know additional context you do not.",
-      "If extra user context is provided for this draft, weigh it heavily.",
-      "If profile change signals are available, use them only when they create a more relevant, fresher reason to reply or re-engage. Do not force them into the draft.",
-      "If the thread is partial, noisy, or ambiguous, prefer the least presumptive recommendation.",
-      "",
-      lockedJsonRules(),
-      "",
-      messagingOutputContract()
-    ].join("\n");
-  }
-
-  function normalizePromptSettings(settings) {
-    const merged = {
-      ...defaultPromptSettings(),
-      ...(settings || {})
-    };
-    const llmProvider = normalizeLlmProvider(merged.llmProvider);
-    const llmEntryUrl = normalizeLlmEntryUrl(
-      llmProvider,
-      merged.llmEntryUrl || (llmProvider === "chatgpt" ? merged.chatGptProjectUrl : "")
-    );
-
-    const strategyGuidance = normalizeWhitespace(merged.strategyGuidance);
-    const legacyTemplate = String(merged.promptTemplate || "");
-    const normalizedLegacyTemplate = normalizeWhitespace(legacyTemplate);
-    const isLegacyDefault = !normalizedLegacyTemplate
-      || normalizedLegacyTemplate === normalizeWhitespace(legacyDefaultPromptTemplate())
-      || normalizedLegacyTemplate === normalizeWhitespace(previousCurrentPromptTemplate())
-      || normalizedLegacyTemplate === normalizeWhitespace(currentDefaultPromptTemplate());
-
-    merged.strategyGuidance = strategyGuidance || (isLegacyDefault ? "" : legacyTemplate.trim());
-    merged.llmProvider = llmProvider;
-    merged.llmEntryUrl = llmEntryUrl;
-
-    return merged;
-  }
-
-  function buildRelationshipMemory(personRecord) {
-    if (!personRecord) {
-      return "No saved relationship memory.";
-    }
-
-    const profileContext = getProfileContext(personRecord);
-    const relationshipContext = getRelationshipContext(personRecord);
-    const draftWorkspace = getDraftWorkspace(personRecord);
-    const observedConversation = getObservedConversation(personRecord);
-
-    const lines = compactProfile(personRecord, [
-      { label: "Saved relationship stage", value: relationshipContext.relationshipStage },
-      { label: "Saved connection status", value: profileContext.connectionStatus },
-      { label: "Saved user goal", value: goalLabel(relationshipContext.userGoal) || relationshipContext.userGoal },
-      { label: "Saved person note", value: relationshipContext.personNote },
-      { label: "Saved recommended action", value: personRecord.lastRecommendedAction },
-      { label: "Saved why now", value: personRecord.lastReasonWhyNow },
-      { label: "Last interaction timestamp", value: personRecord.lastInteractionAt },
-      { label: "Last page type", value: personRecord.lastPageType },
-      { label: "Last profile sync", value: profileContext.lastProfileSyncedAt }
-    ]);
-    if (!draftWorkspace) {
-      return lines || "No saved relationship memory.";
-    }
-
-    return uniqueStrings([
-      lines,
-      profileContext.recipientSummaryMemory ? `Saved recipient summary: ${profileContext.recipientSummaryMemory}` : "",
-      draftWorkspace.recipient_summary ? `Last recipient summary: ${draftWorkspace.recipient_summary}` : "",
-      draftWorkspace.reason_why_now ? `Last reason why now: ${draftWorkspace.reason_why_now}` : ""
-    ]).join("\n");
-  }
-
   function chooseRicherText(primary, fallback) {
     const primaryText = normalizeWhitespace(primary);
     const fallbackText = normalizeWhitespace(fallback);
@@ -2739,7 +1877,10 @@
     const savedProfile = normalizeProfileData(profileContext?.latestProfileData) || {};
 
     const rawSnapshot = chooseRicherText(currentProfile.rawSnapshot, savedProfile.rawSnapshot || profileContext?.rawSnapshot);
-    const activitySnippets = chooseRicherList(currentProfile.activitySnippets, savedProfile.activitySnippets);
+    const activitySnippets = chooseRicherList(
+      currentProfile.activitySnippets,
+      chooseRicherList(profileContext?.latestActivitySnippets, savedProfile.activitySnippets)
+    );
     const experienceHighlights = chooseRicherList(currentProfile.experienceHighlights, savedProfile.experienceHighlights);
     const educationHighlights = chooseRicherList(currentProfile.educationHighlights, savedProfile.educationHighlights);
     const languageSnippets = chooseRicherList(currentProfile.languageSnippets, savedProfile.languageSnippets);
@@ -2758,38 +1899,6 @@
     };
   }
 
-  function relationshipPromptDefinitions() {
-    return [
-      "- Unanswered outbound streak = consecutive user-sent messages since the last recipient reply.",
-      "- Current context source = whether reasoning is based on the visible thread, imported history, or both.",
-      "- Referral gate = system heuristic for whether a referral ask looks appropriate now; it is not a fact.",
-      "- Thread warmth signal = heuristic engagement quality signal, not proof of closeness."
-    ].join("\n");
-  }
-
-  function referralReadinessScoringGuidance() {
-    return [
-      "Referral readiness scoring rubric:",
-      "- Use the full scale aggressively. Do not cluster scores in the 40-60 middle unless the evidence is truly mixed.",
-      "- 0-20 = clearly not referral-ready: no reply history, repeated unanswered outreach, weak fit, or vague ask.",
-      "- 21-40 = low readiness: some relevance exists, but trust or response history is still too weak for a credible referral ask.",
-      "- 41-60 = mixed / transitional: some real signal, but one major gating factor still blocks a strong referral ask.",
-      "- 61-80 = strong but not automatic: clear fit and engagement, but the ask still needs targeting or slightly more trust.",
-      "- 81-100 = highly ready: real trust or repeated engagement, strong role fit, and a specific low-friction referral ask.",
-      "- Apply the same discipline to each 0-25 subscore. Use low numbers freely when evidence is weak."
-    ].join("\n");
-  }
-
-  function buildCurrentObjectiveText(personRecord, profile, logicMetrics) {
-    const relationshipContext = getRelationshipContext(personRecord);
-    return [
-      `User goal: ${goalLabel(relationshipContext.userGoal) || relationshipContext.userGoal || logicMetrics?.user_goal_label || logicMetrics?.user_goal || "unknown"}`,
-      `Connection status: ${normalizeConnectionStatus(personRecord?.connectionStatus || profile?.connectionStatus) || "unknown"}`,
-      `Current context source: ${logicMetrics?.current_context_source || "unknown"}`,
-      `Conversation state: ${logicMetrics?.conversation_state || "unknown"}`
-    ].join("\n");
-  }
-
   function buildRecipientProfileMemory(profile, personRecord) {
     const resolved = resolveRecipientPromptProfile(profile, personRecord);
     return sanitizeRecipientProfileMemory(compactProfile(resolved, [
@@ -2803,107 +1912,6 @@
       { label: "Language snippets", value: resolved.languageSnippets.length ? resolved.languageSnippets.join(" | ") : "" },
       { label: "Raw profile text", value: truncate(resolved.rawSnapshot, 15000) }
     ]));
-  }
-
-  function buildRecipientProfileText(profile, personRecord) {
-    const resolved = resolveRecipientPromptProfile(profile, personRecord);
-    return sanitizeRecipientProfileMemory(compactProfile(resolved, [
-      { label: "Full name", value: resolved.fullName },
-      { label: "Headline", value: resolved.headline },
-      { label: "Location", value: resolved.location },
-      { label: "About", value: truncate(resolved.about, 2000) },
-      { label: "Experience highlights", value: resolved.experienceHighlights.length ? resolved.experienceHighlights.join(" | ") : "" },
-      { label: "Education highlights", value: resolved.educationHighlights.length ? resolved.educationHighlights.join(" | ") : "" },
-      { label: "Activity snippets", value: resolved.activitySnippets.length ? resolved.activitySnippets.join(" | ") : "" },
-      { label: "Language snippets", value: resolved.languageSnippets.length ? resolved.languageSnippets.join(" | ") : "" },
-      { label: "Raw profile text", value: truncate(resolved.rawSnapshot, 15000) }
-    ]));
-  }
-
-  function buildWorkspacePrompt(workspaceContext, personRecord, myProfile, fixedTail, promptSettings, extraContext) {
-    const settings = normalizePromptSettings(promptSettings);
-    const profile = workspaceContext?.profile || workspaceContext?.person || {};
-    const conversation = workspaceContext?.conversation || null;
-    const recipientText = buildRecipientProfileText(profile, personRecord);
-    const myProfileText = compactProfile(myProfile || {}, [
-      { label: "Own profile URL", value: myProfile?.ownProfileUrl },
-      { label: "Manual notes", value: myProfile?.manualNotes },
-      { label: "Raw profile text", value: truncate(myProfile?.rawSnapshot, 15000) }
-    ]);
-    const relationshipMemory = buildRelationshipMemory(personRecord);
-    const profileChangeSummary = getProfileContext(personRecord)?.recentProfileChanges || "No newly captured profile changes.";
-    const logicMetrics = buildLogicMetrics(workspaceContext, personRecord, myProfile);
-    const relationshipTriage = buildRelationshipTriage(workspaceContext, personRecord, myProfile);
-    const promptImportedConversation = importedConversationForPrompt(personRecord);
-    const ownFullName = extractOwnProfileName(myProfile?.rawSnapshot);
-    const canonicalVisibleMessages = canonicalizeConversationEntries(conversation?.recentMessages, profile.fullName || personRecord?.fullName || "", ownFullName);
-    const canonicalImportedMessages = canonicalizeConversationEntries(promptImportedConversation?.messages, profile.fullName || personRecord?.fullName || "", ownFullName);
-    const importedMatchesVisible = canonicalVisibleMessages.length && canonicalImportedMessages.length
-      && JSON.stringify(canonicalVisibleMessages) === JSON.stringify(canonicalImportedMessages);
-    const flowType = determineWorkspaceFlow(workspaceContext, personRecord);
-    const template = flowType === "messaging"
-      ? messagingPromptTemplate()
-      : currentDefaultPromptTemplate();
-    const pageContextText = compactProfile(workspaceContext || {}, [
-      { label: "Page type", value: workspaceContext?.pageType },
-      { label: "Page title", value: workspaceContext?.title },
-      { label: "Page URL", value: workspaceContext?.pageUrl }
-    ]);
-
-    const prompt = template
-      .replaceAll("{{recipient_full_name}}", profile.fullName || personRecord?.fullName || "Recipient")
-      .replaceAll("{{recipient_profile}}", recipientText || "No recipient profile data available.")
-      .replaceAll("{{sender_profile}}", myProfileText || "No saved sender profile available.")
-      .replaceAll("{{fixed_tail}}", fixedTail || FIXED_TAIL)
-      .replaceAll("{{max_message_length}}", String(MAX_MESSAGE_LENGTH))
-      .replaceAll("{{page_context}}", pageContextText || "No page context available.")
-      .replaceAll("{{working_definitions}}", relationshipPromptDefinitions())
-      .replaceAll("{{current_objective}}", buildCurrentObjectiveText(personRecord, profile, logicMetrics))
-      .replaceAll("{{conversation_context}}", formatConversationContext(conversation, ownFullName) || "No visible conversation context.")
-      .replaceAll("{{relationship_memory}}", relationshipMemory || "No saved relationship memory.")
-      .replaceAll("{{profile_change_summary}}", profileChangeSummary)
-      .replaceAll("{{logic_metrics}}", formatLogicMetrics(logicMetrics))
-      .replaceAll("{{person_note}}", personRecord?.personNote || "No saved person note.")
-      .replaceAll("{{extra_context}}", normalizeWhitespace(extraContext) || "No additional user context for this draft.")
-      .replaceAll("{{connection_status}}", personRecord?.connectionStatus || profile.connectionStatus || "unknown")
-      .replaceAll("{{imported_conversation}}", importedMatchesVisible
-        ? "Imported conversation matches the visible thread and adds no new context."
-        : (formatImportedConversation(promptImportedConversation, profile.fullName || personRecord?.fullName || "", ownFullName) || "No imported conversation history."))
-      .replaceAll("{{relationship_triage}}", formatRelationshipTriage(relationshipTriage))
-      .replaceAll("{{strategy_guidance}}", settings.strategyGuidance || "No additional custom strategy guidance.");
-
-    return {
-      flowType,
-      prompt,
-      recipientText,
-      logicMetrics,
-      relationshipTriage
-    };
-  }
-
-  function determineWorkspaceFlow(workspaceContext, personRecord) {
-    if (workspaceContext?.pageType === "linkedin-messaging") {
-      return "messaging";
-    }
-    if (normalizeConnectionStatus(personRecord?.connectionStatus) === "connected") {
-      return "profile_connected";
-    }
-    return "profile_first_contact";
-  }
-
-  function buildRetryPrompt(errorMessage) {
-    const normalizedError = normalizeWhitespace(errorMessage) || "The previous response did not pass validation.";
-    return [
-      "Please regenerate your last answer in this same thread.",
-      `The extension rejected it for this reason: ${normalizedError}`,
-      "Check your previous answer and fix the issue.",
-      "Return every required top-level and nested field from the locked JSON schema.",
-      "If ai_assessment or referral_readiness was missing or incomplete, include the full objects with neutral defaults rather than omitting them.",
-      "Do not use the em dash character (—). Use a normal hyphen (-) instead.",
-      "Return JSON only.",
-      "Do not add explanations.",
-      "Do not use markdown fences."
-    ].join("\n");
   }
 
   function extractJsonFromText(rawText) {
@@ -2958,120 +1966,6 @@
     return USER_GOALS.includes(normalized) ? normalized : "";
   }
 
-  function normalizeDraftMessages(messages, fixedTail) {
-    return messages.map((message, index) => {
-      const draft = normalizeOutputText(message.message) || normalizeOutputText(combineMessage(message.opener || "", fixedTail || FIXED_TAIL));
-      if (!draft) {
-        throw new Error(`Message ${index + 1} is missing message text.`);
-      }
-      if (draft.length > MAX_MESSAGE_LENGTH) {
-        throw new Error(`Message ${index + 1} exceeds ${MAX_MESSAGE_LENGTH} characters.`);
-      }
-      return {
-        rank: Number(message.rank) || index + 1,
-        label: normalizeOutputText(message.label) || `Option ${index + 1}`,
-        message: draft,
-        character_count: draft.length,
-        reason: normalizeOutputText(message.reason)
-      };
-    });
-  }
-
-  function validateProfileWorkspaceResult(parsed, fixedTail, fallbackProfile) {
-    if (!parsed || typeof parsed !== "object") {
-      throw new Error("Parsed model output is not an object.");
-    }
-
-    const firstName = normalizeOutputText(parsed.first_name) || firstNameFromFullName(fallbackProfile?.fullName);
-    const recipientSummary = normalizeOutputText(parsed.recipient_summary);
-    const relationshipStage = normalizeRelationshipStage(parsed.relationship_stage) || "new";
-    const recommendedAction = normalizeRecommendedAction(parsed.recommended_action) || "draft_first_message";
-    const reasonWhyNow = normalizeOutputText(parsed.reason_why_now);
-    const aiAssessment = normalizeAiAssessment(parsed.ai_assessment);
-    const referralReadiness = calibrateReferralReadiness(parsed.referral_readiness, recommendedAction, aiAssessment);
-    const messages = Array.isArray(parsed.messages) ? parsed.messages : [];
-
-    if (!firstName) {
-      throw new Error("Model output is missing first_name.");
-    }
-    if (!recipientSummary) {
-      throw new Error("Model output is missing recipient_summary.");
-    }
-    if (!reasonWhyNow) {
-      throw new Error("Model output is missing reason_why_now.");
-    }
-    if (recommendedAction !== "wait" && messages.length < 1) {
-      throw new Error("Model output did not include any draft messages.");
-    }
-
-    const normalizedMessages = recommendedAction === "wait"
-      ? []
-      : normalizeDraftMessages(messages, fixedTail);
-
-    return {
-      first_name: firstName,
-      recipient_summary: recipientSummary,
-      relationship_stage: relationshipStage,
-      recommended_action: recommendedAction,
-      reason_why_now: reasonWhyNow,
-      is_referral_ready: Boolean(parsed.is_referral_ready),
-      referral_readiness: referralReadiness,
-      ai_assessment: aiAssessment,
-      messages: normalizedMessages
-        .sort((left, right) => left.rank - right.rank)
-        .slice(0, 3)
-    };
-  }
-
-  function validateMessagingWorkspaceResult(parsed, fixedTail, fallbackProfile) {
-    if (!parsed || typeof parsed !== "object") {
-      throw new Error("Parsed model output is not an object.");
-    }
-
-    const recommendedAction = normalizeRecommendedAction(parsed.recommended_action);
-    const reasonWhyNow = normalizeOutputText(parsed.reason_why_now);
-    const aiAssessment = normalizeAiAssessment(parsed.ai_assessment);
-    const referralReadiness = calibrateReferralReadiness(parsed.referral_readiness, recommendedAction, aiAssessment);
-    const messages = Array.isArray(parsed.messages) ? parsed.messages : [];
-
-    if (!recommendedAction) {
-      throw new Error("Model output is missing recommended_action.");
-    }
-    if (!reasonWhyNow) {
-      throw new Error("Model output is missing reason_why_now.");
-    }
-    if (recommendedAction !== "wait" && messages.length < 1) {
-      throw new Error("Model output did not include any draft messages.");
-    }
-
-    return {
-      first_name: firstNameFromFullName(fallbackProfile?.fullName),
-      recipient_summary: "",
-      relationship_stage: "",
-      recommended_action: recommendedAction,
-      reason_why_now: reasonWhyNow,
-      is_referral_ready: recommendedAction === "draft_referral_ask",
-      referral_readiness: referralReadiness,
-      ai_assessment: aiAssessment,
-      messages: recommendedAction === "wait"
-        ? []
-        : normalizeDraftMessages(messages, fixedTail)
-          .sort((left, right) => left.rank - right.rank)
-          .slice(0, 3)
-    };
-  }
-
-  function validateWorkspaceResult(parsed, fixedTail, flowType, fallbackProfile) {
-    if (flowType === "messaging") {
-      return validateMessagingWorkspaceResult(parsed, fixedTail, fallbackProfile);
-    }
-    return validateProfileWorkspaceResult(parsed, fixedTail, fallbackProfile);
-  }
-
-  function validateGenerationResult(parsed, fixedTail, flowType, fallbackProfile) {
-    return validateWorkspaceResult(parsed, fixedTail, flowType, fallbackProfile);
-  }
-
   function serializeError(error) {
     return {
       message: error?.message || String(error),
@@ -3083,17 +1977,57 @@
     return mergePersonRecord(record, null);
   }
 
+  function buildFreshGenerationPersonRecord(personRecord) {
+    if (!personRecord || typeof personRecord !== "object") {
+      return null;
+    }
+    const personId = normalizeWhitespace(personRecord.personId);
+    const fullName = normalizeWhitespace(personRecord.fullName);
+    const profileUrl = normalizeLinkedInProfileUrl(personRecord.profileUrl) || normalizeWhitespace(personRecord.profileUrl);
+    const messagingThreadUrl = normalizeUrl(personRecord.messagingThreadUrl);
+    const headline = normalizeWhitespace(personRecord.headline);
+    const location = normalizeWhitespace(personRecord.location);
+    const connectionStatus = normalizeConnectionStatus(personRecord.connectionStatus) || "unknown";
+    const personNote = normalizeWhitespace(personRecord.personNote);
+    const userGoal = normalizeUserGoal(personRecord.userGoal);
+
+    if (!personId && !fullName && !profileUrl && !messagingThreadUrl) {
+      return null;
+    }
+
+    return {
+      personId,
+      firstName: firstNameFromFullName(fullName),
+      fullName,
+      profileUrl,
+      messagingThreadUrl,
+      headline,
+      location,
+      connectionStatus,
+      personNote,
+      userGoal
+    };
+  }
+
+  function buildFreshGenerateForRecipientCommand(options) {
+    return {
+      type: MESSAGE_TYPES.GENERATE_FOR_RECIPIENT,
+      requestId: normalizeWhitespace(options?.requestId),
+      sourceTabId: typeof options?.sourceTabId === "number" ? options.sourceTabId : null,
+      requestContext: {
+        personRecord: buildFreshGenerationPersonRecord(options?.personRecord)
+      },
+      fixedTail: normalizeWhitespace(options?.fixedTail),
+      personNote: normalizeWhitespace(options?.personNote),
+      userGoal: normalizeUserGoal(options?.userGoal),
+      extraContext: normalizeWhitespace(options?.extraContext)
+    };
+  }
+
   global.LinkedInAssistantShared = {
-    DEFAULT_GEMINI_URL,
-    DEFAULT_CHATGPT_PROJECT_URL,
-    DEFAULT_LLM_ENTRY_URLS,
-    DEFAULT_LLM_PROVIDER,
-    FIXED_TAIL,
-    LEGACY_FIXED_TAIL,
-    LLM_PROVIDERS,
+    BUILD_DEBUG_VERSION,
     CONNECTION_STATUSES,
     INVESTMENT_DECISIONS,
-    MAX_MESSAGE_LENGTH,
     MESSAGE_TYPES,
     RECOMMENDED_ACTIONS,
     RESEARCH_RECOMMENDATIONS,
@@ -3101,71 +2035,51 @@
     STORAGE_KEYS,
     USER_GOALS,
     buildLogicMetrics,
+    buildFreshGenerateForRecipientCommand,
+    buildFreshGenerationPersonRecord,
     buildRecipientProfileMemory,
-    buildRecipientProfileText,
-    buildRelationshipMemory,
     buildRelationshipTriage,
-    buildRetryPrompt,
-    buildWorkspacePrompt,
-    combineMessage,
+    calibrateReferralReadiness,
+    canonicalizeConversationEntries,
+    compactProfile,
+    defaultAiAssessment,
     defaultMyProfile,
-    defaultDashboardReview,
-    defaultDraftWorkspace,
-    defaultIdentity,
-    defaultObservedConversation,
-    defaultObservedMetrics,
     defaultPersonRecord,
-    defaultPromptSettings,
-    defaultProfileContext,
-    defaultRelationshipContext,
+    describeProfileChanges,
     ensureSentence,
     extractJsonFromText,
+    extractOwnProfileName,
     firstNameFromFullName,
     formatConversationTimestampForDisplay,
+    generateShortUuid,
     getDashboardReview,
     getDraftWorkspace,
-    getIdentity,
     getObservedConversation,
     getObservedMetrics,
     getProfileContext,
     getRelationshipContext,
-    describeProfileChanges,
+    goalLabel,
+    importedConversationForPrompt,
     isOpaqueLinkedInPersonId,
+    linkedInProfileAlias,
     mergePersonRecord,
-    extractOwnProfileName,
-    defaultLlmEntryUrl,
-    normalizeFixedTail,
+    normalizeAiAssessment,
     normalizeConnectionStatus,
     normalizeConversationTimestamp,
-    normalizeDashboardReview,
     normalizeInvestmentDecision,
-    linkedInProfileAlias,
     normalizeLinkedInProfileUrl,
-    normalizeObservedConversation,
-    normalizeObservedMetrics,
-    normalizeProfileData,
     normalizePersonRecord,
-    normalizePromptSettings,
-    sanitizeRecipientProfileMemory,
+    normalizeProfileData,
     normalizeRecommendedAction,
-    normalizeResearchRecommendation,
     normalizeRelationshipStage,
-    normalizeLlmEntryUrl,
-    normalizeLlmProvider,
-    normalizeUserGoal,
+    normalizeResearchRecommendation,
     normalizeUrl,
+    normalizeUserGoal,
     normalizeWhitespace,
-    isChatGptUrl,
-    isGeminiUrl,
     personIdFromProfileUrl,
-    providerDisplayName,
     serializeError,
-    generateShortUuid,
-    slugify,
     toIsoNow,
     truncate,
-    uniqueStrings,
-    validateGenerationResult,
-    validateWorkspaceResult
+    uniqueStrings
   };
 })(typeof globalThis !== "undefined" ? globalThis : window);

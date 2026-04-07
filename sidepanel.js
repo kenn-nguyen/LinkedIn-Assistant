@@ -1,9 +1,10 @@
 (function initSidePanel() {
   const shared = globalThis.LinkedInAssistantShared;
+  const prompts = globalThis.LinkedInAssistantPrompts;
   const {
-    defaultLlmEntryUrl,
+    BUILD_DEBUG_VERSION,
+    buildFreshGenerateForRecipientCommand,
     extractOwnProfileName,
-    FIXED_TAIL,
     formatConversationTimestampForDisplay,
     MESSAGE_TYPES,
     defaultMyProfile,
@@ -11,26 +12,31 @@
     getDraftWorkspace,
     getObservedConversation,
     getObservedMetrics,
+    getProfileContext,
     mergePersonRecord,
     defaultPersonRecord,
-    defaultPromptSettings,
     normalizeConnectionStatus,
     normalizeConversationTimestamp,
     normalizeInvestmentDecision,
     normalizeRecommendedAction,
     normalizeResearchRecommendation,
     normalizeRelationshipStage,
+    normalizeWhitespace
+  } = shared;
+  const {
+    defaultLlmEntryUrl,
+    defaultPromptSettings,
+    FIXED_TAIL,
     normalizeLlmEntryUrl,
     normalizeLlmProvider,
-    normalizeWhitespace,
     providerDisplayName
-  } = shared;
+  } = prompts;
 
   const state = {
     pageContext: null,
     activeTabId: null,
+    attachedLinkedInTabId: null,
     myProfile: defaultMyProfile(),
-    identityResolutionSettings: { hiddenTabPermission: "ask" },
     promptSettings: defaultPromptSettings(),
     fixedTail: FIXED_TAIL,
     allPeople: [],
@@ -54,6 +60,7 @@
     ctaReadinessByViewKey: {},
     activeGenerationRequestId: "",
     activeGenerationPersonId: "",
+    activeGenerationSourceTabId: null,
     generationProgressText: "",
     generationJobs: [],
     identityWarning: null,
@@ -68,6 +75,9 @@
     messagingReload: null,
     lastGenerationDiagnostics: null,
     resolutionDiagnostics: null,
+    lastProfileExtractionDiagnostics: null,
+    lastSenderProfileSaveDiagnostics: null,
+    lastOpenMessagesDiagnostics: null,
     showingSenderProfilePrompt: false,
     conversationHistoryExpanded: false,
     transientMessagingRetryTimer: null,
@@ -79,6 +89,19 @@
     refreshInFlight: false,
     refreshPromise: null,
     pendingRefreshOptions: null,
+    refreshCache: {
+      key: "",
+      savedAt: 0,
+      response: null
+    },
+    blockingUiLoading: false,
+    blockingUiLoadingText: "",
+    navigationHold: {
+      active: false,
+      targetUrl: "",
+      targetPageType: ""
+    },
+    statusStateByScope: {},
     statusState: {
       text: "",
       isError: false,
@@ -92,6 +115,8 @@
   const CTA_INITIAL_DISABLE_MS = 1000;
 
   const el = {
+    panelLoadingOverlay: document.querySelector("#panel-loading-overlay"),
+    panelLoadingText: document.querySelector("#panel-loading-text"),
     topToolbar: document.querySelector("#top-toolbar"),
     workspaceView: document.querySelector("#workspace-view"),
     statusCard: document.querySelector("#status-card"),
@@ -114,10 +139,14 @@
     personName: document.querySelector("#person-name"),
     personSubtitle: document.querySelector("#person-subtitle"),
     connectionStatusPill: document.querySelector("#connection-status-pill"),
+    unsupportedPageMessage: document.querySelector("#unsupported-page-message"),
     conversationImportMeta: document.querySelector("#conversation-import-meta"),
+    personCardEditButton: document.querySelector("#person-card-edit-button"),
+    personCardEditor: document.querySelector("#person-card-editor"),
     settingsButton: document.querySelector("#settings-button"),
     closeSettingsButton: document.querySelector("#close-settings-button"),
     nextActionButton: document.querySelector("#next-action-button"),
+    nextHelperButton: document.querySelector("#next-helper-button"),
     updateProfileButton: document.querySelector("#update-profile-button"),
     updateProfileMeta: document.querySelector("#update-profile-meta"),
     importConversationButton: document.querySelector("#import-conversation-button"),
@@ -127,14 +156,9 @@
     resetFixedTail: document.querySelector("#reset-fixed-tail"),
     actionPill: document.querySelector("#action-pill"),
     recommendationReason: document.querySelector("#recommendation-reason"),
+    nextStepEvidence: document.querySelector("#next-step-evidence"),
     referralReadiness: document.querySelector("#referral-readiness"),
     draftSection: document.querySelector("#draft-section"),
-    identityResolutionPrompt: document.querySelector("#identity-resolution-prompt"),
-    identityResolutionCopy: document.querySelector("#identity-resolution-copy"),
-    identityResolutionAllowOnce: document.querySelector("#identity-resolution-allow-once"),
-    identityResolutionAllowAlways: document.querySelector("#identity-resolution-allow-always"),
-    identityResolutionNotNow: document.querySelector("#identity-resolution-not-now"),
-    refreshDraftButton: document.querySelector("#refresh-draft-button"),
     toggleAlternativesButton: document.querySelector("#toggle-alternatives-button"),
     primaryDraftLabel: document.querySelector("#primary-draft-label"),
     primaryDraftInput: document.querySelector("#primary-draft-input"),
@@ -147,7 +171,12 @@
     extraContextInput: document.querySelector("#extra-context-input"),
     savePersonNoteButton: document.querySelector("#save-person-note-button"),
     recipientSummaryCard: document.querySelector("#recipient-summary-card"),
+    recipientProfileMeta: document.querySelector("#recipient-profile-meta"),
+    recipientProfileRefreshLink: document.querySelector("#recipient-profile-refresh-link"),
     recipientSummaryText: document.querySelector("#recipient-summary-text"),
+    recipientActivityBlock: document.querySelector("#recipient-activity-block"),
+    recipientActivityMeta: document.querySelector("#recipient-activity-meta"),
+    recipientActivityList: document.querySelector("#recipient-activity-list"),
     conversationCard: document.querySelector("#conversation-card"),
     conversationList: document.querySelector("#conversation-list"),
     contextSection: document.querySelector("#context-section"),
@@ -155,7 +184,6 @@
     promptSettingsForm: document.querySelector("#prompt-settings-form"),
     llmProviderSettingsSelect: document.querySelector("#llm-provider-settings-select"),
     llmProviderUrlInput: document.querySelector("#llm-provider-url-input"),
-    identityResolutionSettingsSelect: document.querySelector("#identity-resolution-settings-select"),
     senderProfileSettingsUrl: document.querySelector("#sender-profile-settings-url"),
     openSenderProfileLink: document.querySelector("#open-sender-profile-link"),
     savePromptSettingsButton: document.querySelector("#save-prompt-settings-button"),
@@ -163,10 +191,13 @@
     senderContextDetails: document.querySelector("#sender-context-details"),
     profileForm: document.querySelector("#profile-form"),
     saveProfileButton: document.querySelector("#save-profile-button"),
-    technicalDetails: document.querySelector("#technical-details"),
-    technicalDetailsSummary: document.querySelector("#technical-details-summary"),
+    globalLogsPanel: document.querySelector("#global-logs-panel"),
+    globalDiagnosticsDetails: document.querySelector("#global-diagnostics-details"),
+    globalDiagnosticsSummary: document.querySelector("#global-diagnostics-summary"),
     manualRecoverySection: document.querySelector("#manual-recovery-section"),
     readLatestResponseButton: document.querySelector("#read-latest-response-button"),
+    copyTechnicalDetailsButton: document.querySelector("#copy-technical-details-button"),
+    clearTechnicalDetailsButton: document.querySelector("#clear-technical-details-button"),
     pageDiagnostics: document.querySelector("#page-diagnostics"),
     senderProfileExtracted: document.querySelector("#sender-profile-extracted"),
     manualPrompt: document.querySelector("#manual-prompt"),
@@ -192,6 +223,13 @@
     dashboardList: document.querySelector("#dashboard-list")
   };
 
+  function setPersonCardEditorOpen(isOpen) {
+    el.personCardEditor?.classList.toggle("hidden", !isOpen);
+    if (el.personCardEditButton) {
+      el.personCardEditButton.textContent = isOpen ? "Hide" : "Edit";
+    }
+  }
+
   const profileFields = {
     manualNotes: document.querySelector("#profile-manual-notes"),
     rawSnapshot: document.querySelector("#profile-raw-snapshot")
@@ -201,11 +239,34 @@
     if (!button) {
       return;
     }
-    if (!button.dataset.defaultLabel) {
-      button.dataset.defaultLabel = button.textContent;
+    if (isLoading) {
+      if (!button.dataset.defaultLabel) {
+        button.dataset.defaultLabel = button.textContent;
+      }
+      button.dataset.loading = "true";
+      button.disabled = true;
+      button.textContent = loadingText;
+      return;
     }
-    button.disabled = isLoading;
-    button.textContent = isLoading ? loadingText : button.dataset.defaultLabel;
+    button.disabled = false;
+    const nextLabel = button.dataset.pendingLabel || button.dataset.defaultLabel || button.textContent;
+    button.textContent = nextLabel;
+    button.dataset.defaultLabel = nextLabel;
+    delete button.dataset.pendingLabel;
+    delete button.dataset.loading;
+  }
+
+  function setButtonLabel(button, label) {
+    if (!button) {
+      return;
+    }
+    const nextLabel = normalizeWhitespace(label) || button.textContent || "";
+    if (button.dataset.loading === "true") {
+      button.dataset.pendingLabel = nextLabel;
+      return;
+    }
+    button.textContent = nextLabel;
+    button.dataset.defaultLabel = nextLabel;
   }
 
   function applyStatusState() {
@@ -217,6 +278,49 @@
     el.pageStatus.classList.toggle("error-text", isError && Boolean(normalized));
     el.pageStatus.classList.toggle("progress-text", !isError && mode === "progress" && Boolean(normalized));
     el.pageStatus.classList.toggle("warning-text", !isError && mode === "warning" && Boolean(normalized));
+  }
+
+  function statusScopeKeyFromIdentity(identity) {
+    if (!identity) {
+      return "";
+    }
+    const tabId = Number.isInteger(identity.tabId) ? identity.tabId : 0;
+    const personId = normalizeWhitespace(identity.personId);
+    const pageType = normalizeWhitespace(identity.pageType);
+    const pageUrl = normalizeWhitespace(identity.pageUrl);
+    const threadUrl = normalizeWhitespace(identity.threadUrl);
+    return [tabId, personId, pageType, pageUrl, threadUrl].join("::");
+  }
+
+  function currentStatusScopeKey() {
+    return statusScopeKeyFromIdentity(currentViewIdentity());
+  }
+
+  function restoreStatusStateForCurrentScope() {
+    const scopeKey = currentStatusScopeKey();
+    const scoped = (scopeKey && state.statusStateByScope?.[scopeKey]) || null;
+    state.statusState = scoped
+      ? { ...scoped }
+      : {
+        text: "",
+        isError: false,
+        mode: "",
+        source: "ambient",
+        updatedAt: 0
+      };
+    applyStatusState();
+  }
+
+  function setBlockingUiLoading(isLoading, text) {
+    state.blockingUiLoading = Boolean(isLoading);
+    state.blockingUiLoadingText = normalizeWhitespace(text || "") || "Loading LinkedIn data…";
+    if (el.panelLoadingText) {
+      el.panelLoadingText.textContent = state.blockingUiLoadingText;
+    }
+    el.panelLoadingOverlay?.classList.toggle("hidden", !state.blockingUiLoading);
+    if (el.panelLoadingOverlay) {
+      el.panelLoadingOverlay.setAttribute("aria-hidden", state.blockingUiLoading ? "false" : "true");
+    }
   }
 
   function setStatus(text, isError, mode, options) {
@@ -242,24 +346,19 @@
       source,
       updatedAt: Date.now()
     };
+    const scopeKey = normalizeWhitespace(options?.scopeKey || currentStatusScopeKey());
+    if (scopeKey) {
+      state.statusStateByScope = {
+        ...(state.statusStateByScope || {}),
+        [scopeKey]: { ...state.statusState }
+      };
+    }
     applyStatusState();
-  }
-
-  function activeIdentityResolutionRequest() {
-    const request = state.identityResolutionRequest;
-    if (!request?.requestKey) {
-      return request || null;
-    }
-    if (state.dismissedIdentityResolutionRequestKey === request.requestKey) {
-      return null;
-    }
-    return request;
   }
 
   function configuredOwnProfileUrl() {
     return normalizeWhitespace(
       el.senderProfileUrlInput?.value
-      || el.senderProfileSettingsUrl?.value
       || state.myProfile?.ownProfileUrl
       || ""
     );
@@ -373,7 +472,15 @@
     );
     const onAnyProfilePage = canCaptureCurrentProfilePage();
     const canUseCurrentPage = onAnyProfilePage && (!ownProfileUrl || pastedUrlMatchesCurrentPage);
-    const canOpenTargetProfile = Boolean(ownProfileUrl) && !pastedUrlMatchesCurrentPage;
+    const hasConfiguredProfileUrl = Boolean(ownProfileUrl);
+    const canOpenTargetProfile = hasConfiguredProfileUrl && !pastedUrlMatchesCurrentPage;
+    let promptCopy = "";
+    let primaryLabel = "";
+    let primaryDisabled = false;
+    let secondaryLabel = "Go to profile";
+    let secondaryHidden = !hasConfiguredProfileUrl;
+    let secondaryDisabled = !hasConfiguredProfileUrl;
+
     if (el.senderProfileUrlInput && document.activeElement !== el.senderProfileUrlInput) {
       el.senderProfileUrlInput.value = ownProfileUrl;
     }
@@ -383,64 +490,53 @@
     if (el.senderProfileSettingsUrl && document.activeElement !== el.senderProfileSettingsUrl) {
       el.senderProfileSettingsUrl.value = ownProfileUrl;
     }
+
     if (onPendingOwnProfilePage) {
-      el.senderProfileCopy.textContent = "Update this page to switch your saved profile.";
-    } else if (onSavedOwnProfilePage && canOpenTargetProfile) {
-      el.senderProfileCopy.textContent = "Open the pasted profile to switch your saved profile.";
+      promptCopy = "Update this page to switch your saved profile.";
+      primaryLabel = "Update this page";
+      primaryDisabled = !canUpdateSenderProfileNow();
     } else if (onSavedOwnProfilePage) {
-      el.senderProfileCopy.textContent = hasSavedProfile
+      promptCopy = hasSavedProfile
         ? "Refresh your saved profile from this page."
         : "You are on your profile. Save it once.";
+      primaryLabel = hasSavedProfile ? "Refresh my profile" : "Save my profile now";
+      primaryDisabled = !canUpdateSenderProfileNow();
+    } else if (canOpenTargetProfile) {
+      promptCopy = hasSavedProfile
+        ? "Open the pasted profile to switch your saved profile."
+        : "Open the pasted profile, then use this page.";
+      primaryLabel = onAnyProfilePage ? "Use this page" : "Update profile";
+      primaryDisabled = true;
     } else if (canUseCurrentPage) {
-      el.senderProfileCopy.textContent = "If this is your profile, use this page.";
+      promptCopy = "If this is your profile, use this page.";
+      primaryLabel = "Use this page";
+      primaryDisabled = !(canUpdateSenderProfileNow() || canUseCurrentPage);
     } else {
-      el.senderProfileCopy.textContent = "Paste your profile URL and open it.";
+      promptCopy = "Paste your profile URL and open it.";
+      primaryLabel = onAnyProfilePage ? "Update this page" : "Update profile";
+      primaryDisabled = !canUpdateSenderProfileNow();
     }
-    el.senderProfileUpdateNow.disabled = !(canUpdateSenderProfileNow() || canUseCurrentPage) || canOpenTargetProfile;
-    el.senderProfileOpenLink.disabled = !canOpenTargetProfile;
-    if ((onSavedOwnProfilePage || onPendingOwnProfilePage) && !canOpenTargetProfile) {
-      el.senderProfileOpenLink.textContent = "Go to profile";
-      el.senderProfileOpenLink.classList.add("hidden");
-      el.senderProfileUpdateNow.textContent = onPendingOwnProfilePage
-        ? "Update this page"
-        : hasSavedProfile
-          ? "Refresh my profile"
-          : "Save my profile now";
-    } else if (canUseCurrentPage) {
-      el.senderProfileOpenLink.classList.remove("hidden");
-      el.senderProfileOpenLink.textContent = "Go to profile";
-      el.senderProfileUpdateNow.textContent = "Use this page";
-    } else {
-      el.senderProfileOpenLink.classList.remove("hidden");
-      el.senderProfileOpenLink.textContent = "Go to profile";
-      el.senderProfileUpdateNow.textContent = onAnyProfilePage ? "Update this page" : "Update profile";
+
+    if (onSavedOwnProfilePage && hasConfiguredProfileUrl) {
+      secondaryHidden = false;
+      secondaryDisabled = false;
+      secondaryLabel = "Go to profile";
+    } else if (canOpenTargetProfile) {
+      secondaryHidden = false;
+      secondaryDisabled = false;
+      secondaryLabel = "Go to profile";
     }
+
+    el.senderProfileCopy.textContent = promptCopy;
+    el.senderProfileUpdateNow.disabled = primaryDisabled;
+    setButtonLabel(el.senderProfileUpdateNow, primaryLabel);
+    el.senderProfileOpenLink.disabled = secondaryDisabled;
+    el.senderProfileOpenLink.classList.toggle("hidden", secondaryHidden);
+    setButtonLabel(el.senderProfileOpenLink, secondaryLabel);
   }
 
   if (el.readLatestResponseButton) {
     el.readLatestResponseButton.classList.add("hidden");
-  }
-
-  function renderIdentityResolutionPrompt() {
-    const request = activeIdentityResolutionRequest();
-    if (!request) {
-      el.identityResolutionPrompt.classList.add("hidden");
-      el.identityResolutionAllowAlways.classList.remove("hidden");
-      if (el.identityResolutionAllowOnce?.dataset?.defaultLabel) {
-        el.identityResolutionAllowOnce.textContent = el.identityResolutionAllowOnce.dataset.defaultLabel;
-      }
-      return;
-    }
-    el.identityResolutionCopy.textContent = normalizeWhitespace(request.message)
-      || "Allow one quick background check to link this person.";
-    el.identityResolutionAllowAlways.classList.toggle("hidden", request.allowAlways === false);
-    if (!el.identityResolutionAllowOnce.dataset.defaultLabel) {
-      el.identityResolutionAllowOnce.dataset.defaultLabel = el.identityResolutionAllowOnce.textContent;
-    }
-    el.identityResolutionAllowOnce.textContent = request.mode === "merge_confirmation"
-      ? "Check once"
-      : el.identityResolutionAllowOnce.dataset.defaultLabel;
-    el.identityResolutionPrompt.classList.remove("hidden");
   }
 
   function makeRequestId() {
@@ -751,16 +847,213 @@
     return Boolean(state.ctaReadinessByViewKey?.[normalizedViewKey]?.ready);
   }
 
+  function currentNextStepPerson() {
+    const preview = previewPersonRecord(state.pageContext, state.personRecord);
+    return resolveEffectivePersonRecord(preview, state.pageContext?.conversation);
+  }
+
+  function hasRecipientProfileSnapshot(person) {
+    const record = resolveEffectivePersonRecord(person || state.personRecord, state.pageContext?.conversation);
+    const profileContext = record?.profileContext || {};
+    return Boolean(
+      normalizeWhitespace(profileContext.profileCaptureMode) === "full"
+      && (normalizeWhitespace(profileContext.lastProfileSyncedAt) || normalizeWhitespace(record?.lastProfileSyncedAt))
+      && (
+        normalizeWhitespace(profileContext.rawSnapshot)
+        || normalizeWhitespace(profileContext.profileSummary)
+        || profileContext.latestProfileData
+      )
+    );
+  }
+
+  function hasSavedMessageHistory(person) {
+    const observedConversation = currentObservedConversation(person);
+    return Boolean(
+      Array.isArray(observedConversation?.messages) && observedConversation.messages.length
+    ) || Boolean(
+      normalizeWhitespace(observedConversation?.rawThreadText)
+      || normalizeWhitespace(observedConversation?.importedAt)
+      || normalizeWhitespace(observedConversation?.lastMessageAt)
+    );
+  }
+
+  function hasVisibleMessagingThread() {
+    const conversation = state.pageContext?.conversation || {};
+    return state.pageContext?.pageType === "linkedin-messaging" && Boolean(
+      normalizeWhitespace(conversation.threadUrl)
+      || normalizeWhitespace(conversation.recipientName)
+      || (Array.isArray(conversation.recentMessages) && conversation.recentMessages.length)
+      || (Array.isArray(conversation.allVisibleMessages) && conversation.allVisibleMessages.length)
+    );
+  }
+
+  function currentThreadUrl(person) {
+    return normalizeWhitespace(
+      state.pageContext?.conversation?.threadUrl
+      || (state.pageContext?.pageType === "linkedin-messaging" ? state.pageContext?.pageUrl : "")
+      || person?.messagingThreadUrl
+      || state.personRecord?.messagingThreadUrl
+      || ""
+    );
+  }
+
+  function currentRecipientProfileUrl(person) {
+    return normalizeWhitespace(
+      person?.profileUrl
+      || state.pageContext?.person?.profileUrl
+      || state.pageContext?.profile?.profileUrl
+      || currentProfileUrl()
+      || state.personRecord?.profileUrl
+      || ""
+    );
+  }
+
+  function canRefreshCurrentRecipientProfile(person) {
+    const profileUrl = currentRecipientProfileUrl(person);
+    return state.pageContext?.pageType === "linkedin-profile"
+      && !isOwnProfilePage()
+      && Boolean(profileUrl)
+      && hasRecipientProfileSnapshot(person);
+  }
+
+  function nextStepEvidence(person) {
+    const profileReady = hasRecipientProfileSnapshot(person);
+    const messageReady = hasSavedMessageHistory(person);
+    return [
+      profileReady
+        ? {
+            label: "Profile saved",
+            tone: "neutral",
+            action: canRefreshCurrentRecipientProfile(person) ? "refresh_profile_context" : ""
+          }
+        : {
+            label: "Profile missing",
+            tone: "warning"
+          },
+      messageReady
+        ? {
+            label: "Chats synced",
+            tone: "neutral"
+          }
+        : {
+            label: "Chats not synced",
+            tone: "warning"
+          }
+    ].filter(Boolean);
+  }
+
+  function currentNextStepState() {
+    const person = currentNextStepPerson();
+    const profileReady = hasRecipientProfileSnapshot(person);
+    const messageReady = hasSavedMessageHistory(person);
+    const visibleThread = hasVisibleMessagingThread();
+    const profileUrl = currentRecipientProfileUrl(person);
+    const threadUrl = currentThreadUrl(person);
+    const connectionStatus = currentConnectionStatus();
+    const action = currentAction();
+    const readyReason = normalizeWhitespace(currentDraftWorkspace(person)?.reason_why_now);
+    const pageType = state.pageContext?.pageType || "";
+    const onRecipientProfilePage = pageType === "linkedin-profile" && Boolean(profileUrl) && !isOwnProfilePage();
+    const helperProfileAction = profileUrl && !onRecipientProfilePage
+      ? { label: "Open profile", mode: "open_profile", disabled: false, targetUrl: profileUrl }
+      : null;
+    const helperThreadAction = threadUrl && pageType !== "linkedin-messaging"
+      ? { label: "Open thread", mode: "open_thread", disabled: false, targetUrl: threadUrl }
+      : null;
+    const draftAction = { label: nextActionLabel("draft_first_message", person), mode: "draft", disabled: false };
+
+    if (!profileReady) {
+      return {
+        badgeLabel: "Profile needed",
+        reason: "Save profile context first so the assistant knows who this person is.",
+        primary: onRecipientProfilePage
+          ? { label: "Refresh profile context", mode: "refresh_profile_context", disabled: false }
+          : { label: "Open profile", mode: "open_profile", disabled: !profileUrl, targetUrl: profileUrl },
+        helper: onRecipientProfilePage ? helperThreadAction : null,
+        evidence: nextStepEvidence(person),
+        statusText: ""
+      };
+    }
+
+    if (!messageReady) {
+      if (visibleThread) {
+        return {
+          badgeLabel: "Thread needed",
+          reason: "Profile is saved. Import the visible thread to tailor the next touch.",
+          primary: { label: "Import conversation", mode: "import_conversation", disabled: false },
+          helper: helperProfileAction,
+          evidence: nextStepEvidence(person),
+          statusText: ""
+        };
+      }
+
+      if (connectionStatus === "connected" && helperThreadAction) {
+        return {
+          badgeLabel: "Thread needed",
+          reason: "Profile is saved. Open the thread before deciding the next touch.",
+          primary: { label: "Open thread", mode: "open_thread", disabled: false, targetUrl: threadUrl },
+          helper: helperProfileAction,
+          evidence: nextStepEvidence(person),
+          statusText: ""
+        };
+      }
+
+      if (connectionStatus === "connected") {
+        return {
+          badgeLabel: "No thread yet",
+          reason: "You are connected. Open messages if you want to check for an existing thread before drafting.",
+          primary: { label: "Open messages", mode: "open_messages", disabled: !profileUrl, targetUrl: profileUrl },
+          helper: draftAction,
+          evidence: nextStepEvidence(person),
+          statusText: ""
+        };
+      }
+
+      return {
+        badgeLabel: "Ready to draft",
+        reason: "Profile is saved. You can draft a first message now.",
+        primary: draftAction,
+        helper: helperThreadAction || helperProfileAction,
+        evidence: nextStepEvidence(person),
+        statusText: ""
+      };
+    }
+
+    return {
+      badgeLabel: action === "draft_reply"
+        ? "Ready to reply"
+        : action === "draft_follow_up"
+          ? "Ready to follow up"
+          : action === "wait"
+            ? "Waiting"
+            : "Ready to draft",
+      reason: readyReason || relationshipRead(person),
+      primary: { label: nextActionLabel(action, person), mode: "draft", disabled: false },
+      helper: helperThreadAction || helperProfileAction,
+      evidence: nextStepEvidence(person),
+      statusText: readyReason ? "" : relationshipManagementRead()
+    };
+  }
+
   function shouldDisableNextActionButton(options) {
     if (options?.forceDisabled) {
       return true;
     }
+    const nextStep = options?.nextStep || currentNextStepState();
+    if (!nextStep?.primary || nextStep.primary.disabled) {
+      return true;
+    }
+    if (nextStep.primary.mode !== "draft") {
+      return false;
+    }
+
     const viewKey = currentCtaViewKey();
     const readiness = touchCtaReadiness(viewKey);
-    const hasResolvedPersonId = Boolean(normalizeWhitespace(state.personRecord?.personId));
+    const person = currentNextStepPerson();
+    const hasResolvedPersonId = Boolean(normalizeWhitespace(person?.personId));
     if (hasResolvedPersonId) {
-      markCtaReady(viewKey, state.personRecord?.personId);
-      return false;
+      markCtaReady(viewKey, person.personId);
+      return !hasRecipientProfileSnapshot(person);
     }
     if (ctaReadyFromCache(viewKey)) {
       return false;
@@ -877,11 +1170,17 @@
 
   function currentGenerationJob(person) {
     const personId = normalizeWhitespace((person || state.personRecord)?.personId);
+    const sourceTabId = preferredLinkedInTabId();
     if (!personId) {
       return null;
     }
     return (Array.isArray(state.generationJobs) ? state.generationJobs : []).find((job) =>
       normalizeWhitespace(job?.personId) === personId
+      && (
+        sourceTabId === null
+        || !Number.isInteger(job?.sourceTabId)
+        || job.sourceTabId === sourceTabId
+      )
     ) || null;
   }
 
@@ -1667,19 +1966,53 @@
       && normalizeWhitespace(left.threadUrl) === normalizeWhitespace(right.threadUrl);
   }
 
+  function preferredLinkedInTabId() {
+    return state.attachedLinkedInTabId
+      || state.activeTabId
+      || state.backgroundObservedLinkedInTabId
+      || null;
+  }
+
+  function isLinkedInWorkspaceUrl(url) {
+    return /^https:\/\/www\.linkedin\.com\/(?:in|messaging)\b/i.test(normalizeWhitespace(url || ""));
+  }
+
+  function attachToLinkedInTab(tabId, url) {
+    if (typeof tabId !== "number" || !isLinkedInWorkspaceUrl(url)) {
+      return false;
+    }
+    state.attachedLinkedInTabId = tabId;
+    state.lastObservedBrowserTabId = tabId;
+    state.lastObservedBrowserTabUrl = normalizeWhitespace(url || "");
+    return true;
+  }
+
+  function messageMatchesAttachedLinkedInTab(message) {
+    const preferredTabId = preferredLinkedInTabId();
+    const sourceTabId = typeof message?.sourceTabId === "number" ? message.sourceTabId : null;
+    if (preferredTabId === null || sourceTabId === null) {
+      return false;
+    }
+    return preferredTabId === sourceTabId;
+  }
+
   async function getSourceTabId() {
+    const preferredTabId = preferredLinkedInTabId();
+    if (typeof preferredTabId === "number") {
+      return preferredTabId;
+    }
     try {
       let tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
       if (!tabs[0]?.id) {
         tabs = await chrome.tabs.query({ active: true, currentWindow: true });
       }
-      if (tabs[0]?.id) {
+      if (tabs[0]?.id && /^https:\/\/www\.linkedin\.com\//i.test(normalizeWhitespace(tabs[0]?.url || ""))) {
         return tabs[0].id;
       }
     } catch (_error) {
       // Fall back to the last known active LinkedIn tab id from refreshState.
     }
-    return state.activeTabId || null;
+    return preferredLinkedInTabId();
   }
 
   function actionLabel(action) {
@@ -1693,11 +2026,33 @@
       case "draft_referral_ask":
         return "Draft referral ask";
       case "wait":
-        return "Review recommendation";
+        return "Draft again";
       case "draft_first_message":
       default:
         return "Draft message";
     }
+  }
+
+  function nextActionLabel(action, person) {
+    const normalizedAction = normalizeRecommendedAction(action);
+    const hasExistingDraft = Boolean(currentDraftWorkspace(person)?.generatedAt);
+    if (normalizedAction === "wait") {
+      const fallbackAction = inferFallbackAction();
+      if (fallbackAction === "draft_reply") {
+        return hasExistingDraft ? "Draft reply again" : "Draft reply";
+      }
+      if (fallbackAction === "draft_follow_up") {
+        return hasExistingDraft ? "Draft follow-up again" : "Draft follow-up";
+      }
+      if (fallbackAction === "draft_first_message") {
+        return hasExistingDraft ? "Draft message again" : "Draft message";
+      }
+      return hasExistingDraft ? "Draft again" : "Draft message";
+    }
+    if (normalizedAction === "draft_reply" && hasExistingDraft) {
+      return "Draft reply again";
+    }
+    return actionLabel(normalizedAction);
   }
 
   function actionBadgeLabel(action) {
@@ -1724,8 +2079,9 @@
       return draftWorkspace.recommended_action;
     }
 
-    const lastSpeaker = normalizeWhitespace(latestObservedMessage()?.sender || currentObservedConversation()?.lastSpeaker);
-    if (state.pageContext?.pageType === "linkedin-messaging") {
+    const person = currentNextStepPerson();
+    const lastSpeaker = normalizeWhitespace(latestObservedMessage(person)?.sender || currentObservedConversation(person)?.lastSpeaker);
+    if (hasSavedMessageHistory(person)) {
       return isSelfSpeakerLabel(lastSpeaker) ? "draft_follow_up" : "draft_reply";
     }
     if (state.personRecord?.relationshipStage === "no_reply") {
@@ -1818,8 +2174,8 @@
     const summary = normalizeWhitespace(readiness.summary || "");
     const scoreLabel = `Referral readiness ${score}/100`;
     const rest = ` - trust ${trust}/25, replies ${history}/25, fit ${fit}/25, ask ${ask}/25`;
-    const summarySuffix = summary ? `. ${summary}` : "";
-    return `<strong class="referral-readiness-score">${escapeHtml(scoreLabel)}</strong>${escapeHtml(rest + summarySuffix)}`;
+    const summarySuffix = summary ? `. ${renderInlineRichText(summary)}` : "";
+    return `<strong class="referral-readiness-score">${escapeHtml(scoreLabel)}</strong>${escapeHtml(rest)}${summarySuffix}`;
   }
 
   function escapeHtml(value) {
@@ -1829,6 +2185,16 @@
       .replace(/>/g, "&gt;")
       .replace(/\"/g, "&quot;")
       .replace(/'/g, "&#39;");
+  }
+
+  function renderInlineRichText(value) {
+    const escaped = escapeHtml(normalizeWhitespace(value));
+    if (!escaped) {
+      return "";
+    }
+    return escaped
+      .replace(/\*\*(.+?)\*\*/g, '<strong class="inline-emphasis">$1</strong>')
+      .replace(/==(.+?)==/g, '<mark class="inline-highlight">$1</mark>');
   }
 
   function connectionLabel(status) {
@@ -1844,50 +2210,41 @@
     }
   }
 
-  function relationshipRead() {
+  function relationshipRead(person) {
+    const target = resolveEffectivePersonRecord(person || state.personRecord, state.pageContext?.conversation);
     if (isSavedOwnProfilePage()) {
       return "This is your profile.";
     }
-    const draftWorkspace = currentDraftWorkspace();
+    const draftWorkspace = currentDraftWorkspace(target);
     if (draftWorkspace?.reason_why_now) {
       return draftWorkspace.reason_why_now;
     }
 
-    const observedConversation = currentObservedConversation();
-    const lastSpeaker = normalizeWhitespace(latestObservedMessage()?.sender || observedConversation?.lastSpeaker);
+    const observedConversation = currentObservedConversation(target);
+    const lastSpeaker = normalizeWhitespace(latestObservedMessage(target)?.sender || observedConversation?.lastSpeaker);
     const connectionStatus = currentConnectionStatus();
-    const hasImportedConversation = Boolean(currentObservedConversation());
-    if (state.pageContext?.pageType === "linkedin-messaging") {
-      if (!hasImportedConversation) {
-        return "Import the visible thread first.";
-      }
-      if (isSelfSpeakerLabel(lastSpeaker)) {
-        return `${ownDisplayName() || "You"} spoke last.`;
-      }
-      if (lastSpeaker) {
-        return `${lastSpeaker} spoke last.`;
-      }
-      return "Open a thread to draft.";
+    const hasImportedConversation = hasSavedMessageHistory(target);
+    if (hasImportedConversation && isSelfSpeakerLabel(lastSpeaker)) {
+      return `${ownDisplayName() || "You"} spoke last.`;
     }
-
-    if (connectionStatus === "connected") {
-      if (hasImportedConversation) {
-        return "Connected. History imported.";
-      }
-      return "Connected. Open the thread for history.";
+    if (hasImportedConversation && lastSpeaker) {
+      return `${lastSpeaker} spoke last.`;
     }
-
-    if (state.personRecord?.relationshipStage === "no_reply") {
+    if (!hasImportedConversation && connectionStatus === "connected") {
+      return "Profile saved. Bring in the thread before the next touch.";
+    }
+    if (target?.relationshipStage === "no_reply") {
       return "Previous outreach found.";
     }
-
-    return "Local context is ready.";
+    return "Profile context is saved.";
   }
 
   function populateProfileForm(profile, options) {
     const merged = { ...defaultMyProfile(), ...(profile || {}) };
     Object.entries(profileFields).forEach(([key, field]) => {
-      field.value = merged[key] || "";
+      if (field) {
+        field.value = merged[key] || "";
+      }
     });
     if (el.senderProfileNotesInput && document.activeElement !== el.senderProfileNotesInput) {
       el.senderProfileNotesInput.value = merged.manualNotes || "";
@@ -1917,7 +2274,9 @@
     return {
       ownProfileUrl: normalizeWhitespace(el.senderProfileSettingsUrl?.value || el.senderProfileUrlInput?.value || state.myProfile?.ownProfileUrl || ""),
       manualNotes: configuredSenderManualNotes(),
-      rawSnapshot: profileFields.rawSnapshot.value
+      rawSnapshot: typeof profileFields.rawSnapshot?.value === "string"
+        ? profileFields.rawSnapshot.value
+        : (state.myProfile?.rawSnapshot || "")
     };
   }
 
@@ -1982,11 +2341,6 @@
     const llmEntryUrl = normalizeLlmEntryUrl(llmProvider, merged.llmEntryUrl || defaultLlmEntryUrl(llmProvider));
     syncLlmProviderInputs(llmProvider, llmEntryUrl);
     el.strategyGuidance.value = merged.strategyGuidance || "";
-    if (el.identityResolutionSettingsSelect) {
-      el.identityResolutionSettingsSelect.value = normalizeWhitespace(state.identityResolutionSettings?.hiddenTabPermission) === "always_allow"
-        ? "always_allow"
-        : "ask";
-    }
     if (el.senderProfileSettingsUrl && document.activeElement !== el.senderProfileSettingsUrl) {
       el.senderProfileSettingsUrl.value = normalizedOwnProfileUrl();
     }
@@ -2005,38 +2359,137 @@
     };
   }
 
+  function currentObservedSurfaceUrl() {
+    const liveLinkedInUrl = normalizeWhitespace(state.backgroundObservedLinkedInTabUrl || state.pageContext?.pageUrl || "");
+    if (liveLinkedInUrl) {
+      return liveLinkedInUrl;
+    }
+    const lastObservedUrl = normalizeWhitespace(state.lastObservedBrowserTabUrl || "");
+    return isSupportedWorkspaceSurfaceUrl(lastObservedUrl) ? lastObservedUrl : "";
+  }
+
+  function isSupportedWorkspaceSurfaceUrl(url) {
+    const normalized = normalizeWhitespace(url);
+    return /^https:\/\/www\.linkedin\.com\/(?:in|messaging)\b/i.test(normalized);
+  }
+
+  function clearNavigationHold() {
+    state.navigationHold = {
+      active: false,
+      targetUrl: "",
+      targetPageType: ""
+    };
+  }
+
+  function setNavigationHold(targetUrl) {
+    const normalizedUrl = normalizeWhitespace(targetUrl);
+    state.navigationHold = {
+      active: Boolean(normalizedUrl),
+      targetUrl: normalizedUrl,
+      targetPageType: /^https:\/\/www\.linkedin\.com\/messaging\b/i.test(normalizedUrl)
+        ? "linkedin-messaging"
+        : /^https:\/\/www\.linkedin\.com\/in\//i.test(normalizedUrl)
+          ? "linkedin-profile"
+          : ""
+    };
+  }
+
+  function shouldKeepNavigationHold() {
+    if (!state.navigationHold?.active) {
+      return false;
+    }
+    const targetUrl = normalizeWhitespace(state.navigationHold?.targetUrl || "").replace(/\/+$/, "");
+    const targetPageType = normalizeWhitespace(state.navigationHold?.targetPageType || "");
+    const pageType = normalizeWhitespace(state.pageContext?.pageType || "");
+    const pageUrl = normalizeWhitespace(state.pageContext?.pageUrl || "").replace(/\/+$/, "");
+    const surfaceUrl = normalizeWhitespace(currentObservedSurfaceUrl() || "").replace(/\/+$/, "");
+
+    if (!targetUrl) {
+      return false;
+    }
+    if (!isSupportedWorkspaceSurfaceUrl(targetUrl)) {
+      return false;
+    }
+    if (surfaceUrl && surfaceUrl !== targetUrl && pageUrl && pageUrl !== targetUrl) {
+      return true;
+    }
+    if (!state.pageContext?.supported) {
+      return true;
+    }
+    if (targetPageType && pageType && pageType !== targetPageType) {
+      return true;
+    }
+    if (pageUrl && pageUrl !== targetUrl) {
+      return true;
+    }
+    return false;
+  }
+
+  function resetTransientWorkspaceState() {
+    state.personRecord = defaultPersonRecord();
+    state.workspace = null;
+    state.manualRecovery = null;
+    state.lastGenerationDiagnostics = null;
+    state.resolutionDiagnostics = null;
+    state.lastOpenMessagesDiagnostics = null;
+    state.extraContext = "";
+    state.showingAlternatives = false;
+    state.conversationHistoryExpanded = false;
+    state.identityResolutionRequest = null;
+    state.identityWarning = null;
+    setPersonCardEditorOpen(false);
+  }
+
   function renderHeader() {
     const messagingRecipientName = normalizeWhitespace(state.pageContext?.conversation?.recipientName);
+    const isTransientMessagingLoad = state.pageContext?.pageType === "linkedin-messaging"
+      && !state.pageContext?.supported
+      && /loading selected conversation/i.test(state.pageContext?.reason || "Loading selected conversation...");
+    const isTransientProfileLoad = state.pageContext?.pageType === "linkedin-profile"
+      && !state.pageContext?.supported
+      && /loading profile/i.test(state.pageContext?.reason || "Loading profile...");
+    const loadingDisplayName = isTransientMessagingLoad
+      ? "Loading conversation..."
+      : isTransientProfileLoad
+        ? (fallbackProfileNameFromPageContext() || "Loading profile...")
+        : "Open a LinkedIn person";
     const displayName = cleanHeaderName(
-      state.personRecord?.fullName
+      state.pageContext?.person?.fullName
+      || state.pageContext?.profile?.fullName
+      || state.personRecord?.fullName
       || messagingRecipientName
       || state.personRecord?.firstName
       || fallbackProfileNameFromPageContext()
       || ""
-    ) || "Open a LinkedIn person";
+    ) || loadingDisplayName;
     const displaySubtitle = cleanHeaderSubtitle(
-      state.personRecord?.headline
+      state.pageContext?.person?.headline
+      || state.pageContext?.profile?.headline
+      || state.personRecord?.headline
       || extractSubtitleFromRawSnapshot(
-        state.personRecord?.rawSnapshot
-        || state.pageContext?.profile?.rawSnapshot
+        state.pageContext?.profile?.rawSnapshot
         || state.pageContext?.person?.rawSnapshot
+        || state.personRecord?.rawSnapshot
         || "",
         displayName
       )
-      || "",
+      || (
+        isTransientMessagingLoad || isTransientProfileLoad
+          ? normalizeWhitespace(state.pageContext?.reason || "")
+          : ""
+      ),
       displayName
     );
     const observedConversation = currentObservedConversation();
     const draftWorkspace = currentDraftWorkspace();
     const importedAt = observedConversation?.importedAt;
-    const hasVisibleConversation = Boolean(state.pageContext?.conversation?.recentMessages?.length);
     const generatedAt = draftWorkspace?.generatedAt;
     const updatedAt = state.personRecord?.updatedAt;
     el.personName.textContent = displayName;
     const headerProfileUrl = normalizeWhitespace(
-      state.personRecord?.profileUrl
-      || state.pageContext?.person?.profileUrl
+      state.pageContext?.person?.profileUrl
       || state.pageContext?.profile?.profileUrl
+      || state.personRecord?.profileUrl
       || ""
     );
     if (el.personName instanceof HTMLAnchorElement) {
@@ -2050,26 +2503,28 @@
     }
     el.personSubtitle.textContent = displaySubtitle;
     el.personSubtitle.classList.toggle("hidden", !displaySubtitle);
-    el.connectionStatusPill.textContent = connectionLabel(currentConnectionStatus());
-    const freshnessText = importedAt
-      ? `Conversation synced ${formatRelativeTimestamp(importedAt)}`
-      : generatedAt
-        ? `Draft updated ${formatRelativeTimestamp(generatedAt)}`
-        : updatedAt
-          ? `Context updated ${formatRelativeTimestamp(updatedAt)}`
-          : "";
-    el.conversationImportMeta.textContent = freshnessText;
-    el.conversationImportMeta.classList.toggle("hidden", !freshnessText);
-    el.conversationImportMeta.title = importedAt || generatedAt || updatedAt
-      ? formatSavedAt(importedAt || generatedAt || updatedAt)
-      : "";
+    el.connectionStatusPill.textContent = isTransientMessagingLoad || isTransientProfileLoad
+      ? "Loading"
+      : connectionLabel(currentConnectionStatus());
+    if (el.unsupportedPageMessage) {
+      el.unsupportedPageMessage.textContent = "";
+      el.unsupportedPageMessage.classList.add("hidden");
+    }
+    if (el.personCardEditButton) {
+      const canEdit = Boolean(normalizeWhitespace(state.personRecord?.personId));
+      el.personCardEditButton.classList.toggle("hidden", !canEdit);
+      el.personCardEditButton.disabled = !canEdit;
+      if (!canEdit) {
+        setPersonCardEditorOpen(false);
+      }
+    }
+    el.conversationImportMeta.textContent = "";
+    el.conversationImportMeta.classList.add("hidden");
+    el.conversationImportMeta.title = "";
 
-    const secondaryFreshness = generatedAt && importedAt && generatedAt !== importedAt
-      ? `Draft updated ${formatRelativeTimestamp(generatedAt)}`
-      : "";
-    el.lastUpdatedMeta.textContent = secondaryFreshness;
-    el.lastUpdatedMeta.classList.toggle("hidden", !secondaryFreshness);
-    el.lastUpdatedMeta.title = secondaryFreshness ? formatSavedAt(generatedAt) : "";
+    el.lastUpdatedMeta.textContent = "";
+    el.lastUpdatedMeta.classList.add("hidden");
+    el.lastUpdatedMeta.title = "";
 
     const recordUuid = normalizeWhitespace(state.personRecord?.uuid || state.personRecord?.system?.recordUuid || "");
     const shouldShowUuid = Boolean(recordUuid && displayName && displayName !== "Open a LinkedIn person");
@@ -2077,21 +2532,75 @@
     el.personRecordUuid.classList.toggle("hidden", !shouldShowUuid);
   }
 
-  function renderRecommendation() {
-    const draftWorkspace = currentDraftWorkspace();
-    const action = currentAction();
-    const modelReason = normalizeWhitespace(draftWorkspace?.reason_why_now);
-    const triageRead = relationshipManagementRead();
-    const referralRead = referralReadinessRead();
-    const referralMarkup = referralReadinessMarkup();
+  function renderNextStepEvidence(items) {
+    if (!el.nextStepEvidence) {
+      return;
+    }
+    const evidence = Array.isArray(items) ? items.filter(Boolean) : [];
+    el.nextStepEvidence.innerHTML = "";
+    el.nextStepEvidence.classList.toggle("hidden", !evidence.length);
+    evidence.forEach((item) => {
+      const chip = document.createElement("span");
+      chip.className = "next-step-chip";
+      const label = typeof item === "string" ? item : normalizeWhitespace(item?.label);
+      const tone = normalizeWhitespace(typeof item === "object" ? item?.tone : "");
+      const action = normalizeWhitespace(typeof item === "object" ? item?.action : "");
+      chip.classList.toggle("warning", tone === "warning");
+      if (label) {
+        const text = document.createElement("span");
+        text.className = "next-step-chip__label";
+        text.textContent = label;
+        chip.appendChild(text);
+      }
+      if (action) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "next-step-chip__action";
+        button.dataset.mode = action;
+        button.setAttribute("aria-label", "Refresh profile context");
+        button.title = "Refresh profile context";
+        button.textContent = "↻";
+        chip.appendChild(button);
+      }
+      el.nextStepEvidence.appendChild(chip);
+    });
+  }
 
-    el.actionPill.textContent = actionBadgeLabel(action);
-    el.recommendationReason.textContent = modelReason || relationshipRead();
+  function applyRecommendationButton(button, config) {
+    if (!button) {
+      return;
+    }
+    const mode = normalizeWhitespace(config?.mode);
+    const hidden = !config || !mode;
+    button.classList.toggle("hidden", hidden);
+    button.dataset.mode = mode;
+    if (hidden) {
+      button.disabled = true;
+      delete button.dataset.targetUrl;
+      return;
+    }
+    button.dataset.targetUrl = normalizeWhitespace(config?.targetUrl || "");
+    setButtonLabel(button, normalizeWhitespace(config?.label) || "Continue");
+    button.disabled = Boolean(config?.disabled);
+  }
+
+  function renderRecommendation() {
+    const nextStep = currentNextStepState();
+    const referralRead = nextStep?.primary?.mode === "draft" ? referralReadinessRead() : "";
+    const referralMarkup = nextStep?.primary?.mode === "draft" ? referralReadinessMarkup() : "";
+
+    el.actionPill.textContent = nextStep.badgeLabel || "Waiting";
+    el.recommendationReason.innerHTML = renderInlineRichText(nextStep.reason || "Ready when you are.");
+    renderNextStepEvidence(nextStep.evidence);
+    applyRecommendationButton(el.nextActionButton, nextStep.primary);
+    applyRecommendationButton(el.nextHelperButton, nextStep.helper);
     el.referralReadiness.innerHTML = referralMarkup || escapeHtml(referralRead);
     el.referralReadiness.classList.toggle("referral-readiness", Boolean(normalizeWhitespace(referralRead)));
     el.referralReadiness.classList.toggle("hidden", !normalizeWhitespace(referralRead));
-    el.workspaceStatus.textContent = modelReason ? "" : triageRead;
-    el.workspaceStatus.classList.toggle("hidden", !normalizeWhitespace(el.workspaceStatus.textContent));
+    const workspaceStatusText = normalizeWhitespace(nextStep.statusText);
+    el.workspaceStatus.innerHTML = renderInlineRichText(workspaceStatusText);
+    el.workspaceStatus.classList.toggle("hidden", !workspaceStatusText);
+    return nextStep;
   }
 
   function renderDrafts() {
@@ -2136,28 +2645,50 @@
 
     alternatives.forEach((draft, index) => {
       const card = document.createElement("article");
-      card.className = "result-card";
+      card.className = "draft-surface draft-surface--alt";
       card.innerHTML = `
-        <div class="section-heading">
+        <div class="draft-toolbar">
           <strong>${draft.label || `Option ${index + 2}`}</strong>
-          <button type="button" class="icon-button" data-action="copy-alt" data-index="${index + 1}">Copy</button>
+          <button type="button" class="icon-button draft-copy-button" data-action="copy-alt" data-index="${index + 1}">Copy</button>
         </div>
-        <textarea data-index="${index + 1}" rows="4">${draft.message || ""}</textarea>
-        <p class="result-meta draft-metrics" data-role="draft-metrics">${draftMetricsText(draft.message || "")}</p>
-        <p class="result-meta">${draft.reason || ""}</p>
+        <textarea class="draft-editor" data-index="${index + 1}" rows="4">${draft.message || ""}</textarea>
+        <div class="draft-footer">
+          <p class="result-meta draft-metrics" data-role="draft-metrics">${draftMetricsText(draft.message || "")}</p>
+          <p class="result-meta draft-reason">${draft.reason || ""}</p>
+        </div>
       `;
       el.alternativeDrafts.appendChild(card);
       autosizeTextarea(card.querySelector("textarea"));
     });
   }
 
+  function currentLatestActivitySnippets() {
+    const profileContext = getProfileContext(state.personRecord);
+    const saved = Array.isArray(profileContext?.latestActivitySnippets) ? profileContext.latestActivitySnippets : [];
+    const fallback = Array.isArray(profileContext?.latestProfileData?.activitySnippets)
+      ? profileContext.latestProfileData.activitySnippets
+      : [];
+    return (saved.length ? saved : fallback).filter(Boolean).slice(0, 3);
+  }
+
   function renderRecipientContext() {
+    if (!el.recipientSummaryCard || !el.conversationCard || !el.recipientSummaryText || !el.conversationList) {
+      return;
+    }
     const draftWorkspace = currentDraftWorkspace();
     const observedConversation = currentObservedConversation();
+    const profileContext = getProfileContext(state.personRecord);
     const summary = normalizeWhitespace(
       draftWorkspace?.recipient_summary
       || state.personRecord?.recipientSummaryMemory
     );
+    const latestActivitySnippets = currentLatestActivitySnippets();
+    const lastProfileSyncedAt = normalizeWhitespace(profileContext?.lastProfileSyncedAt);
+    const lastActivitySyncedAt = normalizeWhitespace(profileContext?.lastActivitySyncedAt);
+    const canRefreshFullProfile = state.pageContext?.pageType === "linkedin-profile"
+      && !isOwnProfilePage()
+      && Boolean(normalizeWhitespace(state.personRecord?.personId))
+      && hasRecipientProfileSnapshot(state.personRecord);
     const rawConversationFallback = normalizeWhitespace(
       observedConversation?.rawThreadText
       || draftWorkspace?.conversation?.rawThreadText
@@ -2172,28 +2703,55 @@
     el.personGoalSelect.value = state.personRecord?.userGoal || "";
     el.extraContextInput.value = state.extraContext || "";
 
-    if (summary) {
+    if (summary || latestActivitySnippets.length || lastProfileSyncedAt) {
       el.recipientSummaryCard.classList.remove("hidden");
       el.recipientSummaryText.textContent = summary;
     } else {
       el.recipientSummaryCard.classList.add("hidden");
       el.recipientSummaryText.textContent = "";
     }
+    el.recipientSummaryText.classList.toggle("hidden", !summary);
+    if (el.recipientProfileMeta) {
+      const profileMetaText = lastProfileSyncedAt
+        ? `Profile saved ${formatRelativeTimestamp(lastProfileSyncedAt)}`
+        : "";
+      el.recipientProfileMeta.textContent = profileMetaText;
+      el.recipientProfileMeta.classList.toggle("hidden", !profileMetaText);
+      el.recipientProfileMeta.title = profileMetaText ? formatSavedAt(lastProfileSyncedAt) : "";
+    }
+    if (el.recipientProfileRefreshLink) {
+      el.recipientProfileRefreshLink.classList.toggle("hidden", !canRefreshFullProfile);
+    }
+    if (el.recipientActivityBlock && el.recipientActivityList && el.recipientActivityMeta) {
+      el.recipientActivityList.innerHTML = "";
+      latestActivitySnippets.forEach((snippet) => {
+        const item = document.createElement("li");
+        item.textContent = snippet;
+        el.recipientActivityList.appendChild(item);
+      });
+      const activityMetaText = lastActivitySyncedAt
+        ? `Synced ${formatRelativeTimestamp(lastActivitySyncedAt)}`
+        : "";
+      el.recipientActivityMeta.textContent = activityMetaText;
+      el.recipientActivityMeta.classList.toggle("hidden", !activityMetaText);
+      el.recipientActivityMeta.title = activityMetaText ? formatSavedAt(lastActivitySyncedAt) : "";
+      el.recipientActivityBlock.classList.toggle("hidden", !latestActivitySnippets.length);
+    }
 
     if (!recentMessages.length && !rawConversationFallback) {
       el.conversationCard.classList.add("hidden");
       el.conversationList.innerHTML = "";
-      if (state.pageContext?.pageType === "linkedin-messaging" && summary) {
-        el.contextSection.appendChild(el.recipientSummaryCard);
+      if (state.pageContext?.pageType === "linkedin-messaging" && (summary || latestActivitySnippets.length)) {
+        el.contextSection?.appendChild(el.recipientSummaryCard);
       }
       return;
     }
 
     el.conversationCard.classList.remove("hidden");
-    if (state.pageContext?.pageType === "linkedin-messaging" && summary) {
-      el.contextSection.insertBefore(el.recipientSummaryCard, el.conversationCard.nextSibling);
-    } else if (summary) {
-      el.contextSection.insertBefore(el.recipientSummaryCard, el.conversationCard);
+    if (state.pageContext?.pageType === "linkedin-messaging" && (summary || latestActivitySnippets.length)) {
+      el.contextSection?.insertBefore(el.recipientSummaryCard, el.conversationCard.nextSibling);
+    } else if (summary || latestActivitySnippets.length) {
+      el.contextSection?.insertBefore(el.recipientSummaryCard, el.conversationCard);
     }
     el.conversationList.innerHTML = "";
     if (!recentMessages.length && rawConversationFallback) {
@@ -2258,7 +2816,27 @@
     return item;
   }
 
-  function renderManualRecovery() {
+  function buildDiagnosticsSnapshot() {
+    function linkedInSurfaceMode(url) {
+      const normalized = normalizeWhitespace(url || "");
+      if (!normalized) {
+        return "";
+      }
+      if (/^https:\/\/www\.linkedin\.com\/messaging\/thread\//i.test(normalized)) {
+        return "messaging_thread";
+      }
+      if (/^https:\/\/www\.linkedin\.com\/messaging\/compose\//i.test(normalized)) {
+        return "messaging_compose";
+      }
+      if (/^https:\/\/www\.linkedin\.com\/messaging\b/i.test(normalized)) {
+        return "messaging";
+      }
+      if (/^https:\/\/www\.linkedin\.com\/in\//i.test(normalized)) {
+        return "profile";
+      }
+      return "other";
+    }
+
     const pageConversation = state.pageContext?.conversation;
     const importedConversation = currentObservedConversation();
     const observedMetrics = currentObservedMetrics();
@@ -2296,23 +2874,28 @@
     const criticalProfileReady = Boolean(extractedProfileName && extractedProfileHeadline);
     const shouldShowTechnicalDetails = true;
     const diagnostics = {
+      build_debug_version: normalizeWhitespace(BUILD_DEBUG_VERSION || ""),
       page_supported: Boolean(state.pageContext?.supported),
       page_type: state.pageContext?.pageType || "",
       page_url: state.pageContext?.pageUrl || "",
       requested_source_tab_id: state.lastObservedBrowserTabId || state.activeTabId || null,
       observed_browser_tab_id: state.lastObservedBrowserTabId,
       observed_browser_tab_url: state.lastObservedBrowserTabUrl,
+      observed_browser_tab_mode: linkedInSurfaceMode(state.lastObservedBrowserTabUrl),
       background_observed_linkedin_tab_id: state.backgroundObservedLinkedInTabId,
       background_observed_linkedin_tab_url: state.backgroundObservedLinkedInTabUrl,
+      background_observed_linkedin_tab_mode: linkedInSurfaceMode(state.backgroundObservedLinkedInTabUrl),
       last_navigation_signal_href: state.lastNavigationSignalHref,
       last_navigation_signal_at: state.lastNavigationSignalAt,
       last_click_tab_id: state.lastLinkedInClickTrace?.tabId || null,
       last_click_page_href_before: state.lastLinkedInClickTrace?.pageHrefBefore || "",
       last_click_href: state.lastLinkedInClickTrace?.clickHref || "",
+      last_click_target_mode: linkedInSurfaceMode(state.lastLinkedInClickTrace?.clickHref || ""),
       last_click_text: state.lastLinkedInClickTrace?.clickText || "",
       last_click_at: state.lastLinkedInClickTrace?.at || "",
       pending_navigation_tab_id: state.pendingLinkedInNavigation?.tabId || null,
       pending_navigation_target_href: state.pendingLinkedInNavigation?.targetHref || "",
+      pending_navigation_target_mode: linkedInSurfaceMode(state.pendingLinkedInNavigation?.targetHref || ""),
       pending_navigation_started_at: state.pendingLinkedInNavigation?.startedAt || "",
       pending_navigation_resolved_at: state.pendingLinkedInNavigation?.resolvedAt || "",
       pending_navigation_last_seen_tab_url: state.pendingLinkedInNavigation?.lastSeenTabUrl || "",
@@ -2356,17 +2939,36 @@
       relationship_triage: currentRelationshipTriage(),
       generation_diagnostics: state.lastGenerationDiagnostics || null,
       resolution_diagnostics: state.resolutionDiagnostics || null,
+      sender_profile_extraction_diagnostics: state.lastProfileExtractionDiagnostics || null,
+      sender_profile_save_diagnostics: state.lastSenderProfileSaveDiagnostics || null,
+      open_messages_diagnostics: state.lastOpenMessagesDiagnostics || null,
       debug: state.pageContext?.debug || null
     };
+    return {
+      shouldShowTechnicalDetails,
+      diagnostics
+    };
+  }
 
-    el.technicalDetails.classList.toggle("hidden", !shouldShowTechnicalDetails);
-    el.technicalDetailsSummary.textContent = state.manualRecovery ? "Troubleshooting details available" : "Technical details";
-    if (!shouldShowTechnicalDetails) {
-      el.technicalDetails.open = false;
-      return;
-    }
+  function renderManualRecovery() {
+    const { shouldShowTechnicalDetails, diagnostics } = buildDiagnosticsSnapshot();
+    const draftWorkspace = currentDraftWorkspace();
     const currentJob = currentGenerationJob();
     const liveProviderPrompt = typeof currentJob?.providerPrompt === "string" ? currentJob.providerPrompt : "";
+    if (el.globalLogsPanel) {
+      el.globalLogsPanel.classList.toggle("hidden", !shouldShowTechnicalDetails);
+    }
+    if (el.globalDiagnosticsSummary) {
+      el.globalDiagnosticsSummary.textContent = state.manualRecovery
+        ? "Technical details available"
+        : "Technical details";
+    }
+    if (!shouldShowTechnicalDetails) {
+      if (el.globalDiagnosticsDetails) {
+        el.globalDiagnosticsDetails.open = false;
+      }
+      return;
+    }
     el.pageDiagnostics.value = JSON.stringify(diagnostics, null, 2);
     el.senderProfileExtracted.value = state.myProfile?.rawSnapshot || "";
     el.manualPrompt.value = state.manualRecovery?.prompt || liveProviderPrompt || draftWorkspace?.providerPrompt || "";
@@ -2501,7 +3103,7 @@
       if (isBusy || document.hidden) {
         return;
       }
-      void refreshState({ preserveStatus: true, suppressImportStatus: true });
+      void refreshState({ preserveStatus: true, allowCached: true, suppressImportStatus: true });
     }, MESSAGE_THREAD_POLL_MS);
   }
 
@@ -2516,11 +3118,16 @@
     state.navigationRefreshTimers = [];
   }
 
-  function scheduleNavigationRefreshBurst() {
+  function scheduleNavigationRefreshBurst(options) {
     clearNavigationRefreshBurst();
-    [250, 1500].forEach((delayMs) => {
+    [250, 1500].forEach((delayMs, index) => {
       const timerId = window.setTimeout(() => {
-        void refreshState({ preserveStatus: true, suppressImportStatus: true });
+        void refreshState({
+          preserveStatus: true,
+          allowCached: true,
+          showOverlay: index === 0,
+          suppressImportStatus: options?.suppressImportStatus ?? true
+        });
       }, delayMs);
       state.navigationRefreshTimers.push(timerId);
     });
@@ -2535,7 +3142,7 @@
     const delayMs = retryDelays[state.transientMessagingRetryCount - 1] || retryDelays[retryDelays.length - 1];
     state.transientMessagingRetryTimer = window.setTimeout(() => {
       state.transientMessagingRetryTimer = null;
-      void refreshState({ preserveStatus: true, suppressImportStatus: true });
+      void refreshState({ preserveStatus: true, allowCached: true, showOverlay: false, suppressImportStatus: true });
     }, delayMs);
   }
 
@@ -2561,97 +3168,67 @@
     if (!/^https:\/\/www\.linkedin\.com\/(?:in|messaging)\b/i.test(nextHref)) {
       return;
     }
-
-    if (/^https:\/\/www\.linkedin\.com\/in\//i.test(nextHref)) {
-      state.pageContext = {
-        ...(state.pageContext || {}),
-        supported: false,
-        pageType: "linkedin-profile",
-        pageUrl: nextHref,
-        reason: "",
-        person: {
-          ...(state.pageContext?.person || {}),
-          fullName: normalizeWhitespace(clickText) || state.pageContext?.person?.fullName || "",
-          profileUrl: nextHref,
-          publicProfileUrl: nextHref,
-          headline: "",
-          location: "",
-          connectionStatus: "unknown"
-        },
-        profile: {
-          ...(state.pageContext?.profile || {}),
-          fullName: normalizeWhitespace(clickText) || state.pageContext?.profile?.fullName || "",
-          profileUrl: nextHref,
-          headline: "",
-          location: "",
-          connectionStatus: "unknown"
-        }
-      };
-      renderPageStatus({ preserveStatus: false });
-      return;
-    }
-
-    if (/^https:\/\/www\.linkedin\.com\/messaging\b/i.test(nextHref)) {
-      state.pageContext = {
-        ...(state.pageContext || {}),
-        supported: false,
-        pageType: "linkedin-messaging",
-        pageUrl: nextHref,
-        reason: ""
-      };
-      renderPageStatus({ preserveStatus: false });
+    const currentHref = normalizeWhitespace(state.pageContext?.pageUrl || state.lastObservedBrowserTabUrl || "");
+    const isDifferentSurface = nextHref.replace(/\/+$/, "") !== currentHref.replace(/\/+$/, "");
+    if (isDifferentSurface) {
+      setNavigationHold(nextHref);
     }
   }
 
   function renderPageStatus(options) {
+    clearNavigationHold();
     const preserveStatus = Boolean(options?.preserveStatus);
     const hasSavedProfile = hasSavedSenderProfile();
     const supported = Boolean(state.pageContext?.supported);
+    const isTransientMessagingLoad = state.pageContext?.pageType === "linkedin-messaging"
+      && /loading selected conversation/i.test(state.pageContext?.reason || "");
+    const isTransientProfileLoad = state.pageContext?.pageType === "linkedin-profile"
+      && /loading profile/i.test(state.pageContext?.reason || "");
     const canImportConversation = state.pageContext?.pageType === "linkedin-messaging";
     const hasImportedConversation = Boolean(currentObservedConversation());
-    const identityRequest = activeIdentityResolutionRequest();
     const onOwnProfilePage = isSavedOwnProfilePage();
     const onPendingOwnProfilePage = isPendingOwnProfilePage();
+    const showSetupOnly = !hasSavedProfile || onPendingOwnProfilePage || onOwnProfilePage;
     const currentJob = currentGenerationJob();
     const jobProgressText = normalizeWhitespace(currentJob?.progressText);
-    const stickyCtaEnabled = ctaReadyFromCache(currentCtaViewKey());
+    const currentSourceTabId = preferredLinkedInTabId();
     const currentPersonId = normalizeWhitespace(state.personRecord?.personId);
     const localProgressAppliesToCurrentPerson = Boolean(
-      currentPersonId
+      currentSourceTabId !== null
+      && currentSourceTabId === state.activeGenerationSourceTabId
+      && currentPersonId
       && currentPersonId === normalizeWhitespace(state.activeGenerationPersonId)
       && state.activeGenerationRequestId
       && state.generationProgressText
     );
 
+    el.topToolbar?.classList.remove("hidden");
+
     renderHeader();
-    renderRecommendation();
+    const nextStep = renderRecommendation();
     renderDrafts();
     renderRecipientContext();
     renderManualRecovery();
     renderDashboard();
     renderSenderProfilePrompt();
-    renderIdentityResolutionPrompt();
-
-    if (!hasSavedProfile || onPendingOwnProfilePage) {
-      el.topToolbar?.classList.add("hidden");
+    if (showSetupOnly) {
       el.statusCard?.classList.add("hidden");
       el.recommendationSection?.classList.add("hidden");
       el.contextSection?.classList.add("hidden");
       el.draftSection?.classList.add("hidden");
     } else {
-      el.topToolbar?.classList.remove("hidden");
       el.statusCard?.classList.remove("hidden");
       el.recommendationSection?.classList.toggle("hidden", onOwnProfilePage);
       el.contextSection?.classList.remove("hidden");
     }
 
-    if (!hasSavedProfile || onPendingOwnProfilePage) {
+    if (showSetupOnly) {
       if (!preserveStatus) {
         setStatus(
           onPendingOwnProfilePage
             ? "Update this page to switch your saved profile."
-            : isSavedOwnProfilePage()
-            ? "Save your profile to finish setup."
+            : onOwnProfilePage
+            ? "Update your profile from this page."
             : canCaptureCurrentProfilePage() && !configuredOwnProfileUrl()
               ? "If this is your profile, save this page now."
               : "Save your profile first.",
@@ -2661,55 +3238,24 @@
         );
       }
       el.nextActionButton.disabled = true;
-      el.nextActionButton.textContent = actionLabel(currentAction());
-      el.updateProfileButton.disabled = !canUpdateSenderProfileNow();
-      el.updateProfileButton.classList.add("hidden");
-      el.importConversationButton.classList.toggle("hidden", !canImportConversation);
-      el.importConversationButton.disabled = !canImportConversation;
-      el.clearConversationButton.classList.toggle("hidden", !hasImportedConversation);
-      el.clearConversationButton.disabled = !hasImportedConversation;
+      applyRecommendationButton(el.nextHelperButton, null);
+      if (el.updateProfileButton) {
+        el.updateProfileButton.disabled = !canUpdateSenderProfileNow();
+        el.updateProfileButton.classList.add("hidden");
+      }
+      if (el.importConversationButton) {
+        el.importConversationButton.classList.toggle("hidden", !canImportConversation);
+        el.importConversationButton.disabled = !canImportConversation;
+      }
+      if (el.clearConversationButton) {
+        el.clearConversationButton.classList.toggle("hidden", !hasImportedConversation);
+        el.clearConversationButton.disabled = !hasImportedConversation;
+      }
       return;
     }
 
-    if (!supported) {
-      const isTransientMessagingLoad = state.pageContext?.pageType === "linkedin-messaging"
-        && /loading selected conversation/i.test(state.pageContext?.reason || "");
-      const isTransientProfileLoad = state.pageContext?.pageType === "linkedin-profile"
-        && /loading profile/i.test(state.pageContext?.reason || "");
-      const currentLinkedInUrl = normalizeWhitespace(
-        state.pageContext?.pageUrl
-        || state.lastObservedBrowserTabUrl
-        || state.backgroundObservedLinkedInTabUrl
-      );
-      const isLinkedInProfileOrMessagingUrl = /^https:\/\/www\.linkedin\.com\/(?:in|messaging)\b/i.test(currentLinkedInUrl);
-      const isGenericLinkedInFallback = normalizeWhitespace(state.pageContext?.reason || "") === "Open a LinkedIn profile or messaging thread.";
-      const isBlankTransientLinkedInLoad = (
-        state.pageContext?.pageType === "linkedin-messaging"
-        || state.pageContext?.pageType === "linkedin-profile"
-      ) && !normalizeWhitespace(state.pageContext?.reason || "");
-      if (!preserveStatus) {
-        if (
-          isTransientMessagingLoad
-          || isTransientProfileLoad
-          || isBlankTransientLinkedInLoad
-          || (isLinkedInProfileOrMessagingUrl && isGenericLinkedInFallback)
-        ) {
-          setStatus("", false, "", { source: "ambient" });
-        } else {
-          setStatus(
-            state.pageContext?.reason || "Open a LinkedIn profile or messaging thread.",
-            true,
-            "warning",
-            { source: "ambient" }
-          );
-        }
-      }
-      el.nextActionButton.disabled = !stickyCtaEnabled;
-      el.nextActionButton.textContent = actionLabel(currentAction());
-      el.updateProfileButton.disabled = true;
-      el.importConversationButton.classList.add("hidden");
-      el.clearConversationButton.classList.add("hidden");
-      return;
+    if (!supported && !preserveStatus) {
+      setStatus("", false, "", { source: "ambient" });
     }
 
     if (!preserveStatus) {
@@ -2718,28 +3264,34 @@
         || jobProgressText
       );
       setStatus(
-        progressActive ? (jobProgressText || state.generationProgressText) : (identityRequest?.message || state.identityWarning?.message || ""),
+        progressActive ? (jobProgressText || state.generationProgressText) : "",
         false,
         progressActive ? "progress" : "",
         { source: progressActive ? "direct" : "ambient" }
       );
     }
     el.nextActionButton.disabled = shouldDisableNextActionButton({
-      forceDisabled: Boolean(onOwnProfilePage)
+      forceDisabled: Boolean(onOwnProfilePage),
+      nextStep
     });
-    el.nextActionButton.textContent = actionLabel(currentAction());
-    el.updateProfileButton.classList.remove("hidden");
-    el.updateProfileButton.textContent = isSavedOwnProfilePage() ? "Refresh my profile" : "Update Profile";
-    el.updateProfileButton.disabled = state.pageContext?.pageType !== "linkedin-profile" || (normalizedOwnProfileUrl() && !isSavedOwnProfilePage());
-    el.importConversationButton.classList.toggle("hidden", !canImportConversation);
-    if (canImportConversation) {
-      el.importConversationButton.disabled = false;
-      el.importConversationButton.textContent = currentObservedConversation()
-        ? "Refresh conversation context"
-        : "Import conversation";
+    if (el.updateProfileButton) {
+      el.updateProfileButton.classList.remove("hidden");
+      setButtonLabel(el.updateProfileButton, isSavedOwnProfilePage() ? "Refresh my profile" : "Update Profile");
+      el.updateProfileButton.disabled = state.pageContext?.pageType !== "linkedin-profile" || (normalizedOwnProfileUrl() && !isSavedOwnProfilePage());
     }
-    el.clearConversationButton.classList.toggle("hidden", !hasImportedConversation);
-    el.clearConversationButton.disabled = !hasImportedConversation;
+    if (el.importConversationButton) {
+      el.importConversationButton.classList.toggle("hidden", !canImportConversation);
+      if (canImportConversation) {
+        el.importConversationButton.disabled = false;
+        el.importConversationButton.textContent = currentObservedConversation()
+          ? "Refresh conversation context"
+          : "Import conversation";
+      }
+    }
+    if (el.clearConversationButton) {
+      el.clearConversationButton.classList.toggle("hidden", !hasImportedConversation);
+      el.clearConversationButton.disabled = !hasImportedConversation;
+    }
   }
 
   function mergeRefreshOptions(left, right) {
@@ -2747,6 +3299,8 @@
     const rightSuppress = right ? Boolean(right.suppressImportStatus) : null;
     return {
       preserveStatus: Boolean(left?.preserveStatus || right?.preserveStatus),
+      showOverlay: Boolean(left?.showOverlay || right?.showOverlay),
+      allowCached: Boolean(left?.allowCached || right?.allowCached),
       suppressImportStatus:
         leftSuppress === null
           ? (rightSuppress ?? false)
@@ -2756,20 +3310,95 @@
     };
   }
 
-  async function performRefreshState(options) {
+  function buildRefreshCacheKey(sourceTabId) {
+    const tabId = typeof sourceTabId === "number" ? sourceTabId : -1;
+    const surfaceUrl = normalizeWhitespace(currentObservedSurfaceUrl() || state.pageContext?.pageUrl || "");
+    return `${tabId}::${surfaceUrl}`;
+  }
+
+  function cloneRefreshResponse(response) {
+    if (!response) {
+      return null;
+    }
+    try {
+      return JSON.parse(JSON.stringify(response));
+    } catch (_error) {
+      return null;
+    }
+  }
+
+  function isStableRefreshResponse(response) {
+    const pageContext = response?.pageContext || null;
+    if (!pageContext?.supported) {
+      return false;
+    }
+    const reason = normalizeWhitespace(pageContext?.reason || "");
+    if (/loading/i.test(reason)) {
+      return false;
+    }
+    return true;
+  }
+
+  function readCachedRefreshResponse(cacheKey, options) {
+    if (!options?.allowCached || !cacheKey) {
+      return null;
+    }
+    const cached = state.refreshCache || {};
+    if (cached.key !== cacheKey || !cached.response) {
+      return null;
+    }
+    const ageMs = Date.now() - Number(cached.savedAt || 0);
+    if (ageMs > REFRESH_CACHE_MAX_AGE_MS) {
+      return null;
+    }
+    if (!isStableRefreshResponse(cached.response)) {
+      return null;
+    }
+    return cloneRefreshResponse(cached.response);
+  }
+
+  function hasUsableCachedRefreshResponse(cacheKey) {
+    if (!cacheKey) {
+      return false;
+    }
+    return Boolean(readCachedRefreshResponse(cacheKey, { allowCached: true }));
+  }
+
+  function writeCachedRefreshResponse(cacheKey, response) {
+    if (!cacheKey || !response) {
+      return;
+    }
+    state.refreshCache = {
+      key: cacheKey,
+      savedAt: Date.now(),
+      response: cloneRefreshResponse(response)
+    };
+  }
+
+  function refreshResponsesEquivalent(left, right) {
+    if (!left || !right) {
+      return false;
+    }
+    try {
+      return JSON.stringify(left) === JSON.stringify(right);
+    } catch (_error) {
+      return false;
+    }
+  }
+
+  function applyRefreshResponse(response, options) {
     const previousScrollTop = snapshotScrollPosition();
     const previousPersonId = state.personRecord?.personId || "";
     const previousPersonRecord = state.personRecord;
     const previousWorkspace = state.workspace;
+    const previousPageUrl = normalizeWhitespace(state.pageContext?.pageUrl || "");
     const previousViewKey = personViewKey(previousPersonRecord, state.pageContext?.conversation);
-    const requestedSourceTabId = state.lastObservedBrowserTabId || state.activeTabId || null;
-    const response = await chrome.runtime.sendMessage({
-      type: MESSAGE_TYPES.GET_STORAGE_STATE,
-      sourceTabId: requestedSourceTabId
-    });
     const nextPageContext = response.pageContext;
     const isTransientMessagingLoad = nextPageContext?.pageType === "linkedin-messaging"
       && (!nextPageContext?.supported || !response.currentPerson?.personId);
+    const isTransientProfileLoad = nextPageContext?.pageType === "linkedin-profile"
+      && !nextPageContext?.supported;
+    const samePageUrlAsPrevious = normalizeWhitespace(nextPageContext?.pageUrl || "") === previousPageUrl;
     const pageViewKey = personViewKey(nextPageContext?.person, nextPageContext?.conversation);
     const resolvedViewKey = personViewKey(response.currentPerson, nextPageContext?.conversation);
     const hasVisiblePersonSwitch = Boolean(
@@ -2780,12 +3409,16 @@
 
     state.pageContext = nextPageContext;
     state.activeTabId = response.activeTabId || response.pageContext?.tabId || null;
+    state.attachedLinkedInTabId = response.activeTabId
+      || response.pageContext?.tabId
+      || response.backgroundObservedLinkedInTabId
+      || state.attachedLinkedInTabId
+      || null;
     state.backgroundObservedLinkedInTabId = response.backgroundObservedLinkedInTabId || null;
     state.backgroundObservedLinkedInTabUrl = normalizeWhitespace(response.backgroundObservedLinkedInTabUrl || "");
     state.lastLinkedInClickTrace = response.lastLinkedInClickTrace || null;
     state.pendingLinkedInNavigation = response.pendingLinkedInNavigation || null;
     state.messagingReload = response.messagingReload || null;
-    state.identityResolutionSettings = response.identityResolutionSettings || { hiddenTabPermission: "ask" };
     state.myProfile = response.myProfile || defaultMyProfile();
     state.fixedTail = response.fixedTail || FIXED_TAIL;
     state.promptSettings = response.promptSettings || defaultPromptSettings();
@@ -2800,10 +3433,10 @@
     const resolvedCurrentPerson = findSavedPersonRecord(response.currentPerson, nextPageContext?.conversation)
       || response.currentPerson
       || defaultPersonRecord();
-    state.personRecord = isTransientMessagingLoad && previousPersonId
+    state.personRecord = (isTransientMessagingLoad || isTransientProfileLoad) && previousPersonId && samePageUrlAsPrevious
       ? previousPersonRecord
       : resolvedCurrentPerson;
-    state.workspace = isTransientMessagingLoad && previousPersonId
+    state.workspace = (isTransientMessagingLoad || isTransientProfileLoad) && previousPersonId && samePageUrlAsPrevious
       ? previousWorkspace
       : currentDraftWorkspace(state.personRecord);
 
@@ -2843,10 +3476,11 @@
     populateProfileForm(state.myProfile);
     populatePromptSettingsForm(state.promptSettings);
     const shouldPreserveStatus = Boolean(options?.preserveStatus) && currentViewKey === previousViewKey;
+    restoreStatusStateForCurrentScope();
     renderPageStatus({ preserveStatus: shouldPreserveStatus });
     restoreScrollPosition(previousScrollTop);
     updateAutoRefreshTimer();
-    if (isTransientMessagingLoad) {
+    if (isTransientMessagingLoad || isTransientProfileLoad) {
       scheduleTransientMessagingRetry();
     } else {
       clearTransientMessagingRetry();
@@ -2864,6 +3498,23 @@
     }
     if (!options?.suppressImportStatus && response.importedChanged && response.importSyncMessage) {
       setStatus(response.importSyncMessage, false);
+    }
+  }
+
+  async function performRefreshState(options) {
+    const requestedSourceTabId = preferredLinkedInTabId();
+    const refreshCacheKey = buildRefreshCacheKey(requestedSourceTabId);
+    const cachedResponse = readCachedRefreshResponse(refreshCacheKey, options);
+    if (cachedResponse) {
+      applyRefreshResponse(cachedResponse, options);
+    }
+    const response = await chrome.runtime.sendMessage({
+      type: MESSAGE_TYPES.GET_STORAGE_STATE,
+      sourceTabId: requestedSourceTabId
+    });
+    writeCachedRefreshResponse(refreshCacheKey, response);
+    if (!cachedResponse || !refreshResponsesEquivalent(cachedResponse, response)) {
+      applyRefreshResponse(response, options);
     }
   }
 
@@ -2939,11 +3590,172 @@
     syncOwnProfileUrlInputs(url);
     const currentUrl = currentProfileUrl();
     if (currentUrl && currentUrl.replace(/\/+$/, "") === url.replace(/\/+$/, "")) {
+      setViewMode("workspace");
+      el.settingsSection?.classList.add("hidden");
+      void refreshState({ preserveStatus: true, suppressImportStatus: true });
       renderPageStatus({ preserveStatus: true });
       setStatus("You are already on your LinkedIn profile.", false);
       return;
     }
-    window.open(url, "_blank", "noopener,noreferrer");
+    try {
+      const sourceTabId = await getSourceTabId();
+      setViewMode("workspace");
+      el.settingsSection?.classList.add("hidden");
+      applyOptimisticNavigationHint(url, "");
+      if (sourceTabId) {
+        await chrome.tabs.update(sourceTabId, { url, active: true });
+      } else {
+        window.open(url, "_blank", "noopener,noreferrer");
+      }
+      scheduleNavigationRefreshBurst({ suppressImportStatus: true });
+      setStatus("Opening your LinkedIn profile.", false, "progress");
+    } catch (error) {
+      setStatus(error.message || String(error), true);
+    }
+  }
+
+  async function openCurrentLinkedInDestination(kind, destinationOverride) {
+    const person = currentNextStepPerson();
+    const profileUrl = currentRecipientProfileUrl(person);
+    const threadUrl = currentThreadUrl(person);
+    const destinationUrl = normalizeWhitespace(destinationOverride || (kind === "thread" ? threadUrl : profileUrl));
+    const destinationLabel = kind === "thread" ? "thread" : "profile";
+    const currentUrl = normalizeWhitespace(state.pageContext?.pageUrl || "");
+
+    if (!destinationUrl) {
+      setStatus(`No LinkedIn ${destinationLabel} URL is saved for this person yet.`, true);
+      return;
+    }
+    if (currentUrl && currentUrl.replace(/\/+$/, "") === destinationUrl.replace(/\/+$/, "")) {
+      if (kind === "profile" && state.pageContext?.pageType === "linkedin-profile") {
+        await refreshRecipientProfileContext();
+        return;
+      }
+      setStatus(`You are already on this ${destinationLabel}.`, false);
+      return;
+    }
+
+    try {
+      const sourceTabId = await getSourceTabId();
+      if (sourceTabId) {
+        await chrome.tabs.update(sourceTabId, { url: destinationUrl, active: true });
+      } else {
+        window.open(destinationUrl, "_blank", "noopener,noreferrer");
+      }
+      if (kind === "profile") {
+        setStatus("Opening profile so the assistant can refresh profile context.", false, "progress");
+      }
+    } catch (error) {
+      setStatus(error.message || String(error), true);
+    }
+  }
+
+  async function openCurrentLinkedInMessages(profileUrlOverride) {
+    const person = currentNextStepPerson();
+    const profileUrl = normalizeWhitespace(profileUrlOverride || currentRecipientProfileUrl(person));
+    if (!profileUrl) {
+      setStatus("No LinkedIn profile URL is saved for this person yet.", true);
+      return;
+    }
+
+    setStatus("Opening LinkedIn messages for this person.", false, "progress");
+    try {
+      const response = await chrome.runtime.sendMessage({
+        type: MESSAGE_TYPES.OPEN_PERSON_MESSAGES,
+        sourceTabId: await getSourceTabId(),
+        profileUrl
+      });
+      if (!response?.ok) {
+        throw new Error(response?.error || "Unable to open LinkedIn messages for this person.");
+      }
+      state.lastOpenMessagesDiagnostics = response.openMessagesDebug || null;
+      if (response.personRecord?.personId) {
+        state.personRecord = mergePersonRecord(state.personRecord, response.personRecord);
+      }
+      await refreshState({ preserveStatus: true });
+      scheduleNavigationRefreshBurst({ suppressImportStatus: false });
+      const syncMessage = normalizeWhitespace(response?.autoImport?.syncMessage || "");
+      if (syncMessage) {
+        setStatus(syncMessage, false);
+        return;
+      }
+      switch (normalizeWhitespace(response?.autoImport?.result || "")) {
+        case "thread_visible":
+        case "imported":
+        case "unchanged":
+          setStatus("Opened LinkedIn messaging.", false);
+          return;
+        case "messaging_surface_no_messages":
+        case "compose_overlay_visible":
+          setStatus("LinkedIn opened a message composer, but no visible thread history was available to import yet.", false);
+          return;
+        case "no_surface_detected":
+          setStatus("Clicked LinkedIn Message, but no messaging surface was detected yet.", true);
+          return;
+        default:
+          setStatus(
+            response.navigatedToProfile
+              ? "Opened the profile and triggered LinkedIn messaging."
+              : "Opened LinkedIn messaging.",
+            false
+          );
+      }
+    } catch (error) {
+      setStatus(error.message || String(error), true);
+    }
+  }
+
+  async function refreshRecipientProfileContext() {
+    if (state.pageContext?.pageType !== "linkedin-profile" || isOwnProfilePage()) {
+      setStatus("Open the recipient's LinkedIn profile first.", true);
+      return;
+    }
+    setStatus("Refreshing profile context from the current LinkedIn page. LinkedIn needs a short scroll pass to load the full profile.", false, "progress");
+    try {
+      const response = await chrome.runtime.sendMessage({
+        type: MESSAGE_TYPES.UPDATE_RECIPIENT_PROFILE_CONTEXT,
+        sourceTabId: await getSourceTabId()
+      });
+      if (!response?.ok) {
+        throw new Error(response?.error || "Unable to refresh profile context.");
+      }
+      state.personRecord = response.personRecord || state.personRecord;
+      const refreshed = hasRecipientProfileSnapshot(currentNextStepPerson());
+      await refreshState({ preserveStatus: true });
+      setStatus(
+        refreshed
+          ? "Profile context refreshed."
+          : "Still waiting for LinkedIn to finish loading this profile.",
+        !refreshed
+      );
+    } catch (error) {
+      setStatus(error.message || String(error), true);
+    }
+  }
+
+  async function handleNextStepAction(button) {
+    const mode = normalizeWhitespace(button?.dataset?.mode);
+    const targetUrl = normalizeWhitespace(button?.dataset?.targetUrl || "");
+    switch (mode) {
+      case "open_profile":
+        await openCurrentLinkedInDestination("profile", targetUrl);
+        return;
+      case "open_messages":
+        await openCurrentLinkedInMessages(targetUrl);
+        return;
+      case "open_thread":
+        await openCurrentLinkedInDestination("thread", targetUrl);
+        return;
+      case "import_conversation":
+        await handleImportConversation();
+        return;
+      case "refresh_profile_context":
+        await refreshRecipientProfileContext();
+        return;
+      case "draft":
+      default:
+        await handleGenerate();
+    }
   }
 
   function scheduleFixedTailSave() {
@@ -2958,26 +3770,23 @@
     state.manualRecovery = null;
     const requestId = makeRequestId();
     const currentPersonId = normalizeWhitespace(state.personRecord?.personId);
-    state.activeGenerationRequestId = requestId;
-    state.activeGenerationPersonId = currentPersonId;
-    state.generationProgressText = "Queued...";
-    renderManualRecovery();
-    setStatus(state.generationProgressText, false, "progress");
     try {
       const sourceTabId = await getSourceTabId();
-      const response = await chrome.runtime.sendMessage({
-        type: MESSAGE_TYPES.GENERATE_FOR_RECIPIENT,
+      state.activeGenerationRequestId = requestId;
+      state.activeGenerationPersonId = currentPersonId;
+      state.activeGenerationSourceTabId = typeof sourceTabId === "number" ? sourceTabId : null;
+      state.generationProgressText = "Queued...";
+      renderManualRecovery();
+      setStatus(state.generationProgressText, false, "progress");
+      const response = await chrome.runtime.sendMessage(buildFreshGenerateForRecipientCommand({
         requestId,
         sourceTabId,
-        requestContext: {
-          pageContext: state.pageContext,
-          personRecord: state.personRecord
-        },
+        personRecord: state.personRecord,
         fixedTail: el.fixedTailInput.value,
         personNote: el.personNoteInput.value,
         userGoal: el.personGoalSelect.value,
         extraContext: el.extraContextInput.value
-      });
+      }));
       if (!response?.ok) {
         state.manualRecovery = response?.manualRecovery || null;
         state.lastGenerationDiagnostics = response?.diagnostics || null;
@@ -2990,13 +3799,14 @@
       if (state.activeGenerationRequestId === requestId) {
         state.activeGenerationRequestId = "";
         state.activeGenerationPersonId = "";
+        state.activeGenerationSourceTabId = null;
         state.generationProgressText = "";
       }
       setStatus(error.message || String(error), true);
       renderManualRecovery();
     } finally {
       setLoading(el.nextActionButton, "Drafting…", false);
-      el.nextActionButton.textContent = actionLabel(currentAction());
+      renderPageStatus({ preserveStatus: true });
     }
   }
 
@@ -3035,30 +3845,77 @@
         type: MESSAGE_TYPES.UPDATE_MY_PROFILE,
         sourceTabId: await getSourceTabId()
       });
+      state.lastProfileExtractionDiagnostics = response?.extractedProfileDebug || null;
+      state.lastSenderProfileSaveDiagnostics = {
+        source: "handleUpdateProfile",
+        stage: "after_update_my_profile",
+        firstTimeSave,
+        pendingOwnProfilePage,
+        shouldAutoSaveProfile,
+        currentProfileUrl: normalizeWhitespace(currentProfileUrl()),
+        configuredOwnProfileUrl: normalizeWhitespace(configuredOwnProfileUrl()),
+        responseOk: Boolean(response?.ok),
+        responseError: normalizeWhitespace(response?.error || ""),
+        responseOwnProfileUrl: normalizeWhitespace(response?.profile?.ownProfileUrl || ""),
+        responseRawSnapshotLength: normalizeWhitespace(response?.profile?.rawSnapshot || "").length,
+        extractedProfileUrl: normalizeWhitespace(response?.extractedProfile?.profileUrl || ""),
+        extractedRawSnapshotLength: normalizeWhitespace(response?.extractedProfile?.rawSnapshot || "").length
+      };
       if (!response?.ok) {
         throw new Error(response?.error || "Unable to extract your LinkedIn profile.");
       }
+      const fallbackRawSnapshot = normalizeWhitespace([
+        normalizeWhitespace(response.extractedProfile?.fullName),
+        normalizeWhitespace(response.extractedProfile?.headline),
+        normalizeWhitespace(response.extractedProfile?.location),
+        normalizeWhitespace(response.extractedProfile?.about)
+      ].filter(Boolean).join("\n"));
       const nextProfile = {
         ...state.myProfile,
-        ownProfileUrl: response.profile?.ownProfileUrl || configuredOwnProfileUrl() || state.myProfile?.ownProfileUrl || "",
+        ownProfileUrl: response.profile?.ownProfileUrl
+          || response.extractedProfile?.profileUrl
+          || currentProfileUrl()
+          || configuredOwnProfileUrl()
+          || state.myProfile?.ownProfileUrl
+          || "",
         manualNotes: configuredSenderManualNotes(),
-        rawSnapshot: response.profile?.rawSnapshot || ""
+        rawSnapshot: response.profile?.rawSnapshot || response.extractedProfile?.rawSnapshot || fallbackRawSnapshot
       };
       populateProfileForm(nextProfile);
+      state.lastSenderProfileSaveDiagnostics = {
+        ...(state.lastSenderProfileSaveDiagnostics || {}),
+        stage: shouldAutoSaveProfile ? "before_save_my_profile" : "no_auto_save",
+        nextOwnProfileUrl: normalizeWhitespace(nextProfile.ownProfileUrl || ""),
+        nextRawSnapshotLength: normalizeWhitespace(nextProfile.rawSnapshot || "").length
+      };
       if (shouldAutoSaveProfile) {
         const saveResponse = await chrome.runtime.sendMessage({
           type: MESSAGE_TYPES.SAVE_MY_PROFILE,
           profile: nextProfile
         });
+        state.lastSenderProfileSaveDiagnostics = {
+          source: "handleUpdateProfile",
+          attemptedOwnProfileUrl: normalizeWhitespace(nextProfile.ownProfileUrl || ""),
+          attemptedRawSnapshotLength: normalizeWhitespace(nextProfile.rawSnapshot || "").length,
+          responseDiagnostics: saveResponse?.diagnostics || null
+        };
         if (!saveResponse?.ok) {
           throw new Error(saveResponse?.error || "Unable to save profile.");
         }
-        state.myProfile = saveResponse.profile;
+        state.myProfile = {
+          ...state.myProfile,
+          ...nextProfile,
+          ...(saveResponse.profile || {}),
+          ownProfileUrl: normalizeWhitespace(saveResponse.profile?.ownProfileUrl || nextProfile.ownProfileUrl || ""),
+          rawSnapshot: saveResponse.profile?.rawSnapshot || nextProfile.rawSnapshot || "",
+          pendingProfileUrl: ""
+        };
         if (el.senderContextDetails) {
           el.senderContextDetails.open = false;
         }
         syncOwnProfileUrlInputs(state.myProfile?.ownProfileUrl || "");
-        renderPageStatus();
+        await refreshState({ preserveStatus: true, suppressImportStatus: true });
+        renderPageStatus({ preserveStatus: true });
         setStatus(pendingOwnProfilePage ? "Profile switched." : "Sender context saved.", false);
         return;
       }
@@ -3080,6 +3937,12 @@
         type: MESSAGE_TYPES.SAVE_MY_PROFILE,
         profile: readProfileForm()
       });
+      state.lastSenderProfileSaveDiagnostics = {
+        source: "handleSaveProfile",
+        attemptedOwnProfileUrl: normalizeWhitespace(readProfileForm()?.ownProfileUrl || ""),
+        attemptedRawSnapshotLength: normalizeWhitespace(readProfileForm()?.rawSnapshot || "").length,
+        responseDiagnostics: response?.diagnostics || null
+      };
       if (!response?.ok) {
         throw new Error(response?.error || "Unable to save profile.");
       }
@@ -3141,16 +4004,8 @@
       if (!response?.ok) {
         throw new Error(response?.error || "Unable to save prompt settings.");
       }
-      const identityResponse = await chrome.runtime.sendMessage({
-        type: MESSAGE_TYPES.SAVE_IDENTITY_RESOLUTION_SETTINGS,
-        hiddenTabPermission: el.identityResolutionSettingsSelect?.value || "ask"
-      });
-      if (!identityResponse?.ok) {
-        throw new Error(identityResponse?.error || "Unable to save background lookup setting.");
-      }
 
       state.promptSettings = response.promptSettings || defaultPromptSettings();
-      state.identityResolutionSettings = identityResponse.identityResolutionSettings || state.identityResolutionSettings;
       resetPromptSettingsDirty();
       populatePromptSettingsForm(state.promptSettings);
       el.settingsSection.classList.add("hidden");
@@ -3184,6 +4039,7 @@
       }
 
       state.personRecord = goalResponse.personRecord || noteResponse.personRecord || state.personRecord;
+      setPersonCardEditorOpen(false);
       renderPageStatus();
       setStatus("Person context saved.", false);
     } catch (error) {
@@ -3248,42 +4104,6 @@
     }
   }
 
-  async function handleResolveIdentity(hiddenTabPermission) {
-    const request = activeIdentityResolutionRequest();
-    if (!request) {
-      return;
-    }
-    setLoading(el.identityResolutionAllowOnce, "Resolving…", true);
-    setLoading(el.identityResolutionAllowAlways, "Resolving…", true);
-    try {
-      const response = await chrome.runtime.sendMessage({
-        type: MESSAGE_TYPES.RESOLVE_PROFILE_IDENTITY,
-        hiddenTabPermission: hiddenTabPermission || "",
-        requestMode: request.mode || "",
-        profileUrl: request.profileUrl || "",
-        sourceTabId: await getSourceTabId()
-      });
-      if (!response?.ok) {
-        throw new Error(response?.error || "Unable to resolve the public LinkedIn profile URL.");
-      }
-      state.identityResolutionRequest = null;
-      state.dismissedIdentityResolutionRequestKey = "";
-      await refreshState({ preserveStatus: true });
-      setStatus(
-        request.mode === "merge_confirmation"
-          ? "Checked the public LinkedIn profile URL and refreshed the matching person record."
-          : "Resolved the public LinkedIn profile URL for this messaging thread.",
-        false
-      );
-    } catch (error) {
-      setStatus(error.message || String(error), true);
-    } finally {
-      setLoading(el.identityResolutionAllowOnce, "Resolving…", false);
-      setLoading(el.identityResolutionAllowAlways, "Resolving…", false);
-      renderPageStatus({ preserveStatus: true });
-    }
-  }
-
   async function copyToClipboard(text) {
     await navigator.clipboard.writeText(text);
     setStatus("Copied.", false);
@@ -3324,12 +4144,13 @@
     try {
       const response = await chrome.runtime.sendMessage({
         type: MESSAGE_TYPES.READ_LATEST_PROVIDER_RESPONSE,
+        sourceTabId: await getSourceTabId(),
         personId: state.personRecord?.personId || "",
         fixedTail: el.fixedTailInput.value,
         recipientFullName: state.personRecord?.fullName || state.pageContext?.person?.fullName || "",
         recipientProfileUrl: state.personRecord?.profileUrl || state.pageContext?.person?.profileUrl || "",
         pageType: state.pageContext?.pageType || "",
-        flowType: currentDraftWorkspace()?.flowType || (state.pageContext?.pageType === "linkedin-messaging" ? "messaging" : ""),
+        flowType: currentDraftWorkspace()?.flowType || "relationship",
         prompt: state.manualRecovery?.prompt || ""
       });
       if (!response?.ok) {
@@ -3351,6 +4172,36 @@
     }
   }
 
+  function handleClearTechnicalDetails() {
+    state.manualRecovery = null;
+    state.lastGenerationDiagnostics = null;
+    state.resolutionDiagnostics = null;
+      state.lastProfileExtractionDiagnostics = null;
+      state.lastSenderProfileSaveDiagnostics = null;
+      if (el.pageDiagnostics) {
+        el.pageDiagnostics.value = "";
+      }
+    if (el.senderProfileExtracted) {
+      el.senderProfileExtracted.value = "";
+    }
+    if (el.manualPrompt) {
+      el.manualPrompt.value = "";
+    }
+    if (el.manualRawOutput) {
+      el.manualRawOutput.value = "";
+    }
+    if (el.globalDiagnosticsDetails) {
+      el.globalDiagnosticsDetails.open = false;
+    }
+    renderManualRecovery();
+  }
+
+  async function handleCopyTechnicalDetails() {
+    const { diagnostics } = buildDiagnosticsSnapshot();
+    const text = JSON.stringify(diagnostics, null, 2);
+    await copyToClipboard(text);
+  }
+
   async function handleFactoryReset() {
     const confirmed = window.confirm("Factory reset will delete all locally saved extension data, including profiles, notes, imported conversation history, prompt settings, and cache. It will not delete conversations on the provider websites. Continue?");
     if (!confirmed) {
@@ -3364,11 +4215,35 @@
         throw new Error(response?.error || "Unable to factory reset the extension.");
       }
 
+      state.viewMode = "workspace";
+      state.myProfile = defaultMyProfile();
+      state.promptSettings = defaultPromptSettings();
+      state.fixedTail = FIXED_TAIL;
+      state.allPeople = [];
+      state.personRecord = defaultPersonRecord();
       state.workspace = null;
       state.manualRecovery = null;
+      state.identityWarning = null;
+      state.identityResolutionRequest = null;
+      state.dismissedIdentityResolutionRequestKey = "";
       state.extraContext = "";
       state.showingAlternatives = false;
+      state.generationJobs = [];
+      state.activeGenerationRequestId = "";
+      state.activeGenerationPersonId = "";
+      state.generationProgressText = "";
+      state.lastImportSyncMessage = "";
+      state.lastGenerationDiagnostics = null;
+      state.resolutionDiagnostics = null;
+      state.lastProfileExtractionDiagnostics = null;
+      state.lastSenderProfileSaveDiagnostics = null;
+      state.lastOpenMessagesDiagnostics = null;
       el.settingsSection.classList.add("hidden");
+      populateProfileForm(state.myProfile);
+      populatePromptSettingsForm(state.promptSettings);
+      el.fixedTailInput.value = state.fixedTail;
+      setViewMode("workspace");
+      renderPageStatus({ preserveStatus: false });
       await refreshState();
       setStatus("Factory reset complete.", false);
     } catch (error) {
@@ -3426,18 +4301,31 @@
   });
 
   el.nextActionButton.addEventListener("click", () => {
-    handleGenerate();
+    handleNextStepAction(el.nextActionButton);
   });
 
-  el.refreshDraftButton.addEventListener("click", () => {
-    handleGenerate();
+  el.nextHelperButton?.addEventListener("click", () => {
+    handleNextStepAction(el.nextHelperButton);
   });
 
-  el.updateProfileButton.addEventListener("click", () => {
+  el.personCardEditButton?.addEventListener("click", () => {
+    const willOpen = Boolean(el.personCardEditor?.classList.contains("hidden"));
+    setPersonCardEditorOpen(willOpen);
+  });
+
+  el.nextStepEvidence?.addEventListener("click", (event) => {
+    const button = event.target instanceof Element ? event.target.closest(".next-step-chip__action") : null;
+    if (!(button instanceof HTMLButtonElement)) {
+      return;
+    }
+    void handleNextStepAction(button);
+  });
+
+  el.updateProfileButton?.addEventListener("click", () => {
     handleUpdateProfile();
   });
 
-  el.profileForm.addEventListener("submit", (event) => {
+  el.profileForm?.addEventListener("submit", (event) => {
     handleSaveProfile(event);
   });
 
@@ -3464,11 +4352,6 @@
     if (el.senderProfileNotesInput && document.activeElement === profileFields.manualNotes) {
       el.senderProfileNotesInput.value = profileFields.manualNotes.value;
     }
-  });
-
-  el.senderProfileSettingsUrl.addEventListener("input", () => {
-    markPromptSettingsDirty();
-    renderPageStatus({ preserveStatus: true });
   });
 
   el.senderProfileProviderSelect?.addEventListener("change", async () => {
@@ -3508,10 +4391,6 @@
     markPromptSettingsDirty();
   });
 
-  el.identityResolutionSettingsSelect?.addEventListener("change", () => {
-    markPromptSettingsDirty();
-  });
-
   el.extraContextInput.addEventListener("input", () => {
     state.extraContext = el.extraContextInput.value;
   });
@@ -3523,7 +4402,7 @@
     setStatus("Cold outreach default reset.", false);
   });
 
-  el.importConversationButton.addEventListener("click", () => {
+  el.importConversationButton?.addEventListener("click", () => {
     handleImportConversation();
   });
 
@@ -3546,7 +4425,7 @@
     handleUpdateProfile({ allowCurrentPageCapture: true });
   });
 
-  el.clearConversationButton.addEventListener("click", () => {
+  el.clearConversationButton?.addEventListener("click", () => {
     handleClearImportedConversation();
   });
 
@@ -3567,24 +4446,16 @@
     handleReadLatestResponse();
   });
 
-  el.identityResolutionAllowOnce.addEventListener("click", () => {
-    handleResolveIdentity("");
+  el.clearTechnicalDetailsButton?.addEventListener("click", () => {
+    handleClearTechnicalDetails();
   });
 
-  el.identityResolutionAllowAlways.addEventListener("click", () => {
-    handleResolveIdentity("always_allow");
+  el.copyTechnicalDetailsButton?.addEventListener("click", () => {
+    void handleCopyTechnicalDetails();
   });
 
-  el.identityResolutionNotNow.addEventListener("click", () => {
-    const request = activeIdentityResolutionRequest();
-    state.dismissedIdentityResolutionRequestKey = request?.requestKey || "";
-    if (request?.mode === "resolve_identity" && request?.profileUrl) {
-      chrome.runtime.sendMessage({
-        type: MESSAGE_TYPES.MARK_IDENTITY_RESOLUTION_SEEN,
-        profileUrl: request.profileUrl
-      }).catch(() => {});
-    }
-    renderPageStatus({ preserveStatus: true });
+  el.recipientProfileRefreshLink?.addEventListener("click", () => {
+    void refreshRecipientProfileContext();
   });
 
   el.factoryResetButton.addEventListener("click", () => {
@@ -3677,14 +4548,16 @@
 
   chrome.runtime.onMessage.addListener((message, sender) => {
     if (message?.type === MESSAGE_TYPES.GENERATION_PROGRESS) {
+      const matchesAttachedTab = messageMatchesAttachedLinkedInTab(message);
       const personId = normalizeWhitespace(message?.personId);
-      if (personId) {
+      if (personId && matchesAttachedTab) {
         const nextJobs = Array.isArray(state.generationJobs) ? [...state.generationJobs] : [];
-        const index = nextJobs.findIndex((job) => normalizeWhitespace(job?.personId) === personId);
+        const index = nextJobs.findIndex((job) => normalizeWhitespace(job?.requestId) === normalizeWhitespace(message?.requestId));
         const nextJob = {
           ...(index >= 0 ? nextJobs[index] : {}),
           requestId: normalizeWhitespace(message?.requestId),
           personId,
+          sourceTabId: typeof message?.sourceTabId === "number" ? message.sourceTabId : null,
           provider: normalizeWhitespace(message?.provider),
           status: normalizeWhitespace(message?.status || "running"),
           progressText: normalizeWhitespace(message?.text),
@@ -3704,8 +4577,15 @@
       if (message?.requestId && message.requestId === state.activeGenerationRequestId) {
         state.generationProgressText = normalizeWhitespace(message.text);
       }
-      const isCurrentPerson = Boolean(personId && personId === normalizeWhitespace(state.personRecord?.personId));
-      const isActiveRequest = Boolean(message?.requestId && message.requestId === state.activeGenerationRequestId);
+      const isCurrentPerson = Boolean(matchesAttachedTab && personId && personId === normalizeWhitespace(state.personRecord?.personId));
+      const isActiveRequest = Boolean(
+        message?.requestId
+        && message.requestId === state.activeGenerationRequestId
+        && (
+          state.activeGenerationSourceTabId === null
+          || state.activeGenerationSourceTabId === (typeof message?.sourceTabId === "number" ? message.sourceTabId : null)
+        )
+      );
       if (isCurrentPerson || isActiveRequest) {
         const nextText = normalizeWhitespace(message?.text) || state.generationProgressText;
         setStatus(nextText, false, "progress");
@@ -3714,14 +4594,16 @@
     }
 
     if (message?.type === MESSAGE_TYPES.GENERATION_COMPLETE) {
+      const matchesAttachedTab = messageMatchesAttachedLinkedInTab(message);
       const completedPersonId = normalizeWhitespace(message.personId || message.personRecord?.personId);
-      const isCurrentPerson = Boolean(completedPersonId && completedPersonId === normalizeWhitespace(state.personRecord?.personId));
+      const isCurrentPerson = Boolean(matchesAttachedTab && completedPersonId && completedPersonId === normalizeWhitespace(state.personRecord?.personId));
       const mergedCompletedRecord = message?.personRecord ? upsertLocalPersonRecord(message.personRecord) : null;
       state.generationJobs = (Array.isArray(state.generationJobs) ? state.generationJobs : [])
-        .filter((job) => normalizeWhitespace(job?.personId) !== completedPersonId);
+        .filter((job) => normalizeWhitespace(job?.requestId) !== normalizeWhitespace(message?.requestId));
       if (message?.requestId && message.requestId === state.activeGenerationRequestId) {
         state.activeGenerationRequestId = "";
         state.activeGenerationPersonId = "";
+        state.activeGenerationSourceTabId = null;
         state.generationProgressText = "";
       }
       if (isCurrentPerson) {
@@ -3732,20 +4614,22 @@
         state.showingAlternatives = false;
         renderPageStatus();
         setStatus("Draft ready.", false);
-      } else {
+      } else if (matchesAttachedTab) {
         refreshState({ preserveStatus: true, suppressImportStatus: true }).catch(() => {});
       }
       return;
     }
 
     if (message?.type === MESSAGE_TYPES.GENERATION_FAILED) {
+      const matchesAttachedTab = messageMatchesAttachedLinkedInTab(message);
       const failedPersonId = normalizeWhitespace(message.personId);
-      const isCurrentPerson = Boolean(failedPersonId && failedPersonId === normalizeWhitespace(state.personRecord?.personId));
+      const isCurrentPerson = Boolean(matchesAttachedTab && failedPersonId && failedPersonId === normalizeWhitespace(state.personRecord?.personId));
       state.generationJobs = (Array.isArray(state.generationJobs) ? state.generationJobs : [])
-        .filter((job) => normalizeWhitespace(job?.personId) !== failedPersonId);
+        .filter((job) => normalizeWhitespace(job?.requestId) !== normalizeWhitespace(message?.requestId));
       if (message?.requestId && message.requestId === state.activeGenerationRequestId) {
         state.activeGenerationRequestId = "";
         state.activeGenerationPersonId = "";
+        state.activeGenerationSourceTabId = null;
         state.generationProgressText = "";
       }
       if (isCurrentPerson) {
@@ -3759,7 +4643,7 @@
 
     if (message?.type === MESSAGE_TYPES.PAGE_CONTEXT_CHANGED) {
       const senderTabId = sender?.tab?.id || message?.tabId || null;
-      const knownTabId = state.activeTabId || state.lastObservedBrowserTabId || null;
+      const knownTabId = preferredLinkedInTabId() || state.lastObservedBrowserTabId || null;
       if (!senderTabId || (knownTabId && senderTabId !== knownTabId)) {
         return;
       }
@@ -3772,15 +4656,39 @@
     }
   });
 
-  chrome.tabs.onActivated.addListener(() => {
-    scheduleNavigationRefreshBurst();
+  chrome.tabs.onActivated.addListener(async () => {
+    try {
+      const tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+      const activeTab = tabs[0] || null;
+      if (!activeTab?.id) {
+        return;
+      }
+      state.lastObservedBrowserTabId = activeTab.id;
+      state.lastObservedBrowserTabUrl = normalizeWhitespace(activeTab.url || state.lastObservedBrowserTabUrl || "");
+      const attachedToLinkedIn = attachToLinkedInTab(activeTab.id, activeTab.url || "");
+      const shouldRefresh = attachedToLinkedIn || activeTab.id === preferredLinkedInTabId();
+      if (shouldRefresh) {
+        scheduleNavigationRefreshBurst();
+      }
+    } catch (_error) {
+      // Ignore activation lookup errors.
+    }
   });
 
   chrome.tabs.onUpdated.addListener((_tabId, changeInfo, tab) => {
     if (!tab.active) {
       return;
     }
-    if (changeInfo.url || changeInfo.status === "complete") {
+    if (changeInfo.url) {
+      state.lastObservedBrowserTabId = tab.id || state.lastObservedBrowserTabId;
+      state.lastObservedBrowserTabUrl = normalizeWhitespace(changeInfo.url);
+      const attachedToLinkedIn = attachToLinkedInTab(tab.id, changeInfo.url);
+      if (tab.id === preferredLinkedInTabId() || attachedToLinkedIn) {
+        applyOptimisticNavigationHint(changeInfo.url, "");
+      }
+    }
+    if ((changeInfo.url || changeInfo.status === "complete")
+      && (tab.id === preferredLinkedInTabId() || isLinkedInWorkspaceUrl(tab.url || changeInfo.url || ""))) {
       scheduleNavigationRefreshBurst();
     }
   });
@@ -3793,6 +4701,8 @@
       if (state.lastObservedBrowserTabId && details.tabId !== state.lastObservedBrowserTabId) {
         return;
       }
+      attachToLinkedInTab(details.tabId, details.url || state.lastObservedBrowserTabUrl || "");
+      applyOptimisticNavigationHint(details.url || "", "");
       scheduleNavigationRefreshBurst();
     }, {
       url: [{ hostEquals: "www.linkedin.com" }]
@@ -3800,5 +4710,6 @@
   }
 
   setViewMode("workspace");
-  refreshState();
+  renderPageStatus({ preserveStatus: true });
+  refreshState({ allowCached: true });
 })();

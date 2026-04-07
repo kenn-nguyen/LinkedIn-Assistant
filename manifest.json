@@ -44,9 +44,13 @@
         "https://www.linkedin.com/*"
       ],
       "js": [
+        "identity.js",
         "shared.js",
+        "linkedin-commands.js",
         "linkedin-content.js"
       ],
+      "all_frames": true,
+      "match_about_blank": true,
       "run_at": "document_idle"
     },
     {
@@ -55,6 +59,7 @@
         "https://chat.openai.com/*"
       ],
       "js": [
+        "identity.js",
         "shared.js",
         "chatgpt-content.js"
       ],
@@ -65,6 +70,7 @@
         "https://gemini.google.com/*"
       ],
       "js": [
+        "identity.js",
         "shared.js",
         "gemini-content.js"
       ],
