@@ -22,6 +22,14 @@
     /^organizations$/i,
     /^causes$/i
   ];
+  const PROFILE_EXTRACTION_SECTION_TARGETS = [
+    { key: "about", pattern: /^about$/i },
+    { key: "experience", pattern: /^experience$/i },
+    { key: "education", pattern: /^education$/i },
+    { key: "activity", pattern: /^(activity|featured|posts?)$/i },
+    { key: "languages", pattern: /^languages?$/i },
+    { key: "skills", pattern: /^skills$/i }
+  ];
 
   function isVisible(element) {
     if (!(element instanceof Element)) {
@@ -2075,6 +2083,7 @@
       queryAny,
       queryFirst,
       roundMs,
+      scrollProfileForExtraction,
       scrollProfileToBottomAndWaitForStable,
       showPageActivityOverlay,
       truncate,
@@ -2192,6 +2201,66 @@
     );
   }
 
+  function profileExtractionSectionKey(heading) {
+    const normalizedHeading = normalizeWhitespace(heading);
+    if (!normalizedHeading) {
+      return "";
+    }
+    const match = PROFILE_EXTRACTION_SECTION_TARGETS.find((target) => target.pattern.test(normalizedHeading));
+    return match ? match.key : "";
+  }
+
+  function collectLoadedProfileSectionKeys() {
+    return uniqueStrings(
+      getProfileSections(getProfileRoot())
+        .map((section) => profileExtractionSectionKey(sectionHeadingText(section)))
+        .filter(Boolean)
+    );
+  }
+
+  function normalizeProfileExtractionGoals(goals) {
+    if (!Array.isArray(goals) || !goals.length) {
+      return [];
+    }
+    return uniqueStrings(
+      goals
+        .map((goal) => normalizeWhitespace(goal).toLowerCase())
+        .filter((goal) => PROFILE_EXTRACTION_SECTION_TARGETS.some((target) => target.key === goal))
+    );
+  }
+
+  function collectProfileExtractionProgress() {
+    const identity = extractTopCardIdentity(getProfileRoot());
+    const loadedSectionKeys = collectLoadedProfileSectionKeys();
+    const sectionKeySet = new Set(loadedSectionKeys);
+    return {
+      hasIdentity: hasCriticalProfileIdentity(identity.name, identity.headline),
+      loadedSectionKeys,
+      loadedSectionCount: loadedSectionKeys.length,
+      hasStructuredCoverage: sectionKeySet.has("about")
+        || sectionKeySet.has("experience")
+        || sectionKeySet.has("education")
+        || sectionKeySet.has("activity")
+        || sectionKeySet.has("languages"),
+      coreLoaded: hasLoadedCoreSections()
+    };
+  }
+
+  function shouldStopProfileExtractionScroll(progress, goals, nearBottom, stagnantPasses) {
+    const goalList = Array.isArray(goals) && goals.length ? goals : ["about", "experience", "education", "activity"];
+    const goalSatisfied = goalList.every((goal) => progress.loadedSectionKeys.includes(goal));
+    if (goalSatisfied) {
+      return true;
+    }
+    if (nearBottom && progress.coreLoaded && progress.hasStructuredCoverage) {
+      return true;
+    }
+    if (nearBottom && stagnantPasses >= 2 && progress.hasStructuredCoverage) {
+      return true;
+    }
+    return false;
+  }
+
   async function scrollDownTo(targetHeight) {
     const step = Math.max(500, Math.floor(window.innerHeight * 0.75));
     const start = Math.max(0, window.scrollY);
@@ -2263,72 +2332,100 @@
     });
   }
 
-  async function scrollProfileToBottomAndWaitForStable() {
+  async function scrollProfileForExtraction(options) {
     const scroller = getScrollContainer();
     const startedAtMs = nowMs();
     const viewportHeight = Math.max(400, getViewportHeight(scroller));
+    const goals = normalizeProfileExtractionGoals(options?.sectionGoals);
     let lastHeight = getScrollableHeight();
+    let progress = collectProfileExtractionProgress();
     let stabilityWaitMs = 0;
     let stabilityChecks = 0;
-    let stablePasses = 0;
+    let stagnantPasses = 0;
+    let stepCount = 0;
+    const maxSteps = Math.max(8, Number(options?.maxSteps) || 14);
 
     if (!lastHeight) {
       return {
         scrollMs: 0,
         stabilityWaitMs: 0,
-        stabilityChecks: 0
+        stabilityChecks: 0,
+        stepCount: 0,
+        seenSections: []
       };
     }
 
-    await scrollInSteps(scroller, 0, {
-      stepPx: Math.max(320, Math.floor(viewportHeight * 0.7)),
-      stepDelayMs: 85,
-      settleDelayMs: 80
-    });
-    await scrollInSteps(scroller, lastHeight, {
-      stepPx: Math.max(320, Math.floor(viewportHeight * 0.6)),
-      stepDelayMs: 90,
-      settleDelayMs: 260
-    });
+    if (!progress.hasIdentity && getScrollTop(scroller) > Math.floor(viewportHeight * 0.25)) {
+      await scrollInSteps(scroller, 0, {
+        stepPx: Math.max(320, Math.floor(viewportHeight * 0.7)),
+        stepDelayMs: 85,
+        settleDelayMs: 180
+      });
+      progress = collectProfileExtractionProgress();
+      lastHeight = getScrollableHeight();
+    }
 
-    while (stabilityChecks < 3) {
+    while (stepCount < maxSteps) {
+      const currentTop = getScrollTop(scroller);
+      const currentHeight = getScrollableHeight();
+      const bottomTop = Math.max(0, currentHeight - viewportHeight);
+      const nearBottom = currentTop >= Math.max(0, bottomTop - Math.floor(viewportHeight * 0.18));
+
+      if (shouldStopProfileExtractionScroll(progress, goals, nearBottom, stagnantPasses)) {
+        break;
+      }
+
+      const nextTop = Math.min(
+        bottomTop,
+        currentTop + Math.max(560, Math.floor(viewportHeight * 0.88))
+      );
+      if (nextTop <= currentTop + 8) {
+        stagnantPasses += 1;
+        if (stagnantPasses >= 2) {
+          break;
+        }
+        const waitStartedAtMs = nowMs();
+        await delay(220);
+        stabilityWaitMs += roundMs(nowMs() - waitStartedAtMs);
+        continue;
+      }
+
+      await scrollInSteps(scroller, nextTop, {
+        stepPx: Math.max(320, Math.floor(viewportHeight * 0.6)),
+        stepDelayMs: 90,
+        settleDelayMs: 180
+      });
+      stepCount += 1;
       stabilityChecks += 1;
       const waitStartedAtMs = nowMs();
-      await delay(500);
+      await delay(220);
       stabilityWaitMs += roundMs(nowMs() - waitStartedAtMs);
 
       const nextHeight = getScrollableHeight();
-      const targetBottom = Math.max(0, nextHeight - Math.floor(viewportHeight * 0.1));
-      await scrollInSteps(scroller, targetBottom, {
-        stepPx: Math.max(320, Math.floor(viewportHeight * 0.55)),
-        stepDelayMs: 85,
-        settleDelayMs: 80
-      });
-
-      const coreLoaded = hasLoadedCoreSections();
-      if (nextHeight <= lastHeight + 120) {
-        stablePasses += 1;
+      const nextProgress = collectProfileExtractionProgress();
+      const sectionGrowth = nextProgress.loadedSectionCount - progress.loadedSectionCount;
+      if (nextHeight <= lastHeight + 120 && sectionGrowth <= 0) {
+        stagnantPasses += 1;
       } else {
-        stablePasses = 0;
+        stagnantPasses = 0;
       }
       lastHeight = nextHeight;
-
-      if (stablePasses >= 1 && coreLoaded) {
-        break;
-      }
+      progress = nextProgress;
     }
 
-    await scrollInSteps(scroller, 0, {
-      stepPx: Math.max(320, Math.floor(viewportHeight * 0.7)),
-      stepDelayMs: 85,
-      settleDelayMs: 120
-    });
+    await delay(180);
 
     return {
       scrollMs: roundMs(nowMs() - startedAtMs),
       stabilityWaitMs,
-      stabilityChecks
+      stabilityChecks,
+      stepCount,
+      seenSections: progress.loadedSectionKeys.slice(0, 8)
     };
+  }
+
+  async function scrollProfileToBottomAndWaitForStable() {
+    return scrollProfileForExtraction();
   }
 
   async function expandInlineTextSections() {
@@ -2398,70 +2495,107 @@
     });
   }
 
-  function setupContextChangeNotifications() {
-    if (window.__linkedinAssistantContextObserverInstalled) {
+  const assistantLifecycleState = {
+    active: false,
+    observer: null,
+    debounceTimer: null,
+    managedTimeouts: new Set(),
+    lastSignature: "",
+    clickHandler: null,
+    popstateHandler: null,
+    hashchangeHandler: null,
+    originalPushState: null,
+    originalReplaceState: null
+  };
+
+  function managedSetTimeout(callback, delayMs) {
+    const timerId = window.setTimeout(() => {
+      assistantLifecycleState.managedTimeouts.delete(timerId);
+      callback();
+    }, delayMs);
+    assistantLifecycleState.managedTimeouts.add(timerId);
+    return timerId;
+  }
+
+  function clearManagedAssistantTimeouts() {
+    assistantLifecycleState.managedTimeouts.forEach((timerId) => window.clearTimeout(timerId));
+    assistantLifecycleState.managedTimeouts.clear();
+  }
+
+  function notifyContextChangedWhenActive() {
+    if (!assistantLifecycleState.active) {
       return;
     }
-    window.__linkedinAssistantContextObserverInstalled = true;
+    chrome.runtime.sendMessage({
+      type: MESSAGE_TYPES.PAGE_CONTEXT_CHANGED,
+      href: window.location.href
+    }).catch(() => {});
+  }
 
-    let lastSignature = "";
-    let debounceTimer = null;
-
-    const notifyContextChanged = () => {
-      chrome.runtime.sendMessage({
-        type: MESSAGE_TYPES.PAGE_CONTEXT_CHANGED,
-        href: window.location.href
-      }).catch(() => {});
-    };
-
-    const checkForContextChange = () => {
-      debounceTimer = null;
+  function scheduleAssistantContextCheck() {
+    if (!assistantLifecycleState.active) {
+      return;
+    }
+    window.clearTimeout(assistantLifecycleState.debounceTimer);
+    assistantLifecycleState.debounceTimer = window.setTimeout(() => {
+      assistantLifecycleState.debounceTimer = null;
       const nextSignature = currentContextSignature();
-      if (!nextSignature || nextSignature === lastSignature) {
+      if (!nextSignature || nextSignature === assistantLifecycleState.lastSignature) {
         return;
       }
-      lastSignature = nextSignature;
-      notifyContextChanged();
-    };
+      assistantLifecycleState.lastSignature = nextSignature;
+      notifyContextChangedWhenActive();
+    }, 250);
+  }
 
-    const scheduleCheck = () => {
-      window.clearTimeout(debounceTimer);
-      debounceTimer = window.setTimeout(checkForContextChange, 250);
-    };
+  function scheduleDetailPaneRefreshBurstWhenActive() {
+    if (!assistantLifecycleState.active) {
+      return;
+    }
+    [0, 200, 500, 1000, 1800].forEach((delayMs) => {
+      managedSetTimeout(() => {
+        if (assistantLifecycleState.active && isSupportedMessagingPage()) {
+          scheduleAssistantContextCheck();
+        }
+      }, delayMs);
+    });
+  }
 
-    const scheduleDetailPaneRefreshBurst = () => {
-      [0, 200, 500, 1000, 1800].forEach((delayMs) => {
-        window.setTimeout(() => {
-          if (isSupportedMessagingPage()) {
-            scheduleCheck();
-          }
-        }, delayMs);
-      });
-    };
+  function startContextChangeNotifications() {
+    if (assistantLifecycleState.active) {
+      return;
+    }
+    assistantLifecycleState.active = true;
+    assistantLifecycleState.lastSignature = currentContextSignature();
 
-    lastSignature = currentContextSignature();
     [0, 300, 1000].forEach((delayMs) => {
-      window.setTimeout(() => {
-        lastSignature = currentContextSignature();
-        notifyContextChanged();
+      managedSetTimeout(() => {
+        if (!assistantLifecycleState.active) {
+          return;
+        }
+        assistantLifecycleState.lastSignature = currentContextSignature();
+        notifyContextChangedWhenActive();
       }, delayMs);
     });
 
-    const observer = new MutationObserver(() => {
+    assistantLifecycleState.observer = new MutationObserver(() => {
       if (isSupportedMessagingPage() || isSupportedProfilePage() || isLinkedInProfileSubpage()) {
-        scheduleCheck();
+        scheduleAssistantContextCheck();
       }
     });
 
     if (document.body) {
-      observer.observe(document.body, {
+      assistantLifecycleState.observer.observe(document.body, {
         childList: true,
         subtree: true,
         characterData: true
       });
     }
 
-    document.addEventListener("click", (event) => {
+    assistantLifecycleState.clickHandler = (event) => {
+      if (!assistantLifecycleState.active) {
+        return;
+      }
       const target = event.target;
       if (!(target instanceof Element)) {
         return;
@@ -2489,31 +2623,80 @@
       ].join(", "));
 
       if (clickedConversationSwitcher) {
-        scheduleDetailPaneRefreshBurst();
+        scheduleDetailPaneRefreshBurstWhenActive();
       }
-    }, true);
+    };
+    document.addEventListener("click", assistantLifecycleState.clickHandler, true);
 
-    window.addEventListener("popstate", scheduleCheck);
-    window.addEventListener("hashchange", scheduleCheck);
+    assistantLifecycleState.popstateHandler = () => {
+      scheduleAssistantContextCheck();
+    };
+    assistantLifecycleState.hashchangeHandler = () => {
+      scheduleAssistantContextCheck();
+    };
+    window.addEventListener("popstate", assistantLifecycleState.popstateHandler);
+    window.addEventListener("hashchange", assistantLifecycleState.hashchangeHandler);
 
-    const originalPushState = history.pushState.bind(history);
+    assistantLifecycleState.originalPushState = history.pushState.bind(history);
     history.pushState = function patchedPushState(...args) {
-      const result = originalPushState(...args);
-      scheduleCheck();
+      const result = assistantLifecycleState.originalPushState(...args);
+      scheduleAssistantContextCheck();
       return result;
     };
 
-    const originalReplaceState = history.replaceState.bind(history);
+    assistantLifecycleState.originalReplaceState = history.replaceState.bind(history);
     history.replaceState = function patchedReplaceState(...args) {
-      const result = originalReplaceState(...args);
-      scheduleCheck();
+      const result = assistantLifecycleState.originalReplaceState(...args);
+      scheduleAssistantContextCheck();
       return result;
     };
   }
 
-  setupContextChangeNotifications();
+  function stopContextChangeNotifications() {
+    if (!assistantLifecycleState.active) {
+      return;
+    }
+    assistantLifecycleState.active = false;
+    if (assistantLifecycleState.observer) {
+      assistantLifecycleState.observer.disconnect();
+      assistantLifecycleState.observer = null;
+    }
+    window.clearTimeout(assistantLifecycleState.debounceTimer);
+    assistantLifecycleState.debounceTimer = null;
+    clearManagedAssistantTimeouts();
+    if (assistantLifecycleState.clickHandler) {
+      document.removeEventListener("click", assistantLifecycleState.clickHandler, true);
+      assistantLifecycleState.clickHandler = null;
+    }
+    if (assistantLifecycleState.popstateHandler) {
+      window.removeEventListener("popstate", assistantLifecycleState.popstateHandler);
+      assistantLifecycleState.popstateHandler = null;
+    }
+    if (assistantLifecycleState.hashchangeHandler) {
+      window.removeEventListener("hashchange", assistantLifecycleState.hashchangeHandler);
+      assistantLifecycleState.hashchangeHandler = null;
+    }
+    if (assistantLifecycleState.originalPushState) {
+      history.pushState = assistantLifecycleState.originalPushState;
+      assistantLifecycleState.originalPushState = null;
+    }
+    if (assistantLifecycleState.originalReplaceState) {
+      history.replaceState = assistantLifecycleState.originalReplaceState;
+      assistantLifecycleState.originalReplaceState = null;
+    }
+    hidePageActivityOverlay();
+  }
 
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+    if (message?.type === MESSAGE_TYPES.SET_ASSISTANT_ACTIVE) {
+      if (message.active) {
+        startContextChangeNotifications();
+      } else {
+        stopContextChangeNotifications();
+      }
+      sendResponse({ ok: true, active: Boolean(message.active) });
+      return true;
+    }
     linkedInCommands.handleMessage(buildLinkedInCommandDeps(), message, sendResponse);
     return true;
   });

@@ -86,6 +86,7 @@
     lastObservedBrowserTabId: null,
     lastObservedBrowserTabUrl: "",
     promptSettingsDirty: false,
+    panelSessionPort: null,
     refreshInFlight: false,
     refreshPromise: null,
     pendingRefreshOptions: null,
@@ -113,6 +114,7 @@
 
   const MESSAGE_THREAD_POLL_MS = 10000;
   const CTA_INITIAL_DISABLE_MS = 1000;
+  const SIDEPANEL_SESSION_PORT_NAME = "sidepanel-session";
 
   const el = {
     panelLoadingOverlay: document.querySelector("#panel-loading-overlay"),
@@ -2051,7 +2053,8 @@
   }
 
   function preferredLinkedInTabId() {
-    return state.attachedLinkedInTabId
+    return (isLinkedInWorkspaceUrl(state.lastObservedBrowserTabUrl) ? state.lastObservedBrowserTabId : null)
+      || state.attachedLinkedInTabId
       || state.activeTabId
       || state.backgroundObservedLinkedInTabId
       || null;
@@ -3196,6 +3199,42 @@
     }, MESSAGE_THREAD_POLL_MS);
   }
 
+  function disconnectPanelSession() {
+    try {
+      state.panelSessionPort?.disconnect();
+    } catch (_error) {
+      // Ignore disconnect races during panel teardown.
+    }
+    state.panelSessionPort = null;
+  }
+
+  function connectPanelSession() {
+    disconnectPanelSession();
+    try {
+      const port = chrome.runtime.connect({ name: SIDEPANEL_SESSION_PORT_NAME });
+      port.onDisconnect.addListener(() => {
+        if (state.panelSessionPort === port) {
+          state.panelSessionPort = null;
+        }
+      });
+      state.panelSessionPort = port;
+    } catch (_error) {
+      state.panelSessionPort = null;
+    }
+  }
+
+  function teardownSidepanelSession() {
+    window.clearInterval(state.autoRefreshTimer);
+    state.autoRefreshTimer = null;
+    clearTransientMessagingRetry();
+    clearNavigationRefreshBurst();
+    window.clearTimeout(state.ctaReadinessTimer);
+    state.ctaReadinessTimer = null;
+    window.clearTimeout(state.fixedTailSaveTimer);
+    state.fixedTailSaveTimer = null;
+    disconnectPanelSession();
+  }
+
   function clearTransientMessagingRetry() {
     window.clearTimeout(state.transientMessagingRetryTimer);
     state.transientMessagingRetryTimer = null;
@@ -3599,7 +3638,7 @@
   }
 
   async function performRefreshState(options) {
-    const requestedSourceTabId = preferredLinkedInTabId();
+    const requestedSourceTabId = await getSourceTabId();
     const refreshCacheKey = buildRefreshCacheKey(requestedSourceTabId);
     const cachedResponse = readCachedRefreshResponse(refreshCacheKey, options);
     if (cachedResponse) {
@@ -3750,6 +3789,7 @@
   async function openCurrentLinkedInMessages(profileUrlOverride) {
     const person = currentNextStepPerson();
     const profileUrl = normalizeWhitespace(profileUrlOverride || currentRecipientProfileUrl(person));
+    const personId = normalizeWhitespace(person?.personId || state.personRecord?.personId || "");
     if (!profileUrl) {
       setStatus("No LinkedIn profile URL is saved for this person yet.", true);
       return;
@@ -3760,7 +3800,8 @@
       const response = await chrome.runtime.sendMessage({
         type: MESSAGE_TYPES.OPEN_PERSON_MESSAGES,
         sourceTabId: await getSourceTabId(),
-        profileUrl
+        profileUrl,
+        personId
       });
       if (!response?.ok) {
         throw new Error(response?.error || "Unable to open LinkedIn messages for this person.");
@@ -3866,8 +3907,8 @@
     setLoading(el.nextActionButton, "Drafting…", true);
     state.manualRecovery = null;
     const requestId = makeRequestId();
-    const currentPersonId = normalizeWhitespace(state.personRecord?.personId);
     try {
+      const currentPersonId = normalizeWhitespace(state.personRecord?.personId);
       const sourceTabId = await getSourceTabId();
       state.activeGenerationRequestId = requestId;
       state.activeGenerationPersonId = currentPersonId;
@@ -4117,8 +4158,10 @@
   async function handleSavePersonNote() {
     setLoading(el.savePersonNoteButton, "Saving…", true);
     try {
+      const sourceTabId = await getSourceTabId();
       const noteResponse = await chrome.runtime.sendMessage({
         type: MESSAGE_TYPES.SAVE_PERSON_NOTE,
+        sourceTabId,
         personId: state.personRecord?.personId,
         personNote: el.personNoteInput.value
       });
@@ -4128,6 +4171,7 @@
 
       const goalResponse = await chrome.runtime.sendMessage({
         type: MESSAGE_TYPES.SAVE_PERSON_GOAL,
+        sourceTabId,
         personId: state.personRecord?.personId,
         userGoal: el.personGoalSelect.value
       });
@@ -4807,6 +4851,11 @@
     });
   }
 
+  window.addEventListener("beforeunload", () => {
+    teardownSidepanelSession();
+  });
+
+  connectPanelSession();
   setViewMode("workspace");
   renderPageStatus({ preserveStatus: true });
   refreshState({ allowCached: true });

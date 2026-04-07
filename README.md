@@ -43,6 +43,16 @@ Microsoft Edge Manifest V3 extension that drafts short personalized LinkedIn out
 - Stores data in `chrome.storage.local`
 - Focused on drafting and copying, not auto-sending
 
+## Identity model
+
+- Recipient state is keyed by `personId`.
+- The same `personId` must back both the LinkedIn profile page and the LinkedIn messaging page for the same person.
+- Stable card content comes from the stored person record for that `personId`, including saved profile context, summaries, AI assessments, drafts, notes, goals, and thread links.
+- The open LinkedIn page is used to detect fresh observations, such as new messages, updated connection status, new activity snippets, or a refreshed profile snapshot, and those observations update that same stored person record.
+- Profile and messaging are two views of one person workspace, not two separate sources of truth.
+- The sender's own LinkedIn profile is stored separately and is not a recipient `personId` record.
+- The extension must not create or maintain a recipient person record for the user's own profile.
+
 ## Edge compatibility
 
 - Microsoft Edge supports the same Chrome Extension APIs used here, including Manifest V3, side panel, tabs, storage, and content scripts.

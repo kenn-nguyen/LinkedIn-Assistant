@@ -93,15 +93,13 @@
           } catch (_error) {
             // Keep the raw slug when decoding fails.
           }
-          return `li:${slugify(slug)}`;
+          return slug ? `li:${slug}` : "";
         }
       } catch (_error) {
-        // Fall through to fallback name.
+        return "";
       }
     }
-
-    const slug = slugify(fallbackName);
-    return slug ? `name:${slug}` : "";
+    return "";
   }
 
   function linkedInProfileAlias(profileUrl) {
@@ -150,6 +148,22 @@
       profileUrl: personRecord?.profileUrl,
       messagingThreadUrl: personRecord?.messagingThreadUrl
     });
+  }
+
+  function chooseCanonicalIdentityPersonId(existingRecord, incomingRecord, mergedRecord, derivedCandidates) {
+    const existingPersonId = normalizeWhitespace(existingRecord?.identity?.personId || existingRecord?.personId);
+    const incomingPersonId = normalizeWhitespace(incomingRecord?.identity?.personId || incomingRecord?.personId);
+    const mergedPersonId = normalizeWhitespace(mergedRecord?.identity?.personId || mergedRecord?.personId);
+    if (existingPersonId) {
+      return existingPersonId;
+    }
+    if (incomingPersonId) {
+      return incomingPersonId;
+    }
+    if (mergedPersonId) {
+      return mergedPersonId;
+    }
+    return derivedCandidates.find(Boolean) || "";
   }
 
   function mergeIdentity(existingRecord, incomingRecord, mergedRecord) {
@@ -228,19 +242,15 @@
     const publicDerivedPersonId = personIdFromProfileUrl(identity.publicProfileUrl, identity.fullName);
     const fallbackProfileDerivedPersonId = personIdFromProfileUrl(identity.profileUrl, identity.fullName);
     const profileDerivedPersonId = publicDerivedPersonId || primaryDerivedPersonId || fallbackProfileDerivedPersonId;
-    const existingIdentityPersonId = normalizeWhitespace(identity.personId);
-    const existingIdIsOpaque = isOpaqueLinkedInPersonId(existingIdentityPersonId);
-    if (publicDerivedPersonId && !publicDerivedPersonId.startsWith("name:") && existingIdIsOpaque) {
-      identity.personId = publicDerivedPersonId;
-    } else {
-      identity.personId = publicDerivedPersonId || existingIdentityPersonId || primaryDerivedPersonId || profileDerivedPersonId;
-    }
-    if ((!identity.personId || identity.personId.startsWith("name:")) && publicDerivedPersonId && !publicDerivedPersonId.startsWith("name:")) {
-      identity.personId = publicDerivedPersonId;
-    }
-    if ((!identity.personId || identity.personId.startsWith("name:")) && primaryDerivedPersonId && !primaryDerivedPersonId.startsWith("name:")) {
-      identity.personId = primaryDerivedPersonId;
-    }
+    const stableDerivedPersonId = [
+      publicDerivedPersonId,
+      primaryDerivedPersonId,
+      fallbackProfileDerivedPersonId
+    ].find((value) => value && !value.startsWith("name:")) || "";
+    identity.personId = chooseCanonicalIdentityPersonId(existingRecord, incomingRecord, mergedRecord, [
+      stableDerivedPersonId,
+      profileDerivedPersonId
+    ]);
     if (!identity.personId) {
       identity.personId = personIdFromProfileUrl(identity.profileUrl, identity.fullName);
     }

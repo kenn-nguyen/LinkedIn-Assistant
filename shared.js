@@ -53,7 +53,7 @@
     "ask_referral",
     "job_insight"
   ];
-  const BUILD_DEBUG_VERSION = "debug-2026-04-07-0233";
+  const BUILD_DEBUG_VERSION = "debug-2026-04-07-2035";
   const STORAGE_KEYS = {
     myProfile: "myProfile",
     fixedTail: "fixedTail",
@@ -102,6 +102,7 @@
     GENERATION_FAILED: "GENERATION_FAILED",
     PAGE_CONTEXT_CHANGED: "PAGE_CONTEXT_CHANGED",
     LINKEDIN_CLICK_TRACE: "LINKEDIN_CLICK_TRACE",
+    SET_ASSISTANT_ACTIVE: "SET_ASSISTANT_ACTIVE",
     SHOW_PAGE_ACTIVITY_OVERLAY: "SHOW_PAGE_ACTIVITY_OVERLAY",
     HIDE_PAGE_ACTIVITY_OVERLAY: "HIDE_PAGE_ACTIVITY_OVERLAY",
     FACTORY_RESET: "FACTORY_RESET"
@@ -265,7 +266,9 @@
       pendingProfileUrl: "",
       manualNotes: "",
       rawSnapshot: "",
-      updatedAt: ""
+      updatedAt: "",
+      lastActivitySyncedAt: "",
+      latestActivitySnippets: []
     };
   }
 

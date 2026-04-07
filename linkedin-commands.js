@@ -4,7 +4,8 @@
     MESSAGE_TYPES,
     firstNameFromFullName,
     normalizeLinkedInProfileUrl,
-    normalizeWhitespace
+    normalizeWhitespace,
+    personIdFromProfileUrl
   } = shared;
 
   const PROFILE_NOT_SUPPORTED_ERROR = "This page is not a supported LinkedIn profile.";
@@ -22,7 +23,8 @@
     const explicitPersonId = normalizeWhitespace(source?.personId || "");
 
     return {
-      personId: explicitPersonId || shared.personIdFromProfileUrl(profileUrl, fullName),
+      personId: explicitPersonId
+        || personIdFromProfileUrl(profileUrl, fullName),
       firstName: normalizeWhitespace(source?.firstName) || firstNameFromFullName(fullName),
       fullName,
       profileUrl,
@@ -59,6 +61,13 @@
         connection_status: person?.connectionStatus || ""
       },
       reason: extracted?.reason || ""
+    };
+  }
+
+  function buildProfileExtractionMode(options) {
+    return {
+      lightweight: Boolean(options?.lightweight),
+      forceScrollPass: Boolean(options?.forceScrollPass) && !Boolean(options?.lightweight)
     };
   }
 
@@ -176,7 +185,7 @@
       7000
     );
     const firstName = firstNameFromFullName(recipientName);
-    const personId = shared.personIdFromProfileUrl(profileUrl, recipientName);
+    const personId = personIdFromProfileUrl(profileUrl, recipientName);
     const connectionStatus = deps.detectConnectionStatus(header || document);
     const hasCriticalMessagingIdentity = Boolean(normalizeWhitespace(recipientName) && normalizeWhitespace(profileUrl));
     const recipientSnapshot = deps.truncate(shared.uniqueStrings([
@@ -282,9 +291,33 @@
     );
   }
 
+  function missingProfileExtractionGoals(profile) {
+    if (!profile || typeof profile !== "object") {
+      return ["about", "experience", "education", "activity"];
+    }
+    const goals = [];
+    if (!normalizeWhitespace(profile.about || "")) {
+      goals.push("about");
+    }
+    if (!Array.isArray(profile.experienceHighlights) || !profile.experienceHighlights.filter(Boolean).length) {
+      goals.push("experience");
+    }
+    if (!Array.isArray(profile.educationHighlights) || !profile.educationHighlights.filter(Boolean).length) {
+      goals.push("education");
+    }
+    if (!Array.isArray(profile.activitySnippets) || !profile.activitySnippets.filter(Boolean).length) {
+      goals.push("activity");
+    }
+    if (!Array.isArray(profile.languageSnippets) || !profile.languageSnippets.filter(Boolean).length) {
+      goals.push("languages");
+    }
+    return goals;
+  }
+
   async function extractProfileWithRetries(deps, options) {
-    const lightweight = Boolean(options?.lightweight);
-    const forceScrollPass = Boolean(options?.forceScrollPass) && !lightweight;
+    const mode = buildProfileExtractionMode(options);
+    const lightweight = mode.lightweight;
+    const forceScrollPass = mode.forceScrollPass;
     const attempts = lightweight ? 2 : 3;
     const startedAtMs = deps.nowMs();
     const timing = {
@@ -300,9 +333,11 @@
       profile_expand_inline_ms: 0,
       profile_extract_ms: 0,
       profile_total_ms: 0,
-      profile_scroll_strategy: lightweight ? "lightweight" : (forceScrollPass ? "forced_full_refresh" : "adaptive_full"),
+      profile_scroll_strategy: lightweight ? "lightweight" : (forceScrollPass ? "forced_progressive_full_refresh" : "progressive_sections"),
       profile_scroll_passes_run: 0,
-      profile_expand_passes_run: 0
+      profile_expand_passes_run: 0,
+      profile_scroll_goal_summary: "",
+      profile_scroll_seen_sections: []
     };
     let latest = null;
     let stepStartedAtMs = deps.nowMs();
@@ -334,11 +369,18 @@
         const hasAnyStructuredContent = hasStructuredProfileContent(latest?.profile);
         const shouldRunScrollPass = (forceScrollPass && attempt === 1) || attempt === 1 || !hasAnyStructuredContent;
         const shouldRunExpandPass = !profileLooksCompleteEnough(latest?.profile);
+        const sectionGoals = missingProfileExtractionGoals(latest?.profile);
+        timing.profile_scroll_goal_summary = sectionGoals.join(", ");
         if (shouldRunScrollPass) {
           stepStartedAtMs = deps.nowMs();
-          await deps.scrollProfileToBottomAndWaitForStable();
+          const scrollResult = await (deps.scrollProfileForExtraction
+            ? deps.scrollProfileForExtraction({ sectionGoals })
+            : deps.scrollProfileToBottomAndWaitForStable());
           timing.profile_auto_scroll_ms += deps.roundMs(deps.nowMs() - stepStartedAtMs);
           timing.profile_scroll_passes_run += 1;
+          if (Array.isArray(scrollResult?.seenSections)) {
+            timing.profile_scroll_seen_sections = scrollResult.seenSections.slice(0, 8);
+          }
         }
         if (shouldRunExpandPass) {
           stepStartedAtMs = deps.nowMs();
@@ -364,12 +406,23 @@
     return deps.mergeDebugInfo(latest || deps.extractProfile(), timing);
   }
 
-  async function extractSelfProfileWithRetries(deps) {
-    return extractProfileWithRetries(deps, { lightweight: false });
+  async function extractLightweightProfilePageContext(deps) {
+    return extractProfileWithRetries(deps, { lightweight: true });
   }
 
-  async function extractRecipientProfileWithFullRetries(deps) {
-    return extractProfileWithRetries(deps, { lightweight: false });
+  async function extractFullProfile(deps, options) {
+    return extractProfileWithRetries(deps, {
+      lightweight: false,
+      forceScrollPass: Boolean(options?.forceScrollPass)
+    });
+  }
+
+  async function extractSelfProfileWithRetries(deps) {
+    return extractFullProfile(deps, { forceScrollPass: true });
+  }
+
+  async function extractRecipientProfileWithFullRetries(deps, options) {
+    return extractFullProfile(deps, { forceScrollPass: Boolean(options?.forceScrollPass) });
   }
 
   async function extractMessagingContextWithRetries(deps) {
@@ -409,7 +462,7 @@
         const extracted = deps.isSupportedMessagingPage()
           ? await extractMessagingContextWithRetries(deps)
           : deps.isSupportedProfilePage()
-            ? await extractProfileWithRetries(deps, { lightweight: true })
+            ? await extractLightweightProfilePageContext(deps)
             : extractWorkspaceContext(deps);
         sendResponse({
           ok: true,
@@ -441,8 +494,8 @@
       if (message.type === MESSAGE_TYPES.EXTRACT_WORKSPACE_CONTEXT) {
         const workspaceStartedAtMs = deps.nowMs();
         if (deps.isSupportedProfilePage()) {
-        const extracted = await extractProfileWithRetries(deps, { lightweight: false, forceScrollPass: Boolean(message.forceScrollPass) });
-        const person = buildProfilePerson(extracted?.profile);
+          const extracted = await extractFullProfile(deps, { forceScrollPass: Boolean(message.forceScrollPass) });
+          const person = buildProfilePerson(extracted?.profile);
           sendResponse({
             ok: true,
             supported: extracted.supported,
@@ -516,7 +569,7 @@
       }
 
       if (message.type === MESSAGE_TYPES.EXTRACT_RECIPIENT) {
-        const extracted = await extractProfileWithRetries(deps, { lightweight: false, forceScrollPass: Boolean(message.forceScrollPass) });
+        const extracted = await extractRecipientProfileWithFullRetries(deps, { forceScrollPass: Boolean(message.forceScrollPass) });
         if (!extracted.supported) {
           sendResponse({
             ok: false,
@@ -559,6 +612,8 @@
     buildPersonIdentity,
     buildProfilePerson,
     extractWorkspaceContext,
+    extractLightweightProfilePageContext,
+    extractFullProfile,
     extractProfileWithRetries,
     extractSelfProfileWithRetries,
     extractRecipientProfileWithFullRetries,
