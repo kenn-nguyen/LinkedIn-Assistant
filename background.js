@@ -2620,14 +2620,6 @@ function resolveStoredPersonMatch(pageContext, stored) {
     return { matchedRecord: people[previewId], identityWarning: null, matchType: "person_id" };
   }
 
-  if (sourceTabId !== null) {
-    const boundPersonId = normalizeWhitespace(stored?.tabPersonBindings?.[String(sourceTabId)]);
-    const boundRecord = boundPersonId ? people[boundPersonId] : null;
-    if (boundRecord && recordMatchesPageContext(boundRecord, pageContext)) {
-      return { matchedRecord: boundRecord, identityWarning: null, matchType: "tab_binding" };
-    }
-  }
-
   if (previewThreadUrl) {
     const boundPersonId = normalizeWhitespace(stored?.threadPersonBindings?.[previewThreadUrl]);
     if (boundPersonId && people[boundPersonId]) {
@@ -2640,6 +2632,14 @@ function resolveStoredPersonMatch(pageContext, stored) {
     const workspaceThreadMatch = findRecordByDraftWorkspaceThreadUrl(people, previewThreadUrl);
     if (workspaceThreadMatch) {
       return { matchedRecord: workspaceThreadMatch, identityWarning: null, matchType: "draft_workspace_thread_url" };
+    }
+  }
+
+  if (sourceTabId !== null) {
+    const boundPersonId = normalizeWhitespace(stored?.tabPersonBindings?.[String(sourceTabId)]);
+    const boundRecord = boundPersonId ? people[boundPersonId] : null;
+    if (boundRecord && recordMatchesPageContext(boundRecord, pageContext)) {
+      return { matchedRecord: boundRecord, identityWarning: null, matchType: "tab_binding" };
     }
   }
 

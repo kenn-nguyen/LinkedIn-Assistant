@@ -155,6 +155,9 @@
     fixedTailInput: document.querySelector("#fixed-tail-input"),
     resetFixedTail: document.querySelector("#reset-fixed-tail"),
     actionPill: document.querySelector("#action-pill"),
+    actionPillLabel: document.querySelector("#action-pill-label"),
+    actionPillGuideTitle: document.querySelector("#action-pill-guide-title"),
+    actionPillGuideBody: document.querySelector("#action-pill-guide-body"),
     recommendationReason: document.querySelector("#recommendation-reason"),
     nextStepEvidence: document.querySelector("#next-step-evidence"),
     referralReadiness: document.querySelector("#referral-readiness"),
@@ -1033,6 +1036,87 @@
       evidence: nextStepEvidence(person),
       statusText: readyReason ? "" : relationshipManagementRead()
     };
+  }
+
+  function currentActionPillGuide(label) {
+    switch (normalizeWhitespace(label)) {
+      case "Profile needed":
+        return {
+          title: "Profile needed",
+          body: [
+            `<p><span class="pill-info__label">What it is:</span> you do not have enough signal to act with precision.</p>`,
+            `<p><span class="pill-info__label">What to do:</span> save the profile first. <mark class="inline-highlight">Do not draft yet</mark>.</p>`
+          ].join("")
+        };
+      case "Thread needed":
+        return {
+          title: "Thread needed",
+          body: [
+            `<p><span class="pill-info__label">What it is:</span> a conversation likely exists, but the assistant has not seen the interaction pattern.</p>`,
+            `<p><span class="pill-info__label">What to do:</span> open or import the thread before choosing tone, pressure, or timing.</p>`
+          ].join("")
+        };
+      case "No thread yet":
+        return {
+          title: "No thread yet",
+          body: [
+            `<p><span class="pill-info__label">What it is:</span> there is no saved message history for this relationship.</p>`,
+            `<p><span class="pill-info__label">What to do:</span> check messages once. If nothing exists, send a crisp first note with one clear reason.</p>`
+          ].join("")
+        };
+      case "Ready to draft":
+        return {
+          title: "Ready to draft",
+          body: [
+            `<p><span class="pill-info__label">What it is:</span> context is strong enough for a first move.</p>`,
+            `<p><span class="pill-info__label">What to do:</span> send a concise, relevant opener.</p>`,
+            `<p class="pill-info__note"><span class="pill-info__label">Example:</span> tier 1 executive target, profile saved, no prior thread. Lead with relevance, not enthusiasm.</p>`
+          ].join("")
+        };
+      case "Ready to reply":
+        return {
+          title: "Ready to reply",
+          body: [
+            `<p><span class="pill-info__label">What it is:</span> they engaged and the ball is in your court.</p>`,
+            `<p><span class="pill-info__label">What to do:</span> reply promptly, answer their point directly, and advance only one step.</p>`
+          ].join("")
+        };
+      case "Ready to follow up":
+        return {
+          title: "Ready to follow up",
+          body: [
+            `<p><span class="pill-info__label">What it is:</span> you already opened the thread, and another touch is now justified.</p>`,
+            `<p><span class="pill-info__label">What to do:</span> send one measured nudge tied to timing, progress, or a new reason to re-engage.</p>`
+          ].join("")
+        };
+      case "Waiting":
+        return {
+          title: "Waiting",
+          body: [
+            `<p><span class="pill-info__label pill-info__label--warning">What it is:</span> restraint is the highest-quality move right now.</p>`,
+            `<p><span class="pill-info__label">What to do:</span> <mark class="inline-highlight">Do not send another message yet</mark>. Wait for more time, a better trigger, or their reply.</p>`,
+            `<p class="pill-info__note pill-info__note--warning"><span class="pill-info__label pill-info__label--warning">Expert read:</span> forcing momentum too early lowers status and weakens trust.</p>`
+          ].join("")
+        };
+      default:
+        return {
+          title: normalizeWhitespace(label) || "Next step",
+          body: [
+            `<p><span class="pill-info__label">What it is:</span> the assistant's current read on the best next move.</p>`,
+            `<p><span class="pill-info__label">What to do:</span> follow the recommended action and avoid adding pressure without new signal.</p>`
+          ].join("")
+        };
+    }
+  }
+
+  function renderActionPillGuide(label) {
+    const guide = currentActionPillGuide(label);
+    if (el.actionPillGuideTitle) {
+      el.actionPillGuideTitle.textContent = guide.title;
+    }
+    if (el.actionPillGuideBody) {
+      el.actionPillGuideBody.innerHTML = guide.body;
+    }
   }
 
   function shouldDisableNextActionButton(options) {
@@ -2589,7 +2673,12 @@
     const referralRead = nextStep?.primary?.mode === "draft" ? referralReadinessRead() : "";
     const referralMarkup = nextStep?.primary?.mode === "draft" ? referralReadinessMarkup() : "";
 
-    el.actionPill.textContent = nextStep.badgeLabel || "Waiting";
+    if (el.actionPillLabel) {
+      el.actionPillLabel.textContent = nextStep.badgeLabel || "Waiting";
+    } else {
+      el.actionPill.textContent = nextStep.badgeLabel || "Waiting";
+    }
+    renderActionPillGuide(nextStep.badgeLabel || "Waiting");
     el.recommendationReason.innerHTML = renderInlineRichText(nextStep.reason || "Ready when you are.");
     renderNextStepEvidence(nextStep.evidence);
     applyRecommendationButton(el.nextActionButton, nextStep.primary);
@@ -3124,7 +3213,7 @@
       const timerId = window.setTimeout(() => {
         void refreshState({
           preserveStatus: true,
-          allowCached: true,
+          allowCached: false,
           showOverlay: index === 0,
           suppressImportStatus: options?.suppressImportStatus ?? true
         });
@@ -3142,7 +3231,7 @@
     const delayMs = retryDelays[state.transientMessagingRetryCount - 1] || retryDelays[retryDelays.length - 1];
     state.transientMessagingRetryTimer = window.setTimeout(() => {
       state.transientMessagingRetryTimer = null;
-      void refreshState({ preserveStatus: true, allowCached: true, showOverlay: false, suppressImportStatus: true });
+      void refreshState({ preserveStatus: true, allowCached: false, showOverlay: false, suppressImportStatus: true });
     }, delayMs);
   }
 
@@ -3372,6 +3461,14 @@
       key: cacheKey,
       savedAt: Date.now(),
       response: cloneRefreshResponse(response)
+    };
+  }
+
+  function clearRefreshCache() {
+    state.refreshCache = {
+      key: "",
+      savedAt: 0,
+      response: null
     };
   }
 
@@ -4651,6 +4748,7 @@
       state.lastObservedBrowserTabUrl = normalizeWhitespace(message?.href || state.lastObservedBrowserTabUrl || "");
       state.lastNavigationSignalHref = normalizeWhitespace(message?.href || "");
       state.lastNavigationSignalAt = new Date().toISOString();
+      clearRefreshCache();
       applyOptimisticNavigationHint(message?.href || "", message?.clickText || "");
       scheduleNavigationRefreshBurst();
     }

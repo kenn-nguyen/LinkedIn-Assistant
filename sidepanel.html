@@ -86,7 +86,16 @@
       <section id="recommendation-section" class="panel recommendation-panel hidden">
         <div class="section-heading">
           <h2>Next Step</h2>
-          <span id="action-pill" class="status-pill secondary-pill">Waiting</span>
+          <div id="action-pill" class="status-pill secondary-pill action-pill-with-info">
+            <span id="action-pill-label">Waiting</span>
+            <details class="pill-info">
+              <summary class="pill-info__trigger" aria-label="Status guide" title="Status guide">i</summary>
+              <div class="pill-info__popup" role="dialog" aria-label="Relationship status guide">
+                <p id="action-pill-guide-title" class="pill-info__title">Waiting</p>
+                <div id="action-pill-guide-body" class="pill-info__body"></div>
+              </div>
+            </details>
+          </div>
         </div>
         <div id="next-step-evidence" class="next-step-evidence hidden"></div>
         <div class="next-step-context">
