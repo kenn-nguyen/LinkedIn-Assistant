@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "LinkedIn Assistant",
+  "name": "Lumi Assist",
   "version": "0.1.0",
-  "description": "Draft personalized LinkedIn outreach messages in Microsoft Edge via supported AI websites.",
+  "description": "Draft personalized LinkedIn outreach messages in Chrome using supported AI websites.",
   "permissions": [
     "activeTab",
     "clipboardWrite",
@@ -28,7 +28,7 @@
     "128": "icons/icon-128.png"
   },
   "action": {
-    "default_title": "Open LinkedIn Assistant",
+    "default_title": "Open Lumi Assist",
     "default_icon": {
       "16": "icons/icon-16.png",
       "32": "icons/icon-32.png",

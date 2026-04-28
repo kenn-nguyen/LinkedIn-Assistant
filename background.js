@@ -3533,7 +3533,7 @@ function buildImportedConversationRecord(conversation, sourcePageType, myProfile
 function logConversationPersistence(eventName, personRecord, importedConversation) {
   const messages = Array.isArray(importedConversation?.messages) ? importedConversation.messages : [];
   const latestMessage = messages[0] || null;
-  console.info("[LinkedIn Assistant]", eventName, {
+  console.info("[Lumi Assist]", eventName, {
     personId: normalizeWhitespace(personRecord?.personId),
     fullName: normalizeWhitespace(personRecord?.fullName),
     sourcePageType: normalizeWhitespace(importedConversation?.sourcePageType),
@@ -3546,7 +3546,7 @@ function logConversationPersistence(eventName, personRecord, importedConversatio
 }
 
 function logObservedMetricsPersistence(eventName, personRecord, observedMetrics, relationshipTriage) {
-  console.info("[LinkedIn Assistant]", eventName, {
+  console.info("[Lumi Assist]", eventName, {
     personId: normalizeWhitespace(personRecord?.personId),
     fullName: normalizeWhitespace(personRecord?.fullName),
     knownMessageCount: Number(observedMetrics?.known_message_count || 0),
@@ -3562,7 +3562,7 @@ function logObservedMetricsPersistence(eventName, personRecord, observedMetrics,
 }
 
 function logPersonResolution(eventName, payload) {
-  console.info("[LinkedIn Assistant]", eventName, {
+  console.info("[Lumi Assist]", eventName, {
     sourceTabId: payload?.sourceTabId ?? null,
     activeTabId: payload?.activeTabId ?? null,
     providerTabId: payload?.providerTabId ?? null,

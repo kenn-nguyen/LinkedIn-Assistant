@@ -1,6 +1,6 @@
-# LinkedIn Outreach Assistant
+# Lumi Assist
 
-Microsoft Edge Manifest V3 extension that drafts short personalized LinkedIn outreach messages by:
+Chrome Manifest V3 extension that drafts short, personalized LinkedIn outreach messages by:
 
 1. reading the active LinkedIn profile,
 2. combining that context with your saved sender profile,
@@ -26,9 +26,9 @@ Microsoft Edge Manifest V3 extension that drafts short personalized LinkedIn out
   - auto-saves raw profile text locally
   - lets you optionally tweak raw text and keep a short manual note
 
-## Install in Edge
+## Install in Chrome
 
-1. Open `edge://extensions`
+1. Open `chrome://extensions`
 2. Enable `Developer mode`
 3. Click `Load unpacked`
 4. Select this folder: `/Users/kennng/Documents/Linkedin-Assistant`
@@ -36,7 +36,7 @@ Microsoft Edge Manifest V3 extension that drafts short personalized LinkedIn out
 
 ## Current assumptions
 
-- Edge-first MVP
+- Chrome-first MVP
 - No backend and no API usage
 - Uses a visible logged-in ChatGPT tab
 - Opens a new background ChatGPT project tab for each generation attempt
@@ -53,11 +53,11 @@ Microsoft Edge Manifest V3 extension that drafts short personalized LinkedIn out
 - The sender's own LinkedIn profile is stored separately and is not a recipient `personId` record.
 - The extension must not create or maintain a recipient person record for the user's own profile.
 
-## Edge compatibility
+## Chrome compatibility
 
-- Microsoft Edge supports the same Chrome Extension APIs used here, including Manifest V3, side panel, tabs, storage, and content scripts.
-- The code still uses the standard `chrome.*` extension namespace; that is correct for Edge extensions too.
-- If you later want Chrome support as well, this same folder can still be loaded in Chrome without further code changes.
+- Chrome supports the extension APIs used here, including Manifest V3, side panel, tabs, storage, and content scripts.
+- The code uses the standard `chrome.*` extension namespace.
+- If you later want Edge support as well, this same folder should still load in Edge without further code changes.
 
 ## Notes
 
