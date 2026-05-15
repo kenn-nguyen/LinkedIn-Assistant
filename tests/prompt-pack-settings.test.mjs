@@ -6,7 +6,7 @@ import vm from "node:vm";
 
 function loadRuntimeAndShared() {
   const assetPaths = [
-    "prompt-packs/default/manifest.json",
+    "prompt-packs/default/prompt-pack.json",
     "prompt-packs/default/relationship/template.txt",
     "prompt-packs/default/relationship/retry.txt",
     "prompt-packs/default/relationship/contract.json",

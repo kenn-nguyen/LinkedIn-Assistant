@@ -151,7 +151,7 @@
       return packLoadPromises.get(normalizedPackId);
     }
     const loadPromise = (async () => {
-      const manifestPath = `prompt-packs/${normalizedPackId}/manifest.json`;
+      const manifestPath = `prompt-packs/${normalizedPackId}/prompt-pack.json`;
       const manifest = await readJsonAsset(manifestPath);
       validateManifest(manifest);
       const prompts = {};
