@@ -18,7 +18,7 @@
     const headline = normalizeWhitespace(source?.headline || "");
     const location = normalizeWhitespace(source?.location || "");
     const connectionStatus = normalizeWhitespace(source?.connectionStatus || "");
-    const profileSummary = normalizeWhitespace(source?.profileSummary || headline);
+    const profileSummary = normalizeWhitespace(source?.profileSummary || "");
     const rawSnapshot = String(source?.rawSnapshot || "").replace(/\r/g, "").trim();
     const explicitPersonId = normalizeWhitespace(source?.personId || "");
 
@@ -59,6 +59,66 @@
         page_kind: "profile",
         person_found: Boolean(person?.fullName),
         connection_status: person?.connectionStatus || ""
+      },
+      reason: extracted?.reason || ""
+    };
+  }
+
+  function buildJobWorkspaceContext(extracted) {
+    return {
+      supported: Boolean(extracted?.supported),
+      pageType: "linkedin-job",
+      pageUrl: extracted?.pageUrl || window.location.href,
+      title: extracted?.title || document.title,
+      person: null,
+      profile: null,
+      conversation: null,
+      job: extracted?.job || null,
+      debug: {
+        ...(extracted?.debug || {}),
+        page_kind: "job",
+        job_found: Boolean(extracted?.job?.title && extracted?.job?.company)
+      },
+      reason: extracted?.reason || ""
+    };
+  }
+
+  function buildPeopleSearchWorkspaceContext(extracted) {
+    return {
+      supported: Boolean(extracted?.supported),
+      pageType: "linkedin-people-search",
+      pageUrl: extracted?.pageUrl || window.location.href,
+      title: extracted?.title || document.title,
+      person: null,
+      profile: null,
+      conversation: null,
+      peopleSearch: extracted?.peopleSearch || null,
+      debug: {
+        ...(extracted?.debug || {}),
+        page_kind: "people_search",
+        people_found: Number(extracted?.peopleSearch?.resultCount || 0)
+      },
+      reason: extracted?.reason || ""
+    };
+  }
+
+  function buildPostWorkspaceContext(extracted) {
+    return {
+      supported: Boolean(extracted?.supported),
+      pageType: "linkedin-post",
+      pageUrl: extracted?.pageUrl || window.location.href,
+      title: extracted?.title || document.title,
+      person: null,
+      profile: null,
+      conversation: null,
+      job: null,
+      peopleSearch: null,
+      postDiscussion: extracted?.postDiscussion || null,
+      debug: {
+        ...(extracted?.debug || {}),
+        page_kind: "post",
+        post_found: Boolean(extracted?.postDiscussion?.postText || extracted?.postDiscussion?.postUrl),
+        comment_count: Number(extracted?.postDiscussion?.commentCount || 0)
       },
       reason: extracted?.reason || ""
     };
@@ -220,7 +280,6 @@
         headline,
         location: "",
         connectionStatus,
-        profileSummary: deps.truncate(shared.uniqueStrings([headline]).join(" | "), 600),
         rawSnapshot: recipientSnapshot || deps.truncate(deps.visibleText(profileCard), 1000)
       }),
       conversation: {
@@ -246,6 +305,18 @@
 
     if (deps.isSupportedProfilePage()) {
       return buildProfileWorkspaceContext(deps.extractProfile());
+    }
+
+    if (deps.isSupportedJobPage?.()) {
+      return buildJobWorkspaceContext(deps.extractJobPageContext?.());
+    }
+
+    if (deps.isSupportedPeopleSearchPage?.()) {
+      return buildPeopleSearchWorkspaceContext(deps.extractPeopleSearchContext?.());
+    }
+
+    if (deps.isSupportedPostPage?.()) {
+      return buildPostWorkspaceContext(deps.extractPostPageContext?.());
     }
 
     return {
@@ -279,7 +350,6 @@
       return false;
     }
     const rawSnapshotLength = normalizeWhitespace(profile.rawSnapshot || "").length;
-    const summaryLength = normalizeWhitespace(profile.profileSummary || "").length;
     const experienceCount = Array.isArray(profile.experienceHighlights) ? profile.experienceHighlights.filter(Boolean).length : 0;
     const educationCount = Array.isArray(profile.educationHighlights) ? profile.educationHighlights.filter(Boolean).length : 0;
     const aboutLength = normalizeWhitespace(profile.about || "").length;
@@ -287,8 +357,21 @@
       (aboutLength >= 120 && rawSnapshotLength >= 900)
       || (experienceCount >= 2 && rawSnapshotLength >= 900)
       || (experienceCount >= 1 && educationCount >= 1 && rawSnapshotLength >= 800)
-      || (summaryLength >= 220 && rawSnapshotLength >= 1000)
     );
+  }
+
+  function profileHasCollapsedText(profile) {
+    if (!profile || typeof profile !== "object") {
+      return false;
+    }
+    const fields = [
+      profile.about,
+      ...(Array.isArray(profile.experienceHighlights) ? profile.experienceHighlights : []),
+      ...(Array.isArray(profile.educationHighlights) ? profile.educationHighlights : []),
+      ...(Array.isArray(profile.activitySnippets) ? profile.activitySnippets : []),
+      ...(Array.isArray(profile.languageSnippets) ? profile.languageSnippets : [])
+    ];
+    return fields.some((field) => /(?:…|\.\.\.)\s*(?:more)?\s*$/i.test(normalizeWhitespace(field)));
   }
 
   function missingProfileExtractionGoals(profile) {
@@ -305,9 +388,8 @@
     if (!Array.isArray(profile.educationHighlights) || !profile.educationHighlights.filter(Boolean).length) {
       goals.push("education");
     }
-    if (!Array.isArray(profile.activitySnippets) || !profile.activitySnippets.filter(Boolean).length) {
-      goals.push("activity");
-    }
+    // Activity is intentionally opportunistic and lightweight. Do not scroll or expand
+    // just to enrich posts; stable profile sections drive full extraction completion.
     if (!Array.isArray(profile.languageSnippets) || !profile.languageSnippets.filter(Boolean).length) {
       goals.push("languages");
     }
@@ -335,6 +417,7 @@
       profile_total_ms: 0,
       profile_scroll_strategy: lightweight ? "lightweight" : (forceScrollPass ? "forced_progressive_full_refresh" : "progressive_sections"),
       profile_scroll_passes_run: 0,
+      profile_scroll_steps_run: 0,
       profile_expand_passes_run: 0,
       profile_scroll_goal_summary: "",
       profile_scroll_seen_sections: []
@@ -368,16 +451,20 @@
       if (!lightweight && (forceScrollPass || !latest?.supported || !profileLooksCompleteEnough(latest?.profile))) {
         const hasAnyStructuredContent = hasStructuredProfileContent(latest?.profile);
         const shouldRunScrollPass = (forceScrollPass && attempt === 1) || attempt === 1 || !hasAnyStructuredContent;
-        const shouldRunExpandPass = !profileLooksCompleteEnough(latest?.profile);
+        const shouldRunExpandPass = forceScrollPass || !profileLooksCompleteEnough(latest?.profile) || profileHasCollapsedText(latest?.profile);
         const sectionGoals = missingProfileExtractionGoals(latest?.profile);
         timing.profile_scroll_goal_summary = sectionGoals.join(", ");
         if (shouldRunScrollPass) {
           stepStartedAtMs = deps.nowMs();
           const scrollResult = await (deps.scrollProfileForExtraction
-            ? deps.scrollProfileForExtraction({ sectionGoals })
+            ? deps.scrollProfileForExtraction({
+              sectionGoals,
+              forceInitialScroll: forceScrollPass && attempt === 1
+            })
             : deps.scrollProfileToBottomAndWaitForStable());
           timing.profile_auto_scroll_ms += deps.roundMs(deps.nowMs() - stepStartedAtMs);
           timing.profile_scroll_passes_run += 1;
+          timing.profile_scroll_steps_run += Number(scrollResult?.stepCount || 0);
           if (Array.isArray(scrollResult?.seenSections)) {
             timing.profile_scroll_seen_sections = scrollResult.seenSections.slice(0, 8);
           }
@@ -451,7 +538,7 @@
       return "Open the main LinkedIn profile page, not an activity or details subpage.";
     }
     if (!deps.isSupportedProfilePage() && !deps.isSupportedMessagingPage()) {
-      return "Open a LinkedIn profile or 1:1 messaging thread.";
+      return "Open a LinkedIn profile, 1:1 messaging thread, job, people search, or feed post.";
     }
     return undefined;
   }
@@ -473,6 +560,9 @@
           person: extracted.person || buildProfilePerson(extracted.profile) || null,
           profile: extracted.profile || null,
           conversation: extracted.conversation || null,
+          job: extracted.job || null,
+          peopleSearch: extracted.peopleSearch || null,
+          postDiscussion: extracted.postDiscussion || null,
           debug: extracted.debug || null,
           reason: extracted.supported ? undefined : (extracted.reason || unsupportedReason(deps))
         });
@@ -491,6 +581,39 @@
         return;
       }
 
+      if (message.type === MESSAGE_TYPES.CAPTURE_LINKEDIN_POST_DISCUSSION) {
+        if (!deps.isSupportedPostPage?.()) {
+          sendResponse({
+            ok: false,
+            error: "Open a visible LinkedIn feed post before capturing discussion context."
+          });
+          return;
+        }
+        const extracted = await deps.captureVisiblePostDiscussion();
+        sendResponse({
+          ok: Boolean(extracted?.supported),
+          supported: Boolean(extracted?.supported),
+          pageType: "linkedin-post",
+          pageUrl: extracted?.pageUrl || window.location.href,
+          title: extracted?.title || document.title,
+          postDiscussion: extracted?.postDiscussion || null,
+          debug: extracted?.debug || null,
+          error: extracted?.supported ? undefined : (extracted?.reason || "Unable to capture the visible post discussion."),
+          reason: extracted?.reason || ""
+        });
+        return;
+      }
+
+      if (message.type === MESSAGE_TYPES.APPLY_PEOPLE_SEARCH_FILTERS) {
+        if (!deps.isSupportedPeopleSearchPage()) {
+          sendResponse({ ok: false, error: "Open a LinkedIn people search page before applying filters." });
+          return;
+        }
+        const result = await deps.applyPeopleSearchFilters(message.search || {});
+        sendResponse({ ok: true, ...result });
+        return;
+      }
+
       if (message.type === MESSAGE_TYPES.EXTRACT_WORKSPACE_CONTEXT) {
         const workspaceStartedAtMs = deps.nowMs();
         if (deps.isSupportedProfilePage()) {
@@ -505,6 +628,7 @@
             person,
             profile: extracted.profile || null,
             conversation: null,
+            postDiscussion: null,
             debug: {
               ...(extracted.debug || {}),
               page_kind: "profile",

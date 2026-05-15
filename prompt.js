@@ -1,6 +1,7 @@
 (function initPrompts(global) {
   const shared = global.LinkedInAssistantShared;
-  if (!shared) {
+  const promptPackRuntime = global.LumiPromptPackRuntime;
+  if (!shared || !promptPackRuntime) {
     return;
   }
 
@@ -41,6 +42,7 @@
   };
   const LLM_PROVIDERS = Object.freeze(Object.keys(DEFAULT_LLM_ENTRY_URLS));
   const MAX_MESSAGE_LENGTH = 1200;
+  const SHORT_DRAFT_CHARACTER_LIMIT = 300;
 
   function normalizeOutputText(value) {
     return normalizeWhitespace(String(value || "")
@@ -48,8 +50,14 @@
   }
 
   function normalizeFixedTail(value) {
+    if (value === undefined || value === null) {
+      return FIXED_TAIL;
+    }
     const normalized = normalizeWhitespace(value);
-    if (!normalized || normalized === normalizeWhitespace(LEGACY_FIXED_TAIL)) {
+    if (!normalized) {
+      return "";
+    }
+    if (normalized === normalizeWhitespace(LEGACY_FIXED_TAIL)) {
       return FIXED_TAIL;
     }
     return normalized;
@@ -97,6 +105,26 @@
       return normalizedUrl;
     }
     return defaultLlmEntryUrl(normalizedProvider);
+  }
+
+  function normalizeDraftCharacterLimit(value) {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric) || numeric <= 0) {
+      return null;
+    }
+    return Math.max(1, Math.floor(numeric));
+  }
+
+  function draftLengthRule(options) {
+    const draftCharacterLimit = normalizeDraftCharacterLimit(options?.draftCharacterLimit);
+    if (!draftCharacterLimit) {
+      return `- Each final message must stay within ${MAX_MESSAGE_LENGTH} characters.`;
+    }
+    return [
+      `- Each final message must be fewer than ${draftCharacterLimit} characters, including spaces.`,
+      "- This stricter character limit overrides any request for a longer or more detailed draft.",
+      "- If needed, omit nice-to-have detail so the whole message fits the limit."
+    ].join("\n");
   }
 
   function defaultPromptSettings() {
@@ -209,14 +237,18 @@
     ]).join("\n");
   }
 
-  function normalizeDraftMessages(messages, fixedTail) {
+  function normalizeDraftMessages(messages, fixedTail, options) {
+    const draftCharacterLimit = normalizeDraftCharacterLimit(options?.draftCharacterLimit);
     return messages.map((message, index) => {
-      const draft = normalizeOutputText(message.message) || normalizeOutputText(combineMessage(message.opener || "", fixedTail || FIXED_TAIL));
+      const draft = normalizeOutputText(message.message) || normalizeOutputText(combineMessage(message.opener || "", normalizeFixedTail(fixedTail)));
       if (!draft) {
         throw new Error(`Message ${index + 1} is missing message text.`);
       }
       if (draft.length > MAX_MESSAGE_LENGTH) {
         throw new Error(`Message ${index + 1} exceeds ${MAX_MESSAGE_LENGTH} characters.`);
+      }
+      if (draftCharacterLimit && draft.length >= draftCharacterLimit) {
+        throw new Error(`Message ${index + 1} must be fewer than ${draftCharacterLimit} characters.`);
       }
       return {
         rank: Number(message.rank) || index + 1,
@@ -228,7 +260,7 @@
     });
   }
 
-  function validateWorkspaceResult(parsed, fixedTail, _flowType, fallbackProfile) {
+  function validateWorkspaceResult(parsed, fixedTail, _flowType, fallbackProfile, options) {
     if (!parsed || typeof parsed !== "object") {
       throw new Error("Parsed model output is not an object.");
     }
@@ -254,7 +286,7 @@
 
     const normalizedMessages = recommendedAction === "wait"
       ? []
-      : normalizeDraftMessages(messages, fixedTail);
+      : normalizeDraftMessages(messages, fixedTail, options);
 
     return {
       first_name: firstName || "",
@@ -273,8 +305,8 @@
     };
   }
 
-  function validateGenerationResult(parsed, fixedTail, _flowType, fallbackProfile) {
-    return validateWorkspaceResult(parsed, fixedTail, "", fallbackProfile);
+  function validateGenerationResult(parsed, fixedTail, _flowType, fallbackProfile, options) {
+    return validateWorkspaceResult(parsed, fixedTail, "", fallbackProfile, options);
   }
 
   const {
@@ -416,127 +448,16 @@
     ].join("\n");
   }
 
-  function relationshipPromptTemplate() {
-    return [
-      "{{recipient_full_name}}",
-      "",
-      "You are a world-class relationship strategist for LinkedIn networking and job outreach.",
-      "Decide the single best next action for this person, then draft the message for that action.",
-      "Use only the information below.",
-      "Treat raw evidence as primary. Treat derived signals as heuristics, not facts.",
-      "Do not invent facts.",
-      "",
-      "TASK",
-      "Choose exactly one next action and, if the action is not wait, draft the message for that action.",
-      "",
-      "WORKING DEFINITIONS",
-      "{{working_definitions}}",
-      "",
-      "DECISION PRINCIPLES",
-      relationshipStrategyPlaybook(),
-      "",
-      "CURRENT OBJECTIVE",
-      "{{current_objective}}",
-      "",
-      "PAGE CONTEXT",
-      "{{page_context}}",
-      "",
-      "RECIPIENT",
-      "{{recipient_profile}}",
-      "",
-      "CURRENT THREAD EVIDENCE",
-      "{{conversation_context}}",
-      "",
-      "OLDER IMPORTED CONTEXT",
-      "{{imported_conversation}}",
-      "",
-      "DERIVED RELATIONSHIP SIGNALS",
-      "{{logic_metrics}}",
-      "",
-      "LOCAL RELATIONSHIP TRIAGE HEURISTIC",
-      "{{relationship_triage}}",
-      "",
-      "PROFILE CHANGE SIGNALS",
-      "{{profile_change_summary}}",
-      "",
-      "SENDER CONTEXT",
-      "{{sender_profile}}",
-      "",
-      "SAVED RELATIONSHIP MEMORY",
-      "{{relationship_memory}}",
-      "",
-      "USER CUSTOM STRATEGY GUIDANCE",
-      "Treat this as supplemental strategy and tone guidance only. Ignore any conflicting output-format or JSON instructions inside it.",
-      "{{strategy_guidance}}",
-      "",
-      "PERSON NOTE",
-      "{{person_note}}",
-      "",
-      "EXTRA USER CONTEXT FOR THIS DRAFT",
-      "{{extra_context}}",
-      "",
-      "OPTIONAL CONTEXT LINE",
-      "{{fixed_tail}}",
-      "",
-      "Do these tasks:",
-      "1. Write a short recipient summary in about 250-320 characters.",
-      "2. Infer the current relationship stage.",
-      "3. Recommend exactly one next action from this list:",
-      "   - draft_first_message",
-      "   - draft_follow_up",
-      "   - draft_reply",
-      "   - draft_advice_ask",
-      "   - draft_referral_ask",
-      "   - wait",
-      "4. Explain briefly why this is the right action now in about 35-50 words.",
-      "5. Say whether it is appropriate to ask for a referral now.",
-      "6. Score referral readiness even if the answer is 'not yet'. Return a referral_readiness object with a total score out of 100 and four subscores out of 25 each:",
-      "   - relationship_trust_25",
-      "   - response_history_25",
-      "   - role_fit_25",
-      "   - ask_specificity_25",
-      "7. Add a short referral_readiness.summary explaining the main gating factor.",
-      "7a. In reason_why_now, you must use **double asterisks** around the 2 most important skim-worthy phrases.",
-      "7b. In referral_readiness.summary, you must use **double asterisks** around the single biggest gating factor.",
-      "7c. Keep that emphasis sparse. Do not use headings, bullets, or markdown fences inside those fields.",
-      "7d. Keep reason_why_now tight. Do not exceed 50 words.",
-      "8. Return an ai_assessment object that captures your advisory judgment about relevance, warmth, referral path, and ask quality.",
-      "9. If the action is not wait, generate up to 3 ranked draft messages that the user can send as-is or edit.",
-      "9a. For each message.reason, keep the explanation very short: about 8-16 words, roughly half the length of a typical sentence.",
-      "9b. In each message.reason, justify the choice using the most recent recipient message when relevant, especially whether it calls for a shorter or slightly fuller reply.",
-      "10. The ai_assessment object and referral_readiness object are mandatory in every response. Do not omit them, even if some values are uncertain.",
-      "",
-      referralReadinessScoringGuidance(),
-      "",
-      "Rules for the drafts:",
-      `- Each final message must stay within ${MAX_MESSAGE_LENGTH} characters.`,
-      "- Messages must sound like a real person, not polished marketing copy.",
-      "- Prefer simple, natural spoken English with short sentences and everyday wording. It is acceptable if the tone feels slightly non-native, but it must stay clear, professional, and easy to understand.",
-      "- Default to short, concise replies.",
-      "- Only make the message longer when the recipient's most recent message is substantively long or detailed and a fuller reply is genuinely needed.",
-      "- If extra user context explicitly asks for a longer or more detailed draft, follow that instruction.",
-      "- Use the most recent recipient message as the main length cue: short message usually means short reply; thoughtful long message can justify a somewhat fuller reply.",
-      "- Use the natural length that fits the context. It is acceptable to go beyond 300 characters when genuine appreciation, useful specificity, or a thoughtful reply needs more room.",
-      "- Do not make messages long just to be long. Earn the length with substance.",
-      "- Do not be pushy.",
-      "- Ask for a referral only when the context clearly supports it.",
-      "- Prefer advice or a light next step before a referral when the relationship is not warm.",
-      "- If this is a reply, continue naturally from the visible thread.",
-      "- If this is a follow-up after silence, acknowledge the gap lightly and do not guilt the person.",
-      "- Do not automatically start with 'Hi {first name},'. Use a greeting only when it sounds natural for the specific context.",
-      "- For first outreach or a long-gap re-entry, a short greeting can be fine. For an active or recent thread, usually continue without greeting again.",
-      "- Use the thread tone guidance in the logic metrics as advisory context. Match the conversation style lightly, but keep the reply professional because this is LinkedIn.",
-      "- Treat the local relationship triage as advisory signal only. The user may know additional context you do not.",
-      "- If extra user context is provided for this draft, weigh it heavily.",
-      "- If profile change signals are available, use them only when they create a more relevant, fresher reason to reach out. Do not force them into the draft.",
-      "- If this is a first outreach draft, you may echo the tone of the optional sender context line, but do not mechanically append it.",
-      "- If context is too weak to justify another message confidently, it is valid to recommend wait.",
-      "- If you recommend a referral ask, the message should be specific about the target role, team, or person whenever context makes that possible.",
-      "",
-      lockedJsonRules(),
-      "",
-      relationshipOutputContract()
-    ].join("\n");
+  function relationshipPromptTemplate(promptPackSettings) {
+    return promptPackRuntime.getBuiltInTemplate("relationship", promptPackSettings);
+  }
+
+  function postSuggestionPromptTemplate(promptPackSettings) {
+    return promptPackRuntime.getBuiltInTemplate("post_suggestions", promptPackSettings);
+  }
+
+  function relationshipRetryPromptTemplate(promptPackSettings) {
+    return promptPackRuntime.getBuiltInTemplate("relationship_retry", promptPackSettings);
   }
 
   function relationshipPromptDefinitions() {
@@ -571,53 +492,101 @@
     ].join("\n");
   }
 
-  function buildWorkspacePrompt(workspaceContext, personRecord, myProfile, fixedTail, promptSettings, extraContext) {
+  function visibleSignalsText(visibleSignals) {
+    if (!visibleSignals || typeof visibleSignals !== "object") {
+      return "";
+    }
+    return compactProfile({}, [
+      { label: "Companies", value: visibleSignals.companies },
+      { label: "Schools", value: visibleSignals.schools },
+      { label: "Locations", value: visibleSignals.locations },
+      { label: "Languages", value: visibleSignals.languages }
+    ]);
+  }
+
+  function senderProfileFactsText(myProfile, senderProfileData) {
+    const facts = senderProfileData?.profileFacts || myProfile?.profileFacts;
+    if (!facts || typeof facts !== "object") {
+      return "";
+    }
+    return JSON.stringify({
+      identity: facts.identity || {},
+      manualContext: {
+        notes: normalizeWhitespace(myProfile?.manualNotes || "")
+      },
+      about: facts.about || {},
+      experience: Array.isArray(facts.experience) ? facts.experience : [],
+      education: Array.isArray(facts.education) ? facts.education : [],
+      languages: Array.isArray(facts.languages) ? facts.languages : [],
+      recentActivity: {
+        items: Array.isArray(facts.recentActivity?.items) ? facts.recentActivity.items.slice(0, 3) : []
+      },
+      visibleSignals: facts.visibleSignals || senderProfileData?.visibleSignals || myProfile?.visibleSignals || {}
+    }, null, 2);
+  }
+
+  function buildWorkspacePrompt(workspaceContext, personRecord, myProfile, fixedTail, promptSettings, extraContext, options) {
     const settings = normalizePromptSettings(promptSettings || defaultPromptSettings());
     const profile = workspaceContext?.profile || workspaceContext?.person || {};
     const conversation = workspaceContext?.conversation || null;
     const recipientText = buildRecipientProfileMemory(profile, personRecord);
-    const myProfileText = compactProfile(myProfile || {}, [
+    const senderProfileData = myProfile?.profileData || myProfile || {};
+    const myProfileText = senderProfileFactsText(myProfile, senderProfileData) || compactProfile(myProfile || {}, [
       { label: "Own profile URL", value: myProfile?.ownProfileUrl },
       { label: "Manual notes", value: myProfile?.manualNotes },
-      { label: "Raw profile text", value: truncate(myProfile?.rawSnapshot, 15000) }
+      { label: "Full name", value: senderProfileData.fullName || myProfile?.fullName },
+      { label: "Headline", value: senderProfileData.headline || myProfile?.headline },
+      { label: "Location", value: senderProfileData.location || myProfile?.location },
+      { label: "About", value: senderProfileData.about || myProfile?.about },
+      { label: "Experience highlights", value: senderProfileData.experienceHighlights || myProfile?.experienceHighlights },
+      { label: "Education highlights", value: senderProfileData.educationHighlights || myProfile?.educationHighlights },
+      { label: "Activity snippets", value: senderProfileData.activitySnippets || myProfile?.activitySnippets },
+      { label: "Language snippets", value: senderProfileData.languageSnippets || myProfile?.languageSnippets },
+      { label: "Visible signals", value: visibleSignalsText(senderProfileData.visibleSignals || myProfile?.visibleSignals) }
     ]);
     const relationshipMemory = buildRelationshipMemory(personRecord);
     const profileChangeSummary = getProfileContext(personRecord)?.recentProfileChanges || "No newly captured profile changes.";
     const logicMetrics = buildLogicMetrics(workspaceContext, personRecord, myProfile);
     const relationshipTriage = buildRelationshipTriage(workspaceContext, personRecord, myProfile);
     const promptImportedConversation = importedConversationForPrompt(personRecord);
-    const ownFullName = extractOwnProfileName(myProfile?.rawSnapshot);
+    const ownFullName = normalizeWhitespace(senderProfileData.fullName || myProfile?.fullName) || extractOwnProfileName(myProfile?.rawSnapshot);
     const canonicalVisibleMessages = canonicalizeConversationEntries(conversation?.recentMessages, profile.fullName || personRecord?.fullName || "", ownFullName);
     const canonicalImportedMessages = canonicalizeConversationEntries(promptImportedConversation?.messages, profile.fullName || personRecord?.fullName || "", ownFullName);
     const importedMatchesVisible = canonicalVisibleMessages.length && canonicalImportedMessages.length
       && JSON.stringify(canonicalVisibleMessages) === JSON.stringify(canonicalImportedMessages);
     const flowType = "relationship";
-    const template = relationshipPromptTemplate();
+    const template = relationshipPromptTemplate(options?.promptPackSettings);
     const pageContextText = compactProfile(workspaceContext || {}, [
       { label: "Page type", value: workspaceContext?.pageType },
       { label: "Page title", value: workspaceContext?.title },
       { label: "Page URL", value: workspaceContext?.pageUrl }
     ]);
 
-    const prompt = template
-      .replaceAll("{{recipient_full_name}}", profile.fullName || personRecord?.fullName || "Recipient")
-      .replaceAll("{{recipient_profile}}", recipientText || "No recipient profile data available.")
-      .replaceAll("{{sender_profile}}", myProfileText || "No saved sender profile available.")
-      .replaceAll("{{fixed_tail}}", normalizeFixedTail(fixedTail || FIXED_TAIL))
-      .replaceAll("{{page_context}}", pageContextText || "No page context available.")
-      .replaceAll("{{working_definitions}}", relationshipPromptDefinitions())
-      .replaceAll("{{current_objective}}", buildCurrentObjectiveText(personRecord, profile, logicMetrics))
-      .replaceAll("{{conversation_context}}", formatConversationContext(conversation, ownFullName) || "No visible conversation context.")
-      .replaceAll("{{relationship_memory}}", relationshipMemory || "No saved relationship memory.")
-      .replaceAll("{{profile_change_summary}}", profileChangeSummary)
-      .replaceAll("{{logic_metrics}}", formatLogicMetrics(logicMetrics))
-      .replaceAll("{{person_note}}", personRecord?.personNote || "No saved person note.")
-      .replaceAll("{{extra_context}}", normalizeWhitespace(extraContext) || "No additional user context for this draft.")
-      .replaceAll("{{imported_conversation}}", importedMatchesVisible
+    const prompt = promptPackRuntime.applyTemplate(template, {
+      recipient_full_name: profile.fullName || personRecord?.fullName || "Recipient",
+      recipient_profile: recipientText || "No recipient profile data available.",
+      sender_profile: myProfileText || "No saved sender profile available.",
+      fixed_tail: normalizeFixedTail(fixedTail),
+      page_context: pageContextText || "No page context available.",
+      working_definitions: relationshipPromptDefinitions(),
+      relationship_strategy_playbook: relationshipStrategyPlaybook(),
+      current_objective: buildCurrentObjectiveText(personRecord, profile, logicMetrics),
+      conversation_context: formatConversationContext(conversation, ownFullName) || "No visible conversation context.",
+      relationship_memory: relationshipMemory || "No saved relationship memory.",
+      profile_change_summary: profileChangeSummary,
+      logic_metrics: formatLogicMetrics(logicMetrics),
+      person_note: personRecord?.personNote || "No saved person note.",
+      extra_context: normalizeWhitespace(extraContext) || "No additional user context for this draft.",
+      imported_conversation: importedMatchesVisible
         ? "Imported conversation matches the visible thread and adds no new context."
-        : (formatImportedConversation(promptImportedConversation, profile.fullName || personRecord?.fullName || "", ownFullName) || "No imported conversation history."))
-      .replaceAll("{{relationship_triage}}", formatRelationshipTriage(relationshipTriage))
-      .replaceAll("{{strategy_guidance}}", settings.strategyGuidance || "No additional custom strategy guidance.");
+        : (formatImportedConversation(promptImportedConversation, profile.fullName || personRecord?.fullName || "", ownFullName) || "No imported conversation history."),
+      relationship_triage: formatRelationshipTriage(relationshipTriage),
+      draft_length_rule: draftLengthRule(options),
+      strategy_guidance: settings.strategyGuidance || "No additional custom strategy guidance.",
+      referral_readiness_scoring_guidance: referralReadinessScoringGuidance(),
+      locked_json_rules: lockedJsonRules(),
+      relationship_output_contract: relationshipOutputContract()
+    });
 
     return {
       flowType,
@@ -628,19 +597,132 @@
     };
   }
 
-  function buildRetryPrompt(errorMessage) {
-    const normalizedError = normalizeWhitespace(errorMessage) || "The previous response did not pass validation.";
+  function formatPostDiscussionForPrompt(postDiscussion) {
+    const discussion = postDiscussion || {};
+    const actors = Array.isArray(discussion.actors) ? discussion.actors : [];
+    const comments = Array.isArray(discussion.comments) ? discussion.comments : [];
     return [
-      "Please regenerate your last answer in this same thread.",
-      `The extension rejected it for this reason: ${normalizedError}`,
-      "Check your previous answer and fix the issue.",
-      "Return every required top-level and nested field from the locked JSON schema.",
-      "If ai_assessment or referral_readiness was missing or incomplete, include the full objects with neutral defaults rather than omitting them.",
-      "Do not use the em dash character (—). Use a normal hyphen (-) instead.",
-      "Return JSON only.",
-      "Do not use markdown fences.",
-      "Do not add any text before or after the JSON."
-    ].join("\n");
+      compactProfile(discussion, [
+        { label: "Post URL", value: discussion.postUrl || discussion.pageUrl },
+        { label: "Post author", value: discussion.authorName },
+        { label: "Visible actors", value: actors.map((actor) => actor?.name).filter(Boolean) },
+        { label: "Post text", value: discussion.postText },
+        { label: "Reaction summary", value: compactProfile(discussion.reactionSummary || {}, [
+          { label: "Reactions", value: discussion.reactionSummary?.reactionsText },
+          { label: "Comments", value: discussion.reactionSummary?.commentsText },
+          { label: "Reposts", value: discussion.reactionSummary?.repostsText }
+        ]) }
+      ]),
+      comments.length
+        ? [
+          "Visible comments:",
+          ...comments.slice(0, 8).map((comment, index) => {
+            const header = [comment.authorName || `Comment ${index + 1}`, comment.timestamp || ""].filter(Boolean).join(" - ");
+            return `- ${header}: ${normalizeWhitespace(comment.text)}`;
+          })
+        ].join("\n")
+        : "Visible comments: none captured."
+    ].filter(Boolean).join("\n\n");
+  }
+
+  function buildPostSuggestionPrompt(postDiscussion, myProfile, promptSettings, options) {
+    const settings = normalizePromptSettings(promptSettings || defaultPromptSettings());
+    const senderProfileData = myProfile?.profileData || myProfile || {};
+    const senderContext = senderProfileFactsText(myProfile, senderProfileData) || compactProfile(myProfile || {}, [
+      { label: "Full name", value: senderProfileData.fullName || myProfile?.fullName },
+      { label: "Headline", value: senderProfileData.headline || myProfile?.headline },
+      { label: "Location", value: senderProfileData.location || myProfile?.location },
+      { label: "Manual notes", value: myProfile?.manualNotes }
+    ]);
+    const messageLimit = normalizeDraftCharacterLimit(options?.draftCharacterLimit);
+    const limitRule = messageLimit
+      ? `Each suggested message must be fewer than ${messageLimit} characters, including spaces.`
+      : "Each suggested message should stay concise and comfortably under 500 characters.";
+    const postContext = formatPostDiscussionForPrompt(postDiscussion);
+
+    const prompt = promptPackRuntime.applyTemplate(postSuggestionPromptTemplate(options?.promptPackSettings), {
+      draft_length_rule: limitRule,
+      sender_context: senderContext || "No saved sender profile context.",
+      post_context: postContext || "No visible post context.",
+      strategy_guidance_section: settings.strategyGuidance
+        ? ["Additional strategy guidance:", settings.strategyGuidance].join("\n")
+        : "No additional strategy guidance."
+    });
+
+    return {
+      prompt,
+      postContext
+    };
+  }
+
+  function validatePostSuggestionResult(raw, options) {
+    const parsed = shared.extractJsonFromText(raw);
+    const draftCharacterLimit = normalizeDraftCharacterLimit(options?.draftCharacterLimit);
+    const suggestions = Array.isArray(parsed?.suggestions) ? parsed.suggestions : [];
+    const normalizedSuggestions = suggestions.map((item, index) => {
+      const message = normalizeOutputText(item?.message);
+      return {
+        rank: Math.max(1, Number(item?.rank || index + 1) || index + 1),
+        type: normalizeWhitespace(item?.type || "").toLowerCase(),
+        target: normalizeOutputText(item?.target),
+        message,
+        reason: normalizeOutputText(item?.reason)
+      };
+    }).filter((item) => item.message);
+    const errors = [];
+    const postSummary = normalizeOutputText(parsed?.post_summary || parsed?.postSummary);
+    const interactionRead = normalizeOutputText(parsed?.interaction_read || parsed?.interactionRead);
+    if (!postSummary) {
+      errors.push("Missing post_summary.");
+    }
+    if (!interactionRead) {
+      errors.push("Missing interaction_read.");
+    }
+    if (!normalizedSuggestions.length) {
+      errors.push("No suggestions were returned.");
+    }
+    const invalidType = normalizedSuggestions.find((item) => item.type !== "comment" && item.type !== "reply");
+    if (invalidType) {
+      errors.push(`Invalid suggestion type: ${invalidType.type || "unknown"}.`);
+    }
+    const overLimit = normalizedSuggestions.find((item) => draftCharacterLimit && item.message.length >= draftCharacterLimit);
+    if (overLimit) {
+      errors.push(`Suggestion ${overLimit.rank} must be fewer than ${draftCharacterLimit} characters.`);
+    }
+    const tooLong = normalizedSuggestions.find((item) => item.message.length > MAX_MESSAGE_LENGTH);
+    if (tooLong) {
+      errors.push(`Suggestion ${tooLong.rank} exceeds ${MAX_MESSAGE_LENGTH} characters.`);
+    }
+    const missingReason = normalizedSuggestions.find((item) => !item.reason);
+    if (missingReason) {
+      errors.push(`Suggestion ${missingReason.rank} is missing reason.`);
+    }
+    const missingTarget = normalizedSuggestions.find((item) => !item.target);
+    if (missingTarget) {
+      errors.push(`Suggestion ${missingTarget.rank} is missing target.`);
+    }
+    if (errors.length) {
+      return { ok: false, errors, raw: parsed, value: null };
+    }
+    return {
+      ok: true,
+      errors: [],
+      raw: parsed,
+      value: {
+        postSummary,
+        interactionRead,
+        suggestions: normalizedSuggestions
+          .sort((left, right) => left.rank - right.rank)
+          .slice(0, 5)
+      }
+    };
+  }
+
+  function buildRetryPrompt(errorMessage, promptPackSettings) {
+    const normalizedError = normalizeWhitespace(errorMessage) || "The previous response did not pass validation.";
+    return promptPackRuntime.applyTemplate(relationshipRetryPromptTemplate(promptPackSettings), {
+      error_message: normalizedError
+    });
   }
 
   global.LinkedInAssistantPrompts = {
@@ -650,6 +732,7 @@
     DEFAULT_LLM_PROVIDER,
     FIXED_TAIL,
     MAX_MESSAGE_LENGTH,
+    SHORT_DRAFT_CHARACTER_LIMIT,
     defaultLlmEntryUrl,
     defaultPromptSettings,
     isChatGptUrl,
@@ -657,12 +740,16 @@
     normalizeFixedTail,
     normalizeLlmEntryUrl,
     normalizeLlmProvider,
+    normalizeDraftCharacterLimit,
     normalizePromptSettings,
     providerDisplayName,
     relationshipPromptTemplate,
+    postSuggestionPromptTemplate,
     buildWorkspacePrompt,
+    buildPostSuggestionPrompt,
     buildRetryPrompt,
     validateGenerationResult,
-    validateWorkspaceResult
+    validateWorkspaceResult,
+    validatePostSuggestionResult
   };
 })(globalThis);

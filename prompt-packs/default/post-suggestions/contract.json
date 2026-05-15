@@ -1,0 +1,11 @@
+{
+  "prompt_id": "post_suggestions",
+  "contract_id": "linkedin_post_suggestions_v1",
+  "validator": "validatePostSuggestionResult",
+  "supported_placeholders": [
+    "draft_length_rule",
+    "post_context",
+    "sender_context",
+    "strategy_guidance_section"
+  ]
+}

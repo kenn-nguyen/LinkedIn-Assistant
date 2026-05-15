@@ -1,0 +1,32 @@
+{
+  "pack_id": "default",
+  "pack_version": "1.0.0",
+  "app_compat_version": 1,
+  "prompts": {
+    "relationship": {
+      "label": "Relationship draft",
+      "template_path": "relationship/template.txt",
+      "contract_path": "relationship/contract.json"
+    },
+    "relationship_retry": {
+      "label": "Relationship retry",
+      "template_path": "relationship/retry.txt",
+      "contract_path": "relationship/contract.json"
+    },
+    "post_suggestions": {
+      "label": "Post suggestions",
+      "template_path": "post-suggestions/template.txt",
+      "contract_path": "post-suggestions/contract.json"
+    },
+    "job_outreach_search_url": {
+      "label": "Job outreach search URLs",
+      "template_path": "job-outreach/search-url-template.txt",
+      "contract_path": "job-outreach/search-url-contract.json"
+    },
+    "job_outreach_ranking": {
+      "label": "Job outreach ranking",
+      "template_path": "job-outreach/ranking-template.txt",
+      "contract_path": "job-outreach/ranking-contract.json"
+    }
+  }
+}

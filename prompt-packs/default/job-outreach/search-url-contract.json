@@ -1,0 +1,11 @@
+{
+  "prompt_id": "job_outreach_search_url",
+  "contract_id": "job_outreach_search_urls_v1",
+  "validator": "validateSearchUrlResponse",
+  "supported_placeholders": [
+    "search_url_contract_shape",
+    "search_url_contract_version",
+    "search_url_examples",
+    "searches_json"
+  ]
+}

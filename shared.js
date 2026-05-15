@@ -58,8 +58,10 @@
     myProfile: "myProfile",
     fixedTail: "fixedTail",
     promptSettings: "promptSettings",
+    promptPackSettings: "promptPackSettings",
     chatGptProjectUrl: "chatGptProjectUrl",
     people: "people",
+    jobOutreach: "jobOutreach",
     personDraftWorkspaces: "personDraftWorkspaces",
     tabPersonBindings: "tabPersonBindings",
     threadPersonBindings: "threadPersonBindings",
@@ -77,10 +79,12 @@
     GENERATE_FOR_RECIPIENT: "GENERATE_FOR_RECIPIENT",
     UPDATE_MY_PROFILE: "UPDATE_MY_PROFILE",
     UPDATE_RECIPIENT_PROFILE_CONTEXT: "UPDATE_RECIPIENT_PROFILE_CONTEXT",
+    LINK_PROFILE_URL_TO_PERSON: "LINK_PROFILE_URL_TO_PERSON",
     SAVE_MY_PROFILE: "SAVE_MY_PROFILE",
     SET_PENDING_MY_PROFILE_TARGET: "SET_PENDING_MY_PROFILE_TARGET",
     SAVE_FIXED_TAIL: "SAVE_FIXED_TAIL",
     SAVE_PROMPT_SETTINGS: "SAVE_PROMPT_SETTINGS",
+    SAVE_PROMPT_PACK_SETTINGS: "SAVE_PROMPT_PACK_SETTINGS",
     SAVE_CHATGPT_PROJECT_URL: "SAVE_CHATGPT_PROJECT_URL",
     MARK_IDENTITY_RESOLUTION_SEEN: "MARK_IDENTITY_RESOLUTION_SEEN",
     SAVE_PERSON_NOTE: "SAVE_PERSON_NOTE",
@@ -88,6 +92,18 @@
     SAVE_PERSON_THREAD_URL: "SAVE_PERSON_THREAD_URL",
     IMPORT_CURRENT_CONVERSATION: "IMPORT_CURRENT_CONVERSATION",
     CLEAR_IMPORTED_CONVERSATION: "CLEAR_IMPORTED_CONVERSATION",
+    CAPTURE_LINKEDIN_POST_DISCUSSION: "CAPTURE_LINKEDIN_POST_DISCUSSION",
+    GENERATE_POST_SUGGESTIONS: "GENERATE_POST_SUGGESTIONS",
+    POST_SUGGESTIONS_PROGRESS: "POST_SUGGESTIONS_PROGRESS",
+    POST_SUGGESTIONS_COMPLETE: "POST_SUGGESTIONS_COMPLETE",
+    POST_SUGGESTIONS_FAILED: "POST_SUGGESTIONS_FAILED",
+    APPLY_PEOPLE_SEARCH_FILTERS: "APPLY_PEOPLE_SEARCH_FILTERS",
+    RUN_JOB_OUTREACH: "RUN_JOB_OUTREACH",
+    RESUME_JOB_OUTREACH: "RESUME_JOB_OUTREACH",
+    CANCEL_JOB_OUTREACH: "CANCEL_JOB_OUTREACH",
+    DISMISS_JOB_OUTREACH_RUN: "DISMISS_JOB_OUTREACH_RUN",
+    OPEN_JOB_OUTREACH_WORKER_TAB: "OPEN_JOB_OUTREACH_WORKER_TAB",
+    JOB_OUTREACH_PROGRESS: "JOB_OUTREACH_PROGRESS",
     GET_STORAGE_STATE: "GET_STORAGE_STATE",
     RESOLVE_PROFILE_IDENTITY: "RESOLVE_PROFILE_IDENTITY",
     READ_LATEST_CHATGPT_RESPONSE: "READ_LATEST_CHATGPT_RESPONSE",
@@ -160,6 +176,28 @@
         seen.add(key);
         return true;
       });
+  }
+
+  const LINKEDIN_COMPANY_DESCRIPTOR_SUFFIXES = [
+    "Software Development",
+    "Technology, Information and Internet",
+    "IT Services and IT Consulting",
+    "Financial Services",
+    "Banking",
+    "Internet Publishing",
+    "Entertainment Providers",
+    "Computer and Network Security",
+    "Computer Games",
+    "Computer Software"
+  ];
+
+  function cleanLinkedInCompanyDisplayName(value) {
+    const text = normalizeWhitespace(value);
+    const lower = text.toLowerCase();
+    const suffix = LINKEDIN_COMPANY_DESCRIPTOR_SUFFIXES
+      .map((entry) => entry.toLowerCase())
+      .find((entry) => lower.endsWith(` ${entry}`));
+    return suffix ? text.slice(0, text.length - suffix.length).trim() : text;
   }
 
   function safeJson(value, fallback) {
@@ -265,6 +303,25 @@
       ownProfileUrl: "",
       pendingProfileUrl: "",
       manualNotes: "",
+      fullName: "",
+      firstName: "",
+      headline: "",
+      location: "",
+      profileSummary: "",
+      about: "",
+      experienceHighlights: [],
+      educationHighlights: [],
+      activitySnippets: [],
+      languageSnippets: [],
+      visibleSignals: {
+        companies: [],
+        schools: [],
+        locations: [],
+        languages: []
+      },
+      profileFacts: null,
+      profileCaptureMode: "",
+      profileData: null,
       rawSnapshot: "",
       updatedAt: "",
       lastActivitySyncedAt: "",
@@ -488,12 +545,14 @@
       activitySnippets: uniqueStrings(profile.activitySnippets || []),
       languageSnippets: uniqueStrings(profile.languageSnippets || []),
       rawSnapshot: normalizeWhitespace(profile.rawSnapshot),
+      profileCaptureMode: normalizeWhitespace(profile.profileCaptureMode),
       visibleSignals: {
         companies: uniqueStrings(profile.visibleSignals?.companies || []),
         schools: uniqueStrings(profile.visibleSignals?.schools || []),
         locations: uniqueStrings(profile.visibleSignals?.locations || []),
         languages: uniqueStrings(profile.visibleSignals?.languages || [])
-      }
+      },
+      profileFacts: profile.profileFacts && typeof profile.profileFacts === "object" ? profile.profileFacts : null
     };
   }
 
@@ -1893,17 +1952,37 @@
       headline: chooseRicherText(currentProfile.headline, savedProfile.headline || profileContext?.headline || personRecord?.headline),
       location: chooseRicherText(currentProfile.location, savedProfile.location || profileContext?.location || personRecord?.location),
       about: chooseRicherText(currentProfile.about, savedProfile.about),
-      profileSummary: chooseRicherText(currentProfile.profileSummary, savedProfile.profileSummary || profileContext?.profileSummary),
       rawSnapshot,
       activitySnippets,
       experienceHighlights,
       educationHighlights,
-      languageSnippets
+      languageSnippets,
+      profileFacts: currentProfile.profileFacts || savedProfile.profileFacts || null
     };
   }
 
   function buildRecipientProfileMemory(profile, personRecord) {
     const resolved = resolveRecipientPromptProfile(profile, personRecord);
+    if (resolved.profileFacts && typeof resolved.profileFacts === "object") {
+      return sanitizeRecipientProfileMemory(JSON.stringify({
+        identity: {
+          ...(resolved.profileFacts.identity || {}),
+          fullName: resolved.fullName || resolved.profileFacts.identity?.fullName || "",
+          headline: resolved.headline || resolved.profileFacts.identity?.headline || "",
+          location: resolved.location || resolved.profileFacts.identity?.location || ""
+        },
+        about: resolved.profileFacts.about || { text: resolved.about || "" },
+        experience: Array.isArray(resolved.profileFacts.experience) ? resolved.profileFacts.experience : [],
+        education: Array.isArray(resolved.profileFacts.education) ? resolved.profileFacts.education : [],
+        languages: Array.isArray(resolved.profileFacts.languages) ? resolved.profileFacts.languages : [],
+        recentActivity: {
+          items: Array.isArray(resolved.profileFacts.recentActivity?.items)
+            ? resolved.profileFacts.recentActivity.items.slice(0, 3)
+            : []
+        },
+        visibleSignals: resolved.profileFacts.visibleSignals || {}
+      }, null, 2));
+    }
     return sanitizeRecipientProfileMemory(compactProfile(resolved, [
       { label: "Full name", value: resolved.fullName },
       { label: "Headline", value: resolved.headline },
@@ -1912,8 +1991,7 @@
       { label: "Experience highlights", value: resolved.experienceHighlights.length ? resolved.experienceHighlights.join(" | ") : "" },
       { label: "Education highlights", value: resolved.educationHighlights.length ? resolved.educationHighlights.join(" | ") : "" },
       { label: "Activity snippets", value: resolved.activitySnippets.length ? resolved.activitySnippets.join(" | ") : "" },
-      { label: "Language snippets", value: resolved.languageSnippets.length ? resolved.languageSnippets.join(" | ") : "" },
-      { label: "Raw profile text", value: truncate(resolved.rawSnapshot, 15000) }
+      { label: "Language snippets", value: resolved.languageSnippets.length ? resolved.languageSnippets.join(" | ") : "" }
     ]));
   }
 
@@ -2023,7 +2101,22 @@
       fixedTail: normalizeWhitespace(options?.fixedTail),
       personNote: normalizeWhitespace(options?.personNote),
       userGoal: normalizeUserGoal(options?.userGoal),
-      extraContext: normalizeWhitespace(options?.extraContext)
+      extraContext: normalizeWhitespace(options?.extraContext),
+      draftCharacterLimit: Number.isFinite(Number(options?.draftCharacterLimit)) && Number(options?.draftCharacterLimit) > 0
+        ? Math.floor(Number(options.draftCharacterLimit))
+        : null
+    };
+  }
+
+  function buildGeneratePostSuggestionsCommand(options) {
+    return {
+      type: MESSAGE_TYPES.GENERATE_POST_SUGGESTIONS,
+      requestId: normalizeWhitespace(options?.requestId),
+      sourceTabId: typeof options?.sourceTabId === "number" ? options.sourceTabId : null,
+      postDiscussion: options?.postDiscussion || null,
+      draftCharacterLimit: Number.isFinite(Number(options?.draftCharacterLimit)) && Number(options?.draftCharacterLimit) > 0
+        ? Math.floor(Number(options.draftCharacterLimit))
+        : null
     };
   }
 
@@ -2039,11 +2132,13 @@
     USER_GOALS,
     buildLogicMetrics,
     buildFreshGenerateForRecipientCommand,
+    buildGeneratePostSuggestionsCommand,
     buildFreshGenerationPersonRecord,
     buildRecipientProfileMemory,
     buildRelationshipTriage,
     calibrateReferralReadiness,
     canonicalizeConversationEntries,
+    cleanLinkedInCompanyDisplayName,
     compactProfile,
     defaultAiAssessment,
     defaultMyProfile,

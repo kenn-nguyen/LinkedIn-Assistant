@@ -1,7 +1,9 @@
-importScripts("identity.js", "shared.js", "prompt.js");
+importScripts("identity.js", "shared.js", "prompt-pack-runtime.js", "prompt.js", "job-outreach-ai.js");
 
 const shared = globalThis.LinkedInAssistantShared;
 const prompts = globalThis.LinkedInAssistantPrompts;
+const promptPackRuntime = globalThis.LumiPromptPackRuntime;
+const jobOutreachAi = globalThis.LumiJobOutreachAI;
 const {
   MESSAGE_TYPES,
   STORAGE_KEYS,
@@ -20,6 +22,7 @@ const {
   isOpaqueLinkedInPersonId,
   linkedInProfileAlias,
   mergePersonRecord,
+  cleanLinkedInCompanyDisplayName,
   normalizeConnectionStatus,
   normalizeConversationTimestamp,
   normalizeLinkedInProfileUrl,
@@ -29,24 +32,32 @@ const {
   normalizeUrl,
   normalizeWhitespace,
   serializeError,
-  toIsoNow
+  toIsoNow,
+  uniqueStrings
 } = shared;
 const {
   DEFAULT_CHATGPT_PROJECT_URL,
   DEFAULT_LLM_PROVIDER,
   FIXED_TAIL,
   defaultLlmEntryUrl,
+  buildPostSuggestionPrompt,
   buildRetryPrompt,
   buildWorkspacePrompt,
   isChatGptUrl,
   isGeminiUrl,
+  normalizeDraftCharacterLimit,
   normalizeFixedTail,
   normalizeLlmProvider,
   normalizePromptSettings,
   providerDisplayName,
+  validatePostSuggestionResult,
   validateWorkspaceResult,
   defaultPromptSettings
 } = prompts;
+const {
+  defaultPromptPackSettings,
+  normalizePromptPackSettings
+} = promptPackRuntime;
 
 const MAX_RETRIES = 3;
 const CHATGPT_SINGLE_WAIT_MS = 180000;
@@ -60,6 +71,17 @@ const PROVIDER_CAPTURE_SETTLE_MS = 120;
 const PROVIDER_POPUP_WIDTH = 10;
 const PROVIDER_POPUP_HEIGHT = 10;
 const PROVIDER_POPUP_MARGIN = 8;
+const POST_SUGGESTION_CONTRACT_VERSION = "linkedin_post_suggestions_v1";
+const LINKEDIN_CONTENT_SCRIPT_FILES = [
+  "identity.js",
+  "shared.js",
+  "linkedin-profile-extraction.js",
+  "linkedin-library/jobs/extraction.js",
+  "linkedin-library/posts/extraction.js",
+  "linkedin-people-search-extraction.js",
+  "linkedin-commands.js",
+  "linkedin-content.js"
+];
 const lastProviderTabIds = {
   chatgpt: null,
   gemini: null
@@ -67,11 +89,14 @@ const lastProviderTabIds = {
 const providerTabBindings = new Map();
 const sourceTabProviderBindings = new Map();
 const generationJobs = new Map();
+const pendingJobOutreachRuns = new Map();
 const linkedInProfileResolutionInFlight = new Map();
 const linkedInTabUrls = new Map();
 const sidePanelSessionPorts = new Set();
 const PROFILE_CLICK_IDENTITY_MAX_AGE_MS = 2 * 60 * 1000;
+const PENDING_PROFILE_IDENTITY_HANDOFF_MAX_AGE_MS = 2 * 60 * 1000;
 const SIDEPANEL_SESSION_PORT_NAME = "sidepanel-session";
+const pendingProfileIdentityHandoffsByTabId = new Map();
 let lastObservedLinkedInTabId = null;
 let lastObservedLinkedInTabUrl = "";
 let lastLinkedInClickTrace = {
@@ -89,15 +114,28 @@ let pendingLinkedInNavigation = {
   lastSeenTabUrl: ""
 };
 const messagingReloadStateByTab = new Map();
+const promptPackReadyPromise = promptPackRuntime.ensureReady().catch((error) => {
+  console.error("Unable to preload prompt pack runtime", error);
+  throw error;
+});
+
+async function ensurePromptPackReady(settings) {
+  if (settings) {
+    return promptPackRuntime.ensureReady(settings);
+  }
+  return promptPackReadyPromise;
+}
 
 function resetRuntimeCaches() {
   providerTabBindings.clear();
   sourceTabProviderBindings.clear();
   generationJobs.clear();
+  pendingJobOutreachRuns.clear();
   linkedInProfileResolutionInFlight.clear();
   messagingReloadStateByTab.clear();
   linkedInTabUrls.clear();
   sidePanelSessionPorts.clear();
+  pendingProfileIdentityHandoffsByTabId.clear();
   setLastProviderTabId("chatgpt", null);
   setLastProviderTabId("gemini", null);
   lastObservedLinkedInTabId = null;
@@ -126,8 +164,10 @@ async function initializeStorageDefaults(resetAll) {
     STORAGE_KEYS.fixedTail,
     STORAGE_KEYS.myProfile,
     STORAGE_KEYS.promptSettings,
+    STORAGE_KEYS.promptPackSettings,
     STORAGE_KEYS.chatGptProjectUrl,
     STORAGE_KEYS.people,
+    STORAGE_KEYS.jobOutreach,
     STORAGE_KEYS.tabPersonBindings,
     STORAGE_KEYS.threadPersonBindings,
     STORAGE_KEYS.profileRedirects,
@@ -135,7 +175,7 @@ async function initializeStorageDefaults(resetAll) {
   ]);
 
   const nextState = {};
-  if (!current[STORAGE_KEYS.fixedTail]) {
+  if (!Object.prototype.hasOwnProperty.call(current, STORAGE_KEYS.fixedTail)) {
     nextState[STORAGE_KEYS.fixedTail] = FIXED_TAIL;
   } else {
     const normalizedFixedTail = normalizeFixedTail(current[STORAGE_KEYS.fixedTail]);
@@ -149,11 +189,17 @@ async function initializeStorageDefaults(resetAll) {
   if (!current[STORAGE_KEYS.promptSettings]) {
     nextState[STORAGE_KEYS.promptSettings] = defaultPromptSettings();
   }
+  if (!current[STORAGE_KEYS.promptPackSettings]) {
+    nextState[STORAGE_KEYS.promptPackSettings] = defaultPromptPackSettings();
+  }
   if (!current[STORAGE_KEYS.chatGptProjectUrl]) {
     nextState[STORAGE_KEYS.chatGptProjectUrl] = DEFAULT_CHATGPT_PROJECT_URL;
   }
   if (!current[STORAGE_KEYS.people]) {
     nextState[STORAGE_KEYS.people] = {};
+  }
+  if (!current[STORAGE_KEYS.jobOutreach]) {
+    nextState[STORAGE_KEYS.jobOutreach] = { jobsById: {}, filterCache: {}, runsById: {}, runOrder: [], queue: [], activeRunId: "" };
   }
   if (!current[STORAGE_KEYS.tabPersonBindings]) {
     nextState[STORAGE_KEYS.tabPersonBindings] = {};
@@ -419,9 +465,149 @@ async function trackPendingLinkedInNavigation(tabId, targetHref) {
   }
 }
 
+function setPendingProfileIdentityHandoff(tabId, personRecord, targetHref) {
+  if (!Number.isInteger(tabId) || tabId < 0) {
+    return null;
+  }
+  const personId = normalizeWhitespace(personRecord?.personId);
+  if (!personId) {
+    return null;
+  }
+  const handoff = {
+    personId,
+    recordUuid: normalizeWhitespace(personRecord?.uuid || personRecord?.system?.recordUuid),
+    fullName: normalizeWhitespace(personRecord?.fullName),
+    headline: normalizeWhitespace(personRecord?.headline),
+    targetHref: normalizeLinkedInProfileUrl(targetHref),
+    startedAt: toIsoNow(),
+    resolvedAt: "",
+    publicProfileUrl: ""
+  };
+  pendingProfileIdentityHandoffsByTabId.set(tabId, handoff);
+  return handoff;
+}
+
+function clearPendingProfileIdentityHandoff(tabId) {
+  if (!Number.isInteger(tabId)) {
+    return;
+  }
+  pendingProfileIdentityHandoffsByTabId.delete(tabId);
+}
+
+function getPendingProfileIdentityHandoffForPage(pageContext, stored) {
+  if (pageContext?.pageType !== "linkedin-profile") {
+    return null;
+  }
+  const tabId = Number.isInteger(pageContext?.tabId) ? pageContext.tabId : null;
+  if (tabId === null) {
+    return null;
+  }
+  const pending = pendingProfileIdentityHandoffsByTabId.get(tabId);
+  if (!pending) {
+    return null;
+  }
+  const startedAt = Date.parse(normalizeWhitespace(pending.startedAt));
+  if (!Number.isFinite(startedAt) || Math.max(0, Date.now() - startedAt) > PENDING_PROFILE_IDENTITY_HANDOFF_MAX_AGE_MS) {
+    pendingProfileIdentityHandoffsByTabId.delete(tabId);
+    return null;
+  }
+  const people = stored?.people || {};
+  const personId = normalizeWhitespace(pending.personId);
+  const record = personId ? people[personId] : null;
+  if (!record) {
+    return null;
+  }
+  const pageFullName = normalizeWhitespace(pageContext?.person?.fullName || pageContext?.profile?.fullName);
+  const pageProfileUrl = normalizeLinkedInProfileUrl(pageContext?.pageUrl || pageContext?.person?.profileUrl || pageContext?.profile?.profileUrl);
+  if (
+    recordMatchesExplicitPageIdentity(record, pageContext)
+    || recordMatchesProfileNameHeadline(record, pageContext)
+    || (pageFullName && hasMatchingNameEvidence(record, { fullName: pageFullName }))
+    || (pageProfileUrl && pageProfileUrl === normalizeLinkedInProfileUrl(pending.publicProfileUrl || pending.targetHref))
+  ) {
+    return { record, handoff: pending };
+  }
+  return null;
+}
+
+async function maybeResolvePendingProfileIdentityHandoff(tabId, tabUrl) {
+  if (!Number.isInteger(tabId) || tabId < 0) {
+    return;
+  }
+  const pending = pendingProfileIdentityHandoffsByTabId.get(tabId);
+  if (!pending) {
+    return;
+  }
+  const normalizedTabUrl = normalizeLinkedInProfileUrl(tabUrl);
+  if (
+    !normalizedTabUrl
+    || !/^https:\/\/www\.linkedin\.com\/in\//i.test(normalizedTabUrl)
+    || shouldResolveLinkedInProfileUrl(normalizedTabUrl)
+  ) {
+    return;
+  }
+  const startedAt = Date.parse(normalizeWhitespace(pending.startedAt));
+  if (!Number.isFinite(startedAt) || Math.max(0, Date.now() - startedAt) > PENDING_PROFILE_IDENTITY_HANDOFF_MAX_AGE_MS) {
+    pendingProfileIdentityHandoffsByTabId.delete(tabId);
+    return;
+  }
+
+  let stored = await getStoredState();
+  let targetPerson = stored?.people?.[normalizeWhitespace(pending.personId)] || null;
+  if (!targetPerson) {
+    pendingProfileIdentityHandoffsByTabId.delete(tabId);
+    return;
+  }
+
+  const linkedPerson = linkProfileUrlToPersonRecord(targetPerson, normalizedTabUrl);
+  const upsertResult = await upsertPersonRecord(linkedPerson, stored);
+  stored = {
+    ...stored,
+    people: upsertResult.people,
+    tabPersonBindings: upsertResult.tabPersonBindings,
+    threadPersonBindings: upsertResult.threadPersonBindings
+  };
+  const tabBindingResult = await ensureCurrentTabPersonBinding({ tabId }, upsertResult.merged, stored);
+  stored = tabBindingResult.stored;
+  pendingProfileIdentityHandoffsByTabId.set(tabId, {
+    ...pending,
+    personId: normalizeWhitespace(upsertResult.merged?.personId || pending.personId),
+    recordUuid: normalizeWhitespace(upsertResult.merged?.uuid || upsertResult.merged?.system?.recordUuid || pending.recordUuid),
+    fullName: normalizeWhitespace(upsertResult.merged?.fullName || pending.fullName),
+    headline: normalizeWhitespace(upsertResult.merged?.headline || pending.headline),
+    publicProfileUrl: normalizedTabUrl,
+    resolvedAt: toIsoNow()
+  });
+}
+
 function isMissingReceiverError(error) {
   const text = error?.message || String(error || "");
-  return /receiving end does not exist|could not establish connection/i.test(text);
+  return /receiving end does not exist|could not establish connection|message channel closed before a response was received|message port closed before a response was received/i.test(text);
+}
+
+function buildOpenPersonMessagesTabCreateProperties(sourceTab, profileUrl) {
+  const url = normalizeLinkedInProfileUrl(profileUrl || "") || normalizeWhitespace(profileUrl || "");
+  const createProperties = {
+    url,
+    active: true
+  };
+  if (Number.isInteger(sourceTab?.windowId)) {
+    createProperties.windowId = sourceTab.windowId;
+  }
+  if (Number.isInteger(sourceTab?.index)) {
+    createProperties.index = sourceTab.index + 1;
+  }
+  if (Number.isInteger(sourceTab?.id)) {
+    createProperties.openerTabId = sourceTab.id;
+  }
+  return createProperties;
+}
+
+function linkedInMessageErrorText(error) {
+  if (isMissingReceiverError(error)) {
+    return "LinkedIn reloaded before the page responded.";
+  }
+  return error?.message || String(error || "");
 }
 
 async function getActiveTab() {
@@ -469,7 +655,7 @@ async function injectContentScriptsForTab(tab) {
   if (tab.url.startsWith("https://www.linkedin.com/")) {
     await chrome.scripting.executeScript({
       target: { tabId: tab.id, allFrames: true },
-      files: ["identity.js", "shared.js", "linkedin-commands.js", "linkedin-content.js"]
+      files: LINKEDIN_CONTENT_SCRIPT_FILES
     });
     return;
   }
@@ -504,10 +690,10 @@ async function safeSendMessage(tabId, message) {
         await delay(100);
         return await chrome.tabs.sendMessage(tabId, message);
       } catch (retryError) {
-        return { ok: false, error: retryError.message || String(retryError) };
+        return { ok: false, error: linkedInMessageErrorText(retryError) };
       }
     }
-    return { ok: false, error: error.message || String(error) };
+    return { ok: false, error: linkedInMessageErrorText(error) };
   }
 }
 
@@ -521,7 +707,7 @@ async function injectLinkedInScriptsIntoFrames(tabId, frameIds) {
   try {
     await chrome.scripting.executeScript({
       target: { tabId, frameIds: uniqueFrameIds },
-      files: ["identity.js", "shared.js", "linkedin-commands.js", "linkedin-content.js"]
+      files: LINKEDIN_CONTENT_SCRIPT_FILES
     });
   } catch (_error) {
     // Some LinkedIn subframes may reject script injection. Ignore and keep trying other frames.
@@ -731,6 +917,8 @@ function linkedInFrameResponseScore(response) {
     return -1;
   }
   const conversation = response?.conversation || {};
+  const responsePageUrl = normalizeWhitespace(response?.pageUrl || "");
+  const frameId = Number(response?._frameId);
   const visibleMessageCount = Array.isArray(conversation?.allVisibleMessages)
     ? conversation.allVisibleMessages.length
     : Array.isArray(conversation?.recentMessages)
@@ -741,9 +929,12 @@ function linkedInFrameResponseScore(response) {
     score += 500;
   } else if (response.pageType === "linkedin-profile") {
     score += 100;
-  }
-  if (/\/preload\/?$/i.test(normalizeWhitespace(response?.pageUrl || ""))) {
-    score -= 220;
+  } else if (response.pageType === "linkedin-job") {
+    score += 120;
+  } else if (response.pageType === "linkedin-people-search") {
+    score += 110;
+  } else if (response.pageType === "linkedin-post") {
+    score += 105;
   }
   if (response.supported) {
     score += 100;
@@ -756,6 +947,33 @@ function linkedInFrameResponseScore(response) {
   }
   if (normalizeWhitespace(response?.person?.profileUrl || response?.profile?.profileUrl || "")) {
     score += 10;
+  }
+  if (normalizeWhitespace(response?.job?.title || "") && normalizeWhitespace(response?.job?.company || "")) {
+    score += 40;
+  }
+  if (response.pageType === "linkedin-job" && normalizeWhitespace(response?.job?.description || "")) {
+    score += 90;
+  }
+  if (Number(response?.peopleSearch?.resultCount || 0) > 0) {
+    score += 30;
+  }
+  if (normalizeWhitespace(response?.postDiscussion?.postText || "")) {
+    score += 40;
+  }
+  if (Number(response?.postDiscussion?.commentCount || 0) > 0) {
+    score += 20;
+  }
+  if (Number.isInteger(frameId) && frameId === 0) {
+    score += response.pageType === "unsupported" ? 120 : 25;
+  }
+  if (/^about:blank$/i.test(responsePageUrl)) {
+    score -= 260;
+  }
+  if (/\/preload\/?$/i.test(responsePageUrl) && !(response.pageType === "linkedin-job" && response.supported)) {
+    score -= 220;
+  }
+  if (/^https:\/\/www\.linkedin\.com\/tscp-serving\/dtag\b/i.test(responsePageUrl)) {
+    score -= 180;
   }
   return score;
 }
@@ -776,6 +994,15 @@ function isStrongLinkedInFrameResponse(response, messageType) {
     }
     if (response.pageType === "linkedin-profile") {
       return Boolean(response.supported && normalizeWhitespace(response?.profile?.fullName || response?.person?.fullName));
+    }
+    if (response.pageType === "linkedin-job") {
+      return Boolean(response.supported && normalizeWhitespace(response?.job?.title || "") && normalizeWhitespace(response?.job?.company || ""));
+    }
+    if (response.pageType === "linkedin-people-search") {
+      return Boolean(response.supported);
+    }
+    if (response.pageType === "linkedin-post") {
+      return Boolean(response.supported && normalizeWhitespace(response?.postDiscussion?.postText || response?.postDiscussion?.postUrl || ""));
     }
   }
   return false;
@@ -809,7 +1036,8 @@ async function sendLinkedInMessageToFrame(tabId, frameId, message) {
 
 async function sendLinkedInMessageToBestFrame(tabId, message) {
   const shouldProbeFrames = message?.type === MESSAGE_TYPES.GET_PAGE_CONTEXT
-    || message?.type === MESSAGE_TYPES.EXTRACT_WORKSPACE_CONTEXT;
+    || message?.type === MESSAGE_TYPES.EXTRACT_WORKSPACE_CONTEXT
+    || message?.type === MESSAGE_TYPES.CAPTURE_LINKEDIN_POST_DISCUSSION;
   const frameProbes = shouldProbeFrames ? await probeLinkedInFrames(tabId) : [];
   const probeOrderedFrameIds = frameProbes.map((probe) => probe.frameId);
   const fallbackFrameIds = await getLinkedInFrameIds(tabId);
@@ -858,7 +1086,7 @@ async function safeSendLinkedInMessage(tabId, message) {
     }
     return { ok: false, error: "No LinkedIn content script receiver was available in this tab." };
   } catch (error) {
-    return { ok: false, error: error.message || String(error) };
+    return { ok: false, error: linkedInMessageErrorText(error) };
   }
 }
 
@@ -1248,6 +1476,36 @@ async function canonicalizePageContextIdentity(pageContext, stored, options) {
   };
 }
 
+function inferLinkedInPageTypeFromUrl(url) {
+  const normalized = normalizeWhitespace(url || "");
+  if (/^https:\/\/www\.linkedin\.com\/messaging\b/i.test(normalized)) {
+    return "linkedin-messaging";
+  }
+  if (/^https:\/\/www\.linkedin\.com\/in\/[^/]+(?:\/.*)?$/i.test(normalized)) {
+    return "linkedin-profile";
+  }
+  if (
+    /^https:\/\/www\.linkedin\.com\/jobs\/view\/\d+/i.test(normalized)
+    || (
+      /^https:\/\/www\.linkedin\.com\/jobs(?:[/?#]|$)/i.test(normalized)
+      && /[?&]currentJobId=\d+/i.test(normalized)
+    )
+  ) {
+    return "linkedin-job";
+  }
+  if (/^https:\/\/www\.linkedin\.com\/search\/results\/people\/?/i.test(normalized)) {
+    return "linkedin-people-search";
+  }
+  if (
+    /^https:\/\/www\.linkedin\.com\/feed(?:[/?#]|\/update\/|$)/i.test(normalized)
+    || /^https:\/\/www\.linkedin\.com\/posts(?:[/?#]|$)/i.test(normalized)
+    || /^https:\/\/www\.linkedin\.com\/company\/[^/]+\/posts(?:[/?#]|$)/i.test(normalized)
+  ) {
+    return "linkedin-post";
+  }
+  return "unsupported";
+}
+
 async function getPageContext(sourceTabId) {
   const requestStartedAt = Date.now();
   const targetTab = await getTabForRequest(sourceTabId);
@@ -1264,7 +1522,7 @@ async function getPageContext(sourceTabId) {
     return {
       supported: false,
       pageType: "unsupported",
-      reason: "Open a LinkedIn profile or messaging thread to use the extension.",
+      reason: "Open a LinkedIn profile, messaging thread, job, or people search to use the extension.",
       tabId: targetTab.id
     };
   }
@@ -1272,18 +1530,17 @@ async function getPageContext(sourceTabId) {
   const pendingMessagingTarget = pendingLinkedInNavigation?.tabId === targetTab.id
     ? normalizeWhitespace(pendingLinkedInNavigation?.targetHref || "")
     : "";
-  const inferredLinkedInPageType = /^https:\/\/www\.linkedin\.com\/messaging\b/i.test(targetTab.url)
-    || /^https:\/\/www\.linkedin\.com\/messaging\b/i.test(pendingMessagingTarget)
+  const inferredLinkedInPageType = inferLinkedInPageTypeFromUrl(pendingMessagingTarget) === "linkedin-messaging"
     ? "linkedin-messaging"
-    : /^https:\/\/www\.linkedin\.com\/in\/[^/]+(?:\/.*)?$/i.test(targetTab.url)
-      ? "linkedin-profile"
-      : "unsupported";
+    : inferLinkedInPageTypeFromUrl(targetTab.url);
 
   const maxAttempts = inferredLinkedInPageType === "linkedin-messaging"
     ? 6
     : inferredLinkedInPageType === "linkedin-profile"
       ? 2
-      : 3;
+      : inferredLinkedInPageType === "linkedin-job" || inferredLinkedInPageType === "linkedin-people-search" || inferredLinkedInPageType === "linkedin-post"
+        ? 2
+        : 3;
   const requestDebug = {
     background_page_context_ms: 0,
     background_page_context_attempts_planned: maxAttempts,
@@ -1349,7 +1606,7 @@ async function getPageContext(sourceTabId) {
     }));
     const sendStartedAt = Date.now();
     const response = normalizeMessagingContextForTab(
-      await safeSendLinkedInMessage(targetTab.id, { type: MESSAGE_TYPES.GET_PAGE_CONTEXT })
+      await sendLinkedInMessageToBestFrame(targetTab.id, { type: MESSAGE_TYPES.GET_PAGE_CONTEXT })
     );
     requestDebug.background_page_context_send_ms += roundMs(Date.now() - sendStartedAt);
     lastResponse = response;
@@ -1359,7 +1616,13 @@ async function getPageContext(sourceTabId) {
     requestDebug.background_page_context_last_response_page_url = normalizeWhitespace(response?.pageUrl || "");
     requestDebug.background_page_context_last_response_frame_id = Number.isInteger(response?._frameId) ? response._frameId : null;
     if (response?.ok) {
-      const responsePageType = response.pageType === "linkedin-messaging" || response.pageType === "linkedin-profile"
+      const responsePageType = [
+        "linkedin-messaging",
+        "linkedin-profile",
+        "linkedin-job",
+        "linkedin-people-search",
+        "linkedin-post"
+      ].includes(response.pageType)
         ? response.pageType
         : inferredLinkedInPageType;
       if (responsePageType === "linkedin-messaging" && !response.supported) {
@@ -1376,6 +1639,29 @@ async function getPageContext(sourceTabId) {
           reason: response.reason || "Loading profile...",
           pageUrl: response.pageUrl || targetTab.url
         };
+      } else if (responsePageType === "linkedin-job" && !response.supported) {
+        const isInferredJobResponse = response.pageType !== "linkedin-job";
+        lastResponse = {
+          ...response,
+          pageType: "linkedin-job",
+          reason: isInferredJobResponse ? "Loading job..." : response.reason || "Loading job...",
+          pageUrl: response.pageUrl || targetTab.url
+        };
+      } else if (responsePageType === "linkedin-people-search" && !response.supported) {
+        const isInferredPeopleSearchResponse = response.pageType !== "linkedin-people-search";
+        lastResponse = {
+          ...response,
+          pageType: "linkedin-people-search",
+          reason: isInferredPeopleSearchResponse ? "Loading people search..." : response.reason || "Loading people search...",
+          pageUrl: response.pageUrl || targetTab.url
+        };
+      } else if (responsePageType === "linkedin-post" && !response.supported) {
+        lastResponse = {
+          ...response,
+          pageType: "linkedin-post",
+          reason: response.reason || "Open a visible LinkedIn feed or company post.",
+          pageUrl: response.pageUrl || targetTab.url
+        };
       }
       const looksReady = response.supported
         || (
@@ -1383,7 +1669,13 @@ async function getPageContext(sourceTabId) {
             ? !/loading selected conversation/i.test(response.reason || "")
             : responsePageType === "linkedin-profile"
               ? !/loading profile/i.test(response.reason || "")
-              : true
+              : responsePageType === "linkedin-job"
+                ? !/loading job/i.test(response.reason || "")
+                : responsePageType === "linkedin-people-search"
+                  ? !/no people results found yet|loading people search/i.test(response.reason || "")
+                  : responsePageType === "linkedin-post"
+                    ? true
+                    : true
         );
       if (looksReady) {
         const resolvedPageUrl = isLinkedInUrl(lastResponse?.pageUrl)
@@ -1415,7 +1707,13 @@ async function getPageContext(sourceTabId) {
         ? "Loading selected conversation..."
         : inferredLinkedInPageType === "linkedin-profile"
           ? "Loading profile..."
-        : lastResponse?.error || "Unable to inspect the current page.",
+          : inferredLinkedInPageType === "linkedin-job"
+            ? "Loading job..."
+            : inferredLinkedInPageType === "linkedin-people-search"
+              ? "Loading people search..."
+              : inferredLinkedInPageType === "linkedin-post"
+                ? "Open a visible LinkedIn feed or company post."
+              : lastResponse?.error || "Unable to inspect the current page.",
       pageUrl: targetTab.url,
       tabId: targetTab.id
     }, {
@@ -1430,11 +1728,19 @@ async function getPageContext(sourceTabId) {
       ? "linkedin-messaging"
       : inferredLinkedInPageType === "linkedin-profile" && !lastResponse?.supported
         ? "linkedin-profile"
+        : inferredLinkedInPageType === "linkedin-post" && !lastResponse?.supported
+          ? "linkedin-post"
         : lastResponse?.pageType,
     reason: inferredLinkedInPageType === "linkedin-messaging" && !lastResponse?.supported
       ? lastResponse?.reason || "Loading selected conversation..."
       : inferredLinkedInPageType === "linkedin-profile" && !lastResponse?.supported
       ? lastResponse?.reason || "Loading profile..."
+      : inferredLinkedInPageType === "linkedin-job" && !lastResponse?.supported
+      ? lastResponse?.reason || "Loading job..."
+      : inferredLinkedInPageType === "linkedin-people-search" && !lastResponse?.supported
+      ? lastResponse?.reason || "Loading people search..."
+      : inferredLinkedInPageType === "linkedin-post" && !lastResponse?.supported
+      ? lastResponse?.reason || "Open a visible LinkedIn feed or company post."
       : lastResponse?.reason,
     tabId: targetTab.id
   }, {
@@ -1472,6 +1778,37 @@ async function extractLinkedInWorkspaceContext(sourceTabId, options) {
       background_extract_workspace_ms: roundMs(Date.now() - startedAt)
     },
     tabId: targetTab.id
+  };
+}
+
+async function captureLinkedInPostDiscussion(sourceTabId) {
+  const startedAt = Date.now();
+  const targetTab = await getTabForRequest(sourceTabId);
+  if (!targetTab?.id || !isLinkedInUrl(targetTab.url)) {
+    return {
+      ok: false,
+      error: "Open a LinkedIn feed or company post before capturing discussion context."
+    };
+  }
+  const response = await safeSendLinkedInMessage(targetTab.id, {
+    type: MESSAGE_TYPES.CAPTURE_LINKEDIN_POST_DISCUSSION
+  });
+  if (!response?.ok) {
+    return {
+      ok: false,
+      error: response?.error || "Unable to capture the visible LinkedIn post discussion.",
+      debug: response?.debug || null
+    };
+  }
+  return {
+    ...response,
+    pageUrl: isLinkedInUrl(response?.pageUrl) ? response.pageUrl : normalizeWhitespace(targetTab.url || ""),
+    tabId: targetTab.id,
+    debug: {
+      ...(response?.debug || {}),
+      background_post_capture_frame_id: Number.isInteger(response?._frameId) ? response._frameId : null,
+      background_post_capture_ms: roundMs(Date.now() - startedAt)
+    }
   };
 }
 
@@ -1738,6 +2075,37 @@ async function sendGenerationProgress(requestId, sourceTabId, text, meta) {
   }
 }
 
+async function sendPostSuggestionProgress(requestId, sourceTabId, text, meta) {
+  if (!requestId || !normalizeWhitespace(text)) {
+    return;
+  }
+  try {
+    await chrome.runtime.sendMessage({
+      type: MESSAGE_TYPES.POST_SUGGESTIONS_PROGRESS,
+      requestId,
+      sourceTabId: typeof sourceTabId === "number" ? sourceTabId : null,
+      provider: normalizeLlmProvider(meta?.provider || DEFAULT_LLM_PROVIDER),
+      status: normalizeWhitespace(meta?.status || "running") || "running",
+      progressPercent: Number.isFinite(Number(meta?.progressPercent)) ? Number(meta.progressPercent) : 0,
+      outputChars: Number.isFinite(Number(meta?.outputChars)) ? Number(meta.outputChars) : 0,
+      text: normalizeWhitespace(text)
+    });
+  } catch (_error) {
+    // Ignore sidepanel delivery issues.
+  }
+}
+
+async function sendPostSuggestionLifecycleMessage(type, payload) {
+  try {
+    await chrome.runtime.sendMessage({
+      type,
+      ...(payload || {})
+    });
+  } catch (_error) {
+    // Ignore sidepanel delivery issues.
+  }
+}
+
 async function sendGenerationLifecycleMessage(type, payload) {
   try {
     await chrome.runtime.sendMessage({
@@ -1790,6 +2158,267 @@ function resolveThreadUrl(provider, candidateUrl, fallbackUrl) {
   return isProviderUrl(provider, normalizedFallback) ? normalizedFallback : "";
 }
 
+function parseJobJsonWithValidator(rawOutput, validator) {
+  try {
+    const result = validator(rawOutput);
+    if (result?.ok) {
+      return result;
+    }
+    return {
+      ok: false,
+      errors: Array.isArray(result?.errors) && result.errors.length
+        ? result.errors
+        : ["Provider response did not match the required JSON contract."],
+      raw: result?.raw || null
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      errors: [error?.message || String(error)],
+      raw: null
+    };
+  }
+}
+
+function buildJobJsonRepairPrompt(contractName, errors, rawOutput) {
+  return [
+    `Your previous ${contractName} response failed validation.`,
+    "Return corrected JSON only. Do not include markdown or prose.",
+    "Use plain JSON string values only. URL fields must be plain absolute URLs, not Markdown links.",
+    "Escape quotation marks inside JSON strings.",
+    "Validation errors:",
+    (Array.isArray(errors) ? errors : [])
+      .map((error) => `- ${normalizeWhitespace(error)}`)
+      .join("\n") || "- Unknown validation failure.",
+    "",
+    "Previous raw response:",
+    normalizeWhitespace(rawOutput).slice(0, 12000)
+  ].join("\n");
+}
+
+async function runProviderJsonPromptWithRetry({ prompt, validator, contractName, sourceTabId, runnerOptions, onProgress }) {
+  const provider = normalizeLlmProvider(runnerOptions?.provider || DEFAULT_LLM_PROVIDER);
+  const providerName = providerDisplayName(provider);
+  const entryUrl = normalizeUrl(runnerOptions?.entryUrl || defaultLlmEntryUrl(provider)) || defaultLlmEntryUrl(provider);
+  const previousTab = await getActiveTab();
+  const previousTabId = previousTab?.id || null;
+  let providerTab = null;
+  let lastRawOutput = "";
+  let lastErrors = [];
+  const startedAt = Date.now();
+
+  try {
+    await onProgress?.(`Opening ${providerName}.`, {
+      provider,
+      status: "opening_provider",
+      progressPercent: 6
+    });
+    providerTab = await ensureProviderTab(provider, entryUrl, { preferFreshTab: true });
+    if (!providerTab?.id) {
+      throw new Error(`No ${providerName} tab available.`);
+    }
+    setLastProviderTabId(provider, providerTab.id);
+
+    let promptToSend = prompt;
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      const messageType = attempt === 1 ? MESSAGE_TYPES.RUN_PROMPT : MESSAGE_TYPES.RETRY_RUN;
+      await onProgress?.(attempt === 1 ? `Sending prompt to ${providerName}.` : `Sending repair prompt to ${providerName}.`, {
+        provider,
+        status: attempt === 1 ? "submitting_prompt" : "submitting_repair",
+        attempt,
+        progressPercent: attempt === 1 ? 10 : 72
+      });
+      const startResponse = await sendPromptToProviderTab(provider, providerTab.id, messageType, promptToSend, previousTabId);
+      if (!startResponse?.ok) {
+        throw new Error(startResponse?.error || `Unable to submit ${contractName} prompt to ${providerName}.`);
+      }
+
+      const waitStartedAt = Date.now();
+      while (Date.now() - waitStartedAt < CHATGPT_TOTAL_WAIT_MS) {
+        const readResponse = await safeSendMessage(providerTab.id, {
+          type: MESSAGE_TYPES.READ_RESPONSE,
+          maxWaitMs: PROVIDER_BACKGROUND_READ_MAX_WAIT_MS,
+          stallWaitMs: PROVIDER_BACKGROUND_READ_STALL_MS
+        });
+        if (!readResponse?.ok) {
+          throw new Error(readResponse?.error || `Unable to read ${providerName} response.`);
+        }
+
+        lastRawOutput = String(readResponse.rawOutput || lastRawOutput || "").trim();
+        if (readResponse.status === "still_generating") {
+          const progress = formatGenerationProgressText(providerName, lastRawOutput, Date.now() - waitStartedAt);
+          await onProgress?.(progress.text, {
+            provider,
+            status: "generating",
+            attempt,
+            progressPercent: progress.percent,
+            outputChars: progress.chars
+          });
+          const partialValidation = parseJobJsonWithValidator(lastRawOutput, validator);
+          if (partialValidation.ok) {
+            await onProgress?.(`${providerName} returned valid JSON.`, {
+              provider,
+              status: "valid_json",
+              attempt,
+              progressPercent: 90
+            });
+            return {
+              ok: true,
+              attempt,
+              rawOutput: lastRawOutput,
+              value: partialValidation.value,
+              provider,
+              providerTabId: providerTab.id,
+              timings: { llm_total_ms: roundMs(Date.now() - startedAt) }
+            };
+          }
+          await delay(PROVIDER_BACKGROUND_POLL_DELAY_MS);
+          continue;
+        }
+
+        if (readResponse.status === "complete" || readResponse.status === "stalled" || readResponse.status === "no_response") {
+          const providerState = await readProviderTabState(provider, providerTab.id);
+          const candidateOutput = String(providerState?.latestResponseText || lastRawOutput || "").trim();
+          lastRawOutput = candidateOutput || lastRawOutput;
+          const validation = parseJobJsonWithValidator(lastRawOutput, validator);
+          if (validation.ok) {
+            return {
+              ok: true,
+              attempt,
+              rawOutput: lastRawOutput,
+              value: validation.value,
+              provider,
+              providerTabId: providerTab.id,
+              threadUrl: resolveThreadUrl(provider, providerState?.currentUrl || "", entryUrl),
+              timings: { llm_total_ms: roundMs(Date.now() - startedAt) }
+            };
+          }
+          lastErrors = validation.errors || [];
+          if (attempt >= 2) {
+            throw new Error(lastErrors.join(" ") || `${contractName} response failed validation.`);
+          }
+          await onProgress?.(`Repairing ${contractName} JSON.`, {
+            provider,
+            status: "repairing_json",
+            attempt,
+            errors: lastErrors,
+            progressPercent: 70
+          });
+          promptToSend = buildJobJsonRepairPrompt(contractName, lastErrors, lastRawOutput);
+          lastRawOutput = "";
+          await delay(1000);
+          break;
+        }
+
+        await delay(PROVIDER_BACKGROUND_POLL_DELAY_MS);
+      }
+    }
+  } finally {
+    if (providerTab?.id) {
+      try {
+        await chrome.tabs.remove(providerTab.id);
+      } catch (_error) {
+        // Ignore cleanup failure.
+      }
+      if (getLastProviderTabId(provider) === providerTab.id) {
+        setLastProviderTabId(provider, null);
+      }
+    }
+    if (previousTabId) {
+      await restoreActiveTab(previousTabId).catch(() => {});
+    }
+    await hideLinkedInPageActivityOverlay(sourceTabId).catch(() => {});
+  }
+
+  throw new Error(lastErrors.join(" ") || `${contractName} response failed validation.`);
+}
+
+async function runPostSuggestionWorkflow(message) {
+  const requestId = normalizeWhitespace(message?.requestId) || `post_suggestions_${Date.now()}`;
+  const sourceTabId = typeof message?.sourceTabId === "number" ? message.sourceTabId : null;
+  const draftCharacterLimit = normalizeDraftCharacterLimit(message?.draftCharacterLimit);
+  const progress = (text, meta) => sendPostSuggestionProgress(requestId, sourceTabId, text, meta);
+  const startedAt = Date.now();
+  try {
+    await progress("Reading the visible LinkedIn post.", {
+      status: "capturing_context",
+      progressPercent: 4
+    });
+    const captured = message?.postDiscussion
+      ? {
+        ok: true,
+        postDiscussion: message.postDiscussion
+      }
+      : await captureLinkedInPostDiscussion(sourceTabId);
+    if (!captured?.ok || !captured?.postDiscussion) {
+      throw new Error(captured?.error || "Capture the visible post discussion first.");
+    }
+
+    const stored = await getStoredState();
+    await ensurePromptPackReady(stored.promptPackSettings);
+    const promptSettings = normalizePromptSettings(stored.promptSettings || defaultPromptSettings());
+    const runnerOptions = {
+      provider: promptSettings.llmProvider,
+      entryUrl: promptSettings.llmEntryUrl
+    };
+    const promptPayload = buildPostSuggestionPrompt(
+      captured.postDiscussion,
+      stored.myProfile || defaultMyProfile(),
+      promptSettings,
+      {
+        draftCharacterLimit,
+        promptPackSettings: stored.promptPackSettings
+      }
+    );
+
+    await progress("Preparing suggestion prompt.", {
+      status: "building_prompt",
+      progressPercent: 10,
+      provider: promptSettings.llmProvider
+    });
+    const generation = await enqueueChatGptRun(() => runProviderJsonPromptWithRetry({
+      prompt: promptPayload.prompt,
+      validator: (rawOutput) => validatePostSuggestionResult(rawOutput, { draftCharacterLimit }),
+      contractName: POST_SUGGESTION_CONTRACT_VERSION,
+      sourceTabId,
+      runnerOptions,
+      onProgress: progress
+    }));
+
+    const result = {
+      postSummary: normalizeWhitespace(generation.value?.postSummary),
+      interactionRead: normalizeWhitespace(generation.value?.interactionRead),
+      suggestions: Array.isArray(generation.value?.suggestions) ? generation.value.suggestions : [],
+      provider: generation.provider,
+      threadUrl: normalizeWhitespace(generation.threadUrl || ""),
+      prompt: promptPayload.prompt
+    };
+    await sendPostSuggestionLifecycleMessage(MESSAGE_TYPES.POST_SUGGESTIONS_COMPLETE, {
+      requestId,
+      sourceTabId,
+      result,
+      postDiscussion: captured.postDiscussion,
+      diagnostics: {
+        provider: generation.provider,
+        attempt: generation.attempt,
+        timings: generation.timings || null,
+        totalMs: roundMs(Date.now() - startedAt)
+      }
+    });
+    return { ok: true, requestId };
+  } catch (error) {
+    await sendPostSuggestionLifecycleMessage(MESSAGE_TYPES.POST_SUGGESTIONS_FAILED, {
+      requestId,
+      sourceTabId,
+      error: error?.message || String(error),
+      diagnostics: {
+        totalMs: roundMs(Date.now() - startedAt)
+      }
+    });
+    return { ok: false, requestId, error: error?.message || String(error) };
+  }
+}
+
 function estimateGenerationProgressPercent(rawOutput) {
   const chars = normalizeWhitespace(rawOutput).length;
   if (!chars) {
@@ -1816,7 +2445,7 @@ function formatGenerationProgressText(providerName, rawOutput, elapsedMs) {
   };
 }
 
-function tryValidateProviderOutput(rawOutput, fixedTail, flowType, fallbackProfile) {
+function tryValidateProviderOutput(rawOutput, fixedTail, flowType, fallbackProfile, validationOptions) {
   const normalized = normalizeWhitespace(rawOutput);
   if (!normalized) {
     return null;
@@ -1826,7 +2455,8 @@ function tryValidateProviderOutput(rawOutput, fixedTail, flowType, fallbackProfi
       shared.extractJsonFromText(normalized),
       fixedTail,
       flowType,
-      fallbackProfile
+      fallbackProfile,
+      validationOptions
     );
   } catch (_error) {
     return null;
@@ -1884,6 +2514,7 @@ async function runPromptWithRetries(prompt, fixedTail, runnerOptions, flowType, 
   const providerName = providerDisplayName(provider);
   const entryUrl = normalizeUrl(runnerOptions?.entryUrl || defaultLlmEntryUrl(provider)) || defaultLlmEntryUrl(provider);
   const preferFreshTab = Boolean(runnerOptions?.preferFreshTab);
+  const validationOptions = options?.validationOptions || {};
   const isTemporarySession = provider === "chatgpt" && /[?&]temporary-chat=true\b/i.test(entryUrl);
   const timings = {
     llm_total_ms: 0,
@@ -1983,7 +2614,8 @@ async function runPromptWithRetries(prompt, fixedTail, runnerOptions, flowType, 
               shared.extractJsonFromText(capturedOutput),
               fixedTail,
               flowType,
-              fallbackProfile
+              fallbackProfile,
+              validationOptions
             );
             timings.llm_validate_response_ms += roundMs(Date.now() - validateStartedAt);
             threadUrl = resolveThreadUrl(provider, flashed.currentUrl, entryUrl);
@@ -2033,7 +2665,10 @@ async function runPromptWithRetries(prompt, fixedTail, runnerOptions, flowType, 
               progressPercent: progress.percent,
               outputChars: progress.chars
             });
-            const retryPrompt = buildRetryPrompt(validationError.message || String(validationError));
+            const retryPrompt = buildRetryPrompt(
+              validationError.message || String(validationError),
+              options?.promptPackSettings
+            );
             const retryResponse = await sendPromptToProviderTab(provider, providerTab.id, MESSAGE_TYPES.RETRY_RUN, retryPrompt, previousTabId);
             if (!retryResponse?.ok) {
               throw new Error(retryResponse?.error || `Unable to request a regenerated response from ${providerName}.`);
@@ -2051,7 +2686,7 @@ async function runPromptWithRetries(prompt, fixedTail, runnerOptions, flowType, 
         }
 
         if (readResponse.status === "still_generating") {
-          const validatedWhileGenerating = tryValidateProviderOutput(lastRawOutput, fixedTail, flowType, fallbackProfile);
+          const validatedWhileGenerating = tryValidateProviderOutput(lastRawOutput, fixedTail, flowType, fallbackProfile, validationOptions);
           if (validatedWhileGenerating) {
             await onProgress?.(`Capturing ${providerName} response...`, {
               provider,
@@ -2066,7 +2701,7 @@ async function runPromptWithRetries(prompt, fixedTail, runnerOptions, flowType, 
               jobBinding?.sourceTabId
             );
             const capturedOutput = normalizeWhitespace(flashed.rawOutput || lastRawOutput);
-            const validatedCaptured = tryValidateProviderOutput(capturedOutput, fixedTail, flowType, fallbackProfile) || validatedWhileGenerating;
+            const validatedCaptured = tryValidateProviderOutput(capturedOutput, fixedTail, flowType, fallbackProfile, validationOptions) || validatedWhileGenerating;
             threadUrl = resolveThreadUrl(provider, flashed.currentUrl, entryUrl);
             await onProgress?.("Finalizing draft...", {
               provider,
@@ -2116,7 +2751,7 @@ async function runPromptWithRetries(prompt, fixedTail, runnerOptions, flowType, 
           const stateResponse = await readProviderTabState(provider, providerTab.id);
           const stateChars = Number(stateResponse?.latestResponseLength || 0);
           const candidateOutput = normalizeWhitespace(stateResponse?.latestResponseText || lastRawOutput);
-          const validatedFromCandidate = tryValidateProviderOutput(candidateOutput, fixedTail, flowType, fallbackProfile);
+          const validatedFromCandidate = tryValidateProviderOutput(candidateOutput, fixedTail, flowType, fallbackProfile, validationOptions);
           if (validatedFromCandidate) {
             await onProgress?.(`Capturing ${providerName} response...`, {
               provider,
@@ -2131,7 +2766,7 @@ async function runPromptWithRetries(prompt, fixedTail, runnerOptions, flowType, 
               jobBinding?.sourceTabId
             );
             const capturedOutput = normalizeWhitespace(flashed.rawOutput || candidateOutput);
-            const validatedCaptured = tryValidateProviderOutput(capturedOutput, fixedTail, flowType, fallbackProfile) || validatedFromCandidate;
+            const validatedCaptured = tryValidateProviderOutput(capturedOutput, fixedTail, flowType, fallbackProfile, validationOptions) || validatedFromCandidate;
             const stateProgress = formatGenerationProgressText(
               providerName,
               capturedOutput,
@@ -2259,8 +2894,10 @@ async function getStoredState() {
     STORAGE_KEYS.myProfile,
     STORAGE_KEYS.fixedTail,
     STORAGE_KEYS.promptSettings,
+    STORAGE_KEYS.promptPackSettings,
     STORAGE_KEYS.chatGptProjectUrl,
     STORAGE_KEYS.people,
+    STORAGE_KEYS.jobOutreach,
     STORAGE_KEYS.tabPersonBindings,
     STORAGE_KEYS.threadPersonBindings,
     STORAGE_KEYS.profileRedirects,
@@ -2269,6 +2906,7 @@ async function getStoredState() {
 
   const rawPeople = stored[STORAGE_KEYS.people] || {};
   const rawPromptSettings = stored[STORAGE_KEYS.promptSettings] || defaultPromptSettings();
+  const rawPromptPackSettings = stored[STORAGE_KEYS.promptPackSettings] || defaultPromptPackSettings();
   const legacyChatGptProjectUrl = stored[STORAGE_KEYS.chatGptProjectUrl] || DEFAULT_CHATGPT_PROJECT_URL;
   const people = Object.fromEntries(
     Object.entries(rawPeople)
@@ -2280,14 +2918,18 @@ async function getStoredState() {
   );
   return {
     myProfile: stored[STORAGE_KEYS.myProfile] || defaultMyProfile(),
-    fixedTail: normalizeFixedTail(stored[STORAGE_KEYS.fixedTail] || FIXED_TAIL),
+    fixedTail: Object.prototype.hasOwnProperty.call(stored, STORAGE_KEYS.fixedTail)
+      ? normalizeFixedTail(stored[STORAGE_KEYS.fixedTail])
+      : FIXED_TAIL,
     promptSettings: normalizePromptSettings({
       ...rawPromptSettings,
       llmEntryUrl: normalizeWhitespace(rawPromptSettings?.llmEntryUrl || "")
         || (normalizeLlmProvider(rawPromptSettings?.llmProvider) === "chatgpt" ? legacyChatGptProjectUrl : "")
     }),
+    promptPackSettings: normalizePromptPackSettings(rawPromptPackSettings),
     chatGptProjectUrl: legacyChatGptProjectUrl,
     people,
+    jobOutreach: normalizeJobOutreachStore(stored[STORAGE_KEYS.jobOutreach]),
     tabPersonBindings: stored[STORAGE_KEYS.tabPersonBindings] || {},
     threadPersonBindings: stored[STORAGE_KEYS.threadPersonBindings] || {},
     profileRedirects: stored[STORAGE_KEYS.profileRedirects] || {},
@@ -2429,16 +3071,39 @@ function chooseCanonicalPersonId(records, preferredPersonId) {
     .filter((entry) => entry && typeof entry === "object")
     .map((entry) => ({
       personId: normalizeWhitespace(entry.personId),
-      strength: personRecordStrength(entry)
+      strength: personRecordStrength(entry),
+      stableDerivedPersonId: stableDerivedPersonIdForRecord(entry),
+      hasThreadContext: Boolean(
+        normalizeUrl(entry.messagingThreadUrl)
+        || normalizeUrl(getDraftWorkspace(entry)?.conversation?.threadUrl)
+      )
     }))
     .filter((entry) => entry.personId);
+
+  const threadBackedEntries = explicitEntries
+    .filter((entry) => entry.hasThreadContext)
+    .sort((left, right) =>
+      right.strength - left.strength
+        || Number(isOpaqueLinkedInPersonId(right.personId)) - Number(isOpaqueLinkedInPersonId(left.personId))
+        || Number(isPublicSlugPersonId(right.personId)) - Number(isPublicSlugPersonId(left.personId))
+    );
+  if (threadBackedEntries.length === 1) {
+    return threadBackedEntries[0].personId;
+  }
+  if (threadBackedEntries.length > 1 && normalizedPreferredPersonId) {
+    const preferredThreadBacked = threadBackedEntries.find((entry) => entry.personId === normalizedPreferredPersonId);
+    if (preferredThreadBacked) {
+      return preferredThreadBacked.personId;
+    }
+  }
 
   if (normalizedPreferredPersonId && explicitEntries.some((entry) => entry.personId === normalizedPreferredPersonId)) {
     return normalizedPreferredPersonId;
   }
 
   explicitEntries.sort((left, right) =>
-    right.strength - left.strength
+    Number(right.hasThreadContext) - Number(left.hasThreadContext)
+      || right.strength - left.strength
       || Number(isPublicSlugPersonId(right.personId)) - Number(isPublicSlugPersonId(left.personId))
       || Number(isOpaqueLinkedInPersonId(right.personId)) - Number(isOpaqueLinkedInPersonId(left.personId))
   );
@@ -2958,6 +3623,14 @@ function resolveStoredPersonMatch(pageContext, stored) {
   if (isOwnProfilePageContext(pageContext, stored)) {
     return { matchedRecord: null, identityWarning: null, matchType: "own_profile" };
   }
+  const pendingProfileHandoff = getPendingProfileIdentityHandoffForPage(pageContext, stored);
+  if (pendingProfileHandoff?.record) {
+    return {
+      matchedRecord: pendingProfileHandoff.record,
+      identityWarning: null,
+      matchType: "pending_profile_handoff"
+    };
+  }
   const people = stored?.people || {};
   const recentProfileClickMatch = resolveProfileClickTraceMatch(pageContext, stored);
   if (recentProfileClickMatch?.record) {
@@ -2978,6 +3651,20 @@ function resolveStoredPersonMatch(pageContext, stored) {
   const previewOpaqueUrl = identityHints.previewOpaqueUrl;
   const previewPublicUrl = identityHints.previewPublicUrl;
   const previewNameHeadlineSignature = identityHints.previewNameHeadlineSignature;
+  if (pageContext?.pageType === "linkedin-profile" && sourceTabId !== null) {
+    const boundPersonId = normalizeWhitespace(stored?.tabPersonBindings?.[String(sourceTabId)]);
+    const boundRecord = boundPersonId ? people[boundPersonId] : null;
+    if (
+      boundRecord
+      && normalizeUrl(boundRecord.messagingThreadUrl)
+      && (
+        recordMatchesExplicitPageIdentity(boundRecord, pageContext)
+        || recordMatchesProfileNameHeadline(boundRecord, pageContext)
+      )
+    ) {
+      return { matchedRecord: boundRecord, identityWarning: null, matchType: "tab_binding_profile_person" };
+    }
+  }
 
   if (previewId && people[previewId]) {
     return { matchedRecord: people[previewId], identityWarning: null, matchType: "person_id" };
@@ -3239,6 +3926,51 @@ function mergeCurrentPerson(pageContext, existingRecord) {
   });
 }
 
+function linkProfileUrlToPersonRecord(personRecord, profileUrl) {
+  const normalizedProfileUrl = normalizeLinkedInProfileUrl(profileUrl);
+  if (!personRecord?.personId || !normalizedProfileUrl) {
+    return personRecord || null;
+  }
+  const isOpaqueProfileUrl = shouldResolveLinkedInProfileUrl(normalizedProfileUrl);
+  return mergePersonRecord(personRecord, {
+    profileUrl: normalizedProfileUrl,
+    identity: {
+      profileUrl: normalizedProfileUrl,
+      primaryLinkedInMemberUrl: isOpaqueProfileUrl
+        ? normalizedProfileUrl
+        : primaryLinkedInMemberUrl(personRecord),
+      publicProfileUrl: !isOpaqueProfileUrl
+        ? normalizedProfileUrl
+        : publicProfileUrl(personRecord),
+      knownProfileUrls: Array.from(new Set([
+        ...knownProfileUrls(personRecord),
+        normalizedProfileUrl
+      ].filter(Boolean))),
+      aliases: Array.from(new Set([
+        ...(Array.isArray(personRecord?.identity?.aliases) ? personRecord.identity.aliases : []),
+        linkedInProfileAlias(normalizedProfileUrl)
+      ].filter(Boolean))),
+      identityStatus: "resolved",
+      identityConfidence: isOpaqueProfileUrl ? "high" : "medium"
+    },
+    updatedAt: toIsoNow()
+  });
+}
+
+function resolveLinkProfileTargetPerson(explicitPersonId, hintedPersonRecord, stored) {
+  const normalizedExplicitPersonId = normalizeWhitespace(explicitPersonId);
+  if (normalizedExplicitPersonId && stored?.people?.[normalizedExplicitPersonId]) {
+    return stored.people[normalizedExplicitPersonId];
+  }
+
+  const normalizedHint = hintedPersonRecord ? normalizePersonRecord(hintedPersonRecord) : null;
+  if (!normalizedHint?.personId) {
+    return null;
+  }
+
+  return mergePersonRecord(stored?.people?.[normalizedHint.personId], normalizedHint);
+}
+
 function findMatchingStoredPerson(pageContext, stored) {
   return resolveStoredPersonMatch(pageContext, stored).matchedRecord;
 }
@@ -3267,6 +3999,20 @@ function shouldMergeDuplicatePersonRecords(baseRecord, candidateRecord) {
   if (hasMatchingIdentityAlias(baseRecord, candidateRecord)) {
     return true;
   }
+  const crossSurfaceSlugPair = (
+    (isOpaqueLinkedInPersonId(baseId) && isPublicSlugPersonId(candidateId))
+    || (isPublicSlugPersonId(baseId) && isOpaqueLinkedInPersonId(candidateId))
+  );
+  if (
+    crossSurfaceSlugPair
+    && hasMatchingNameEvidence(baseRecord, candidateRecord)
+    && (
+      hasMatchingHeadlinePrefixEvidence(baseRecord, candidateRecord)
+      || hasMatchingProfileEvidence(baseRecord, candidateRecord)
+    )
+  ) {
+    return true;
+  }
   return false;
 }
 
@@ -3291,6 +4037,22 @@ function mergeDuplicatePersonEntries(personRecord, stored) {
   ], personRecord.personId);
   if (canonicalPersonId) {
     combined.personId = canonicalPersonId;
+  }
+
+  const canonicalRecordUuid = normalizeWhitespace(
+    people[combined.personId]?.uuid
+    || people[combined.personId]?.system?.recordUuid
+    || seed?.uuid
+    || seed?.system?.recordUuid
+    || personRecord?.uuid
+    || personRecord?.system?.recordUuid
+  );
+  if (canonicalRecordUuid) {
+    combined.uuid = canonicalRecordUuid;
+    combined.system = {
+      ...(combined.system || {}),
+      recordUuid: canonicalRecordUuid
+    };
   }
 
   const nextPeople = { ...people };
@@ -3703,6 +4465,15 @@ function headlineQualityScore(value) {
   if (!text) {
     return 0;
   }
+  if (/^explore premium profiles\b/i.test(lower)) {
+    return -100;
+  }
+  if (/reposted this$/i.test(lower)) {
+    return -80;
+  }
+  if (/\bmessage\b/i.test(text) && /\b(?:1st|2nd|3rd\+?|\d+(?:st|nd|rd|th))\b/i.test(text)) {
+    return -60;
+  }
   if (/^(he\/him|she\/her|they\/them)(\s*[·|]\s*\d+(?:st|nd|rd|th))?$/i.test(text)) {
     return 1;
   }
@@ -3713,7 +4484,7 @@ function headlineQualityScore(value) {
   if (/[|]/.test(text)) {
     score += 4;
   }
-  if (/(manager|director|founder|student|mba|som|product|engineer|strategy|marketing|sales|ads|platform|banking|fintech|ai|risk|fraud|recruiter|talent|acquisition|specialist|analyst|consultant|associate|intern)/i.test(text)) {
+  if (/(manager|director|founder|student|mba|som|product|engineer|strategy|marketing|sales|ads|platform|banking|fintech|ai|risk|fraud|recruiter|talent|acquisition|specialist|analyst|consultant|associate|intern|partnership|partnerships|account)/i.test(text)) {
     score += 3;
   }
   if (text.length >= 12 && text.length <= 160) {
@@ -3814,6 +4585,24 @@ function isFullProfileExtractionContext(pageContext) {
       normalizeWhitespace(pageContext?.debug?.profile_timing_mode) === "full"
       || normalizeWhitespace(pageContext?.debug?.workspace_context_scroll_mode) === "full_profile"
     );
+}
+
+function hasFullProfileSectionData(profile) {
+  return Boolean(
+    normalizeWhitespace(profile?.about)
+    || (Array.isArray(profile?.experienceHighlights) && profile.experienceHighlights.length)
+    || (Array.isArray(profile?.educationHighlights) && profile.educationHighlights.length)
+    || (Array.isArray(profile?.activitySnippets) && profile.activitySnippets.length)
+  );
+}
+
+function isForcedFullProfileExtractionResponse(response) {
+  const debug = response?.debug || {};
+  return normalizeWhitespace(debug.profile_timing_mode) === "full"
+    && normalizeWhitespace(debug.profile_scroll_strategy) === "forced_progressive_full_refresh"
+    && Number(debug.profile_scroll_passes_run || 0) > 0
+    && Number(debug.profile_scroll_steps_run || 0) > 0
+    && hasFullProfileSectionData(response?.profile);
 }
 
 async function syncActivityContextIfNeeded(pageContext, stored, currentPerson) {
@@ -4135,6 +4924,7 @@ if (chrome.webNavigation?.onHistoryStateUpdated) {
     }
     rememberLinkedInTab(details.tabId, details.url);
     notifyPageContextChanged(details.tabId, details.url);
+    maybeResolvePendingProfileIdentityHandoff(details.tabId, details.url).catch(() => {});
   }, {
     url: [{ hostEquals: "www.linkedin.com" }]
   });
@@ -4167,6 +4957,7 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   if (changeInfo.url || changeInfo.status === "loading" || changeInfo.status === "complete") {
     notifyPageContextChanged(tabId, changeInfo.url || tab.url);
   }
+  maybeResolvePendingProfileIdentityHandoff(tabId, changeInfo.url || tab.url).catch(() => {});
 });
 
 chrome.tabs.onActivated.addListener(async (activeInfo) => {
@@ -4181,6 +4972,7 @@ chrome.tabs.onActivated.addListener(async (activeInfo) => {
 chrome.tabs.onRemoved.addListener((tabId) => {
   clearMessagingReload(tabId);
   linkedInTabUrls.delete(tabId);
+  clearPendingProfileIdentityHandoff(tabId);
   const removedProviderBinding = providerTabBindings.get(tabId) || null;
   if (removedProviderBinding?.provider && typeof removedProviderBinding?.sourceTabId === "number") {
     sourceTabProviderBindings.delete(`${removedProviderBinding.provider}:${removedProviderBinding.sourceTabId}`);
@@ -4245,6 +5037,7 @@ async function executeGenerationJob(job) {
     job?.requestContext?.pageContext?.conversation?.threadUrl
     || job?.requestContext?.personRecord?.messagingThreadUrl
   );
+  const draftCharacterLimit = normalizeDraftCharacterLimit(job.draftCharacterLimit);
 
   const requestedPageContext = job?.requestContext?.pageContext;
   const canReuseRequestedProfileContext = Boolean(
@@ -4314,13 +5107,18 @@ async function executeGenerationJob(job) {
   stored = observedBeforePrompt.stored;
   await sendGenerationProgress(requestId, sourceTabId, "Preparing the draft prompt...");
   stepStartedAt = Date.now();
+  await ensurePromptPackReady(stored.promptPackSettings);
   const promptPayload = buildWorkspacePrompt(
     workspaceContext,
     syncedPerson,
     stored.myProfile,
-    normalizeFixedTail(job.fixedTail || stored.fixedTail || FIXED_TAIL),
+    normalizeFixedTail(job.fixedTail ?? stored.fixedTail),
     stored.promptSettings,
-    job.extraContext
+    job.extraContext,
+    {
+      draftCharacterLimit,
+      promptPackSettings: stored.promptPackSettings
+    }
   );
   generationTiming.draft_prompt_build_ms = roundMs(Date.now() - stepStartedAt);
   const llmRunner = normalizePromptSettings(stored.promptSettings || defaultPromptSettings());
@@ -4337,7 +5135,7 @@ async function executeGenerationJob(job) {
   );
   const generation = await enqueueChatGptRun(() => runPromptWithRetries(
     promptPayload.prompt,
-    normalizeFixedTail(job.fixedTail || stored.fixedTail || FIXED_TAIL),
+    normalizeFixedTail(job.fixedTail ?? stored.fixedTail),
     {
       provider: llmRunner.llmProvider,
       entryUrl: llmRunner.llmEntryUrl,
@@ -4352,7 +5150,9 @@ async function executeGenerationJob(job) {
         requestId,
         sourceTabId
       },
-      onProgress: (text, meta) => sendGenerationProgress(requestId, sourceTabId, text, meta)
+      onProgress: (text, meta) => sendGenerationProgress(requestId, sourceTabId, text, meta),
+      promptPackSettings: stored.promptPackSettings,
+      validationOptions: { draftCharacterLimit }
     }
   ));
   generationTiming.draft_llm_ms = roundMs(generation?.timings?.llm_total_ms || 0);
@@ -4399,6 +5199,7 @@ async function executeGenerationJob(job) {
     messages: generation.result.messages,
     relationship_triage: promptPayload.relationshipTriage,
     extra_context: normalizeWhitespace(job.extraContext),
+    draft_character_limit: draftCharacterLimit,
     providerPrompt: promptPayload.prompt,
     rawOutput: generation.rawOutput,
     recipient_full_name: syncedPerson.fullName,
@@ -4473,6 +5274,2709 @@ async function executeGenerationJob(job) {
       },
       workspaceContextDebug: workspaceContext?.debug || null
     }
+  };
+}
+
+function normalizeJobOutreachJob(job) {
+  const source = job || {};
+  return {
+    title: normalizeWhitespace(source.title),
+    company: normalizeWhitespace(source.company),
+    location: normalizeWhitespace(source.location),
+    datePosted: normalizeWhitespace(source.datePosted),
+    sourceUrl: normalizeWhitespace(source.sourceUrl || source.jobUrl || source.pageUrl),
+    description: normalizeWhitespace(source.description),
+    jobId: normalizeWhitespace(source.jobId)
+  };
+}
+
+function normalizeMyProfileForStorage(profile, previousProfile) {
+  const source = profile || {};
+  const previous = previousProfile || {};
+  const sourceProfileData = source.profileData || source.latestProfileData || {};
+  const previousProfileData = previous.profileData || {};
+  const mergedProfileData = normalizeProfileData({
+    ...previousProfileData,
+    ...sourceProfileData,
+    ...source,
+    profileUrl: source.profileUrl || source.ownProfileUrl || sourceProfileData.profileUrl || previousProfileData.profileUrl || previous.ownProfileUrl
+  }) || null;
+  const visibleSignals = mergedProfileData?.visibleSignals || source.visibleSignals || previous.visibleSignals || {};
+  const activitySnippets = Array.isArray(source.latestActivitySnippets)
+    ? source.latestActivitySnippets
+    : Array.isArray(mergedProfileData?.activitySnippets)
+      ? mergedProfileData.activitySnippets
+      : Array.isArray(source.activitySnippets)
+        ? source.activitySnippets
+        : Array.isArray(previous.latestActivitySnippets)
+          ? previous.latestActivitySnippets
+          : [];
+  return {
+    ...defaultMyProfile(),
+    ...previous,
+    ownProfileUrl: normalizeLinkedInProfileUrl(
+      source.ownProfileUrl
+      || source.profileUrl
+      || sourceProfileData.profileUrl
+      || previousProfileData.profileUrl
+      || previous.ownProfileUrl
+      || ""
+    ),
+    pendingProfileUrl: normalizeLinkedInProfileUrl(source.pendingProfileUrl || ""),
+    manualNotes: normalizeWhitespace(source.manualNotes || previous.manualNotes),
+    fullName: normalizeWhitespace(mergedProfileData?.fullName || source.fullName || previous.fullName),
+    firstName: normalizeWhitespace(mergedProfileData?.firstName || source.firstName || previous.firstName),
+    headline: normalizeWhitespace(mergedProfileData?.headline || source.headline || previous.headline),
+    location: normalizeWhitespace(mergedProfileData?.location || source.location || previous.location),
+    profileSummary: normalizeWhitespace(mergedProfileData?.profileSummary || source.profileSummary || ""),
+    about: normalizeWhitespace(mergedProfileData?.about || source.about || previous.about),
+    experienceHighlights: uniqueStrings(Array.isArray(mergedProfileData?.experienceHighlights) ? mergedProfileData.experienceHighlights : previous.experienceHighlights || []),
+    educationHighlights: uniqueStrings(Array.isArray(mergedProfileData?.educationHighlights) ? mergedProfileData.educationHighlights : previous.educationHighlights || []),
+    activitySnippets: uniqueStrings(Array.isArray(mergedProfileData?.activitySnippets) ? mergedProfileData.activitySnippets : previous.activitySnippets || []),
+    languageSnippets: uniqueStrings(Array.isArray(mergedProfileData?.languageSnippets) ? mergedProfileData.languageSnippets : previous.languageSnippets || []),
+    profileCaptureMode: normalizeWhitespace(mergedProfileData?.profileCaptureMode || source.profileCaptureMode || previous.profileCaptureMode),
+    visibleSignals: {
+      companies: uniqueStrings(visibleSignals.companies || []),
+      schools: uniqueStrings(visibleSignals.schools || []),
+      locations: uniqueStrings(visibleSignals.locations || []),
+      languages: uniqueStrings(visibleSignals.languages || [])
+    },
+    profileFacts: mergedProfileData?.profileFacts || source.profileFacts || previous.profileFacts || null,
+    profileData: mergedProfileData,
+    rawSnapshot: normalizeWhitespace(mergedProfileData?.rawSnapshot || source.rawSnapshot || previous.rawSnapshot),
+    updatedAt: normalizeWhitespace(source.updatedAt) || toIsoNow(),
+    lastActivitySyncedAt: normalizeWhitespace(source.lastActivitySyncedAt || previous.lastActivitySyncedAt),
+    latestActivitySnippets: uniqueStrings(activitySnippets)
+  };
+}
+
+function compactHash(value) {
+  const text = normalizeWhitespace(value);
+  let hash = 2166136261;
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(36);
+}
+
+function jobIdFromJob(job) {
+  const normalized = normalizeJobOutreachJob(job);
+  if (normalized.jobId) {
+    return `li_job_${normalized.jobId}`;
+  }
+  const fromUrl = normalizeWhitespace(normalized.sourceUrl).match(/(?:currentJobId=|\/jobs\/view\/)(\d+)/i)?.[1];
+  if (fromUrl) {
+    return `li_job_${fromUrl}`;
+  }
+  const stableText = [
+    normalized.sourceUrl,
+    normalized.title,
+    normalized.company,
+    normalized.location
+  ].filter(Boolean).join("|");
+  return stableText ? `job_${compactHash(stableText.toLowerCase())}` : "";
+}
+
+function normalizeJobOutreachRunStatus(status) {
+  const normalized = normalizeWhitespace(status).toLowerCase();
+  if (["complete", "ranking_complete", "search_empty_complete"].includes(normalized)) {
+    return "completed";
+  }
+  if ([
+    "queued",
+    "running",
+    "awaiting_user_action",
+    "resuming",
+    "completed",
+    "failed",
+    "cancelled"
+  ].includes(normalized)) {
+    return normalized;
+  }
+  return normalized || "queued";
+}
+
+function isJobOutreachRunTerminalStatus(status) {
+  return ["completed", "failed", "cancelled"].includes(normalizeJobOutreachRunStatus(status));
+}
+
+function isJobOutreachRunActiveStatus(status) {
+  return ["queued", "running", "awaiting_user_action", "resuming"].includes(normalizeJobOutreachRunStatus(status));
+}
+
+function normalizeJobOutreachManualActionSnapshot(action) {
+  if (!action || typeof action !== "object") {
+    return null;
+  }
+  const requestId = normalizeWhitespace(action.requestId);
+  const summary = normalizeWhitespace(action.summary);
+  if (!requestId || !summary) {
+    return null;
+  }
+  return {
+    requestId,
+    searchKey: normalizeWhitespace(action.searchKey),
+    workerTabId: typeof action.workerTabId === "number" ? action.workerTabId : null,
+    summary,
+    detail: normalizeWhitespace(action.detail),
+    reason: normalizeWhitespace(action.reason),
+    status: normalizeJobOutreachRunStatus(action.status || "awaiting_user_action"),
+    progressPercent: Math.max(0, Math.min(100, Number(action.progressPercent || 0))),
+    removableFilters: Array.isArray(action.removableFilters)
+      ? action.removableFilters.map((filter) => ({
+        type: normalizeWhitespace(filter?.type).toLowerCase(),
+        label: normalizeWhitespace(filter?.label || filter?.sourceText || filter?.value),
+        sourceText: normalizeWhitespace(filter?.sourceText || filter?.value || filter?.label),
+        param: normalizeWhitespace(filter?.param || ""),
+        id: normalizeWhitespace(filter?.id || "")
+      })).filter((filter) => filter.type && filter.sourceText)
+      : []
+  };
+}
+
+function normalizeJobOutreachRun(run, fallbackJobId = "") {
+  const source = run && typeof run === "object" ? run : {};
+  const runId = normalizeWhitespace(source.runId || source.requestId);
+  const jobId = normalizeWhitespace(source.jobId || fallbackJobId);
+  if (!runId) {
+    return null;
+  }
+  return {
+    runId,
+    jobId,
+    job: normalizeJobOutreachJob(source.job || {}),
+    createdAt: normalizeWhitespace(source.createdAt),
+    startedAt: normalizeWhitespace(source.startedAt),
+    completedAt: normalizeWhitespace(source.completedAt),
+    updatedAt: normalizeWhitespace(source.updatedAt),
+    sourceTabId: typeof source.sourceTabId === "number" ? source.sourceTabId : null,
+    workerTabId: typeof source.workerTabId === "number" ? source.workerTabId : null,
+    status: normalizeJobOutreachRunStatus(source.status),
+    cancelRequested: Boolean(source.cancelRequested),
+    progressText: normalizeWhitespace(source.progressText || source.text),
+    progressDetail: normalizeWhitespace(source.progressDetail || source.detail),
+    progressPercent: Math.max(0, Math.min(100, Number(source.progressPercent || 0))),
+    sharedCriteria: source.sharedCriteria && typeof source.sharedCriteria === "object"
+      ? {
+        locations: uniqueStrings(source.sharedCriteria.locations || []),
+        schools: uniqueStrings(source.sharedCriteria.schools || []),
+        currentCompany: normalizeWhitespace(source.sharedCriteria.currentCompany)
+      }
+      : { locations: [], schools: [], currentCompany: "" },
+    searches: Array.isArray(source.searches) ? source.searches : [],
+    searchPlan: source.searchPlan || null,
+    rankingPlan: source.rankingPlan || null,
+    rankingInput: source.rankingInput || null,
+    importedPeopleBySearch: (source.importedPeopleBySearch && typeof source.importedPeopleBySearch === "object")
+      ? source.importedPeopleBySearch
+      : (source.peopleBySearch && typeof source.peopleBySearch === "object")
+        ? source.peopleBySearch
+      : {},
+    importedPeopleBySearchKey: (source.importedPeopleBySearchKey && typeof source.importedPeopleBySearchKey === "object")
+      ? source.importedPeopleBySearchKey
+      : (source.peopleBySearchKey && typeof source.peopleBySearchKey === "object")
+        ? source.peopleBySearchKey
+      : {},
+    diagnostics: source.diagnostics || null,
+    manualAction: normalizeJobOutreachManualActionSnapshot(source.manualAction),
+    error: normalizeWhitespace(source.error)
+  };
+}
+
+function mergeJobOutreachRunWithJob(run, job) {
+  const normalizedRun = normalizeJobOutreachRun(run, run?.jobId || job?.jobId || "");
+  if (!normalizedRun) {
+    return null;
+  }
+  const normalizedJob = normalizeJobOutreachJob(job || {});
+  const mergedJob = {
+    ...normalizedJob,
+    ...normalizedRun.job
+  };
+  return {
+    ...normalizedRun,
+    job: {
+      ...mergedJob,
+      title: normalizeWhitespace(normalizedRun.job?.title || normalizedJob.title),
+      company: normalizeWhitespace(normalizedRun.job?.company || normalizedJob.company),
+      location: normalizeWhitespace(normalizedRun.job?.location || normalizedJob.location),
+      datePosted: normalizeWhitespace(normalizedRun.job?.datePosted || normalizedJob.datePosted),
+      applySignal: normalizeWhitespace(normalizedRun.job?.applySignal || normalizedJob.applySignal),
+      promotionSignal: normalizeWhitespace(normalizedRun.job?.promotionSignal || normalizedJob.promotionSignal),
+      sourceUrl: normalizeWhitespace(normalizedRun.job?.sourceUrl || normalizedJob.sourceUrl),
+      description: normalizeWhitespace(normalizedRun.job?.description || normalizedJob.description),
+      jobId: normalizeWhitespace(normalizedRun.job?.jobId || normalizedJob.jobId || normalizedRun.jobId)
+    }
+  };
+}
+
+function normalizeJobOutreachStore(store) {
+  const source = store && typeof store === "object" ? store : {};
+  const jobsById = {};
+  const runsById = {};
+  Object.entries(source.jobsById || {}).forEach(([jobId, record]) => {
+    const key = normalizeWhitespace(record?.jobId || jobId);
+    if (!key) {
+      return;
+    }
+    const job = normalizeJobOutreachJob(record?.job || {});
+    const latestRun = mergeJobOutreachRunWithJob(record?.latestRun, job);
+    if (latestRun?.runId) {
+      runsById[latestRun.runId] = latestRun;
+    }
+    jobsById[key] = {
+      jobId: key,
+      job,
+      latestRun,
+      analytics: {
+        totalSearchRuns: Math.max(0, Number(record?.analytics?.totalSearchRuns || 0)),
+        lastSearchAt: normalizeWhitespace(record?.analytics?.lastSearchAt),
+        searchTermHistory: Array.isArray(record?.analytics?.searchTermHistory)
+          ? record.analytics.searchTermHistory.slice(-20)
+          : []
+      },
+      firstSeenAt: normalizeWhitespace(record?.firstSeenAt),
+      updatedAt: normalizeWhitespace(record?.updatedAt)
+    };
+  });
+  Object.entries(source.runsById || {}).forEach(([runId, run]) => {
+    const parentJob = jobsById[normalizeWhitespace(run?.jobId || runId)]?.job || {};
+    const normalized = mergeJobOutreachRunWithJob(run, parentJob);
+    if (normalized?.runId) {
+      runsById[normalized.runId] = normalized;
+    }
+  });
+  const runOrder = uniqueStrings(Array.isArray(source.runOrder) ? source.runOrder : Object.keys(runsById))
+    .filter((runId) => runsById[runId]);
+  const queue = uniqueStrings(Array.isArray(source.queue) ? source.queue : [])
+    .filter((runId) => runsById[runId] && normalizeJobOutreachRunStatus(runsById[runId].status) === "queued");
+  const activeRunId = normalizeWhitespace(source.activeRunId);
+  return {
+    jobsById,
+    filterCache: normalizeJobOutreachFilterCache(source.filterCache),
+    runsById,
+    runOrder,
+    queue,
+    activeRunId: runsById[activeRunId] ? activeRunId : ""
+  };
+}
+
+function trimJobOutreachRuns(store, options = {}) {
+  const current = normalizeJobOutreachStore(store);
+  const pressure = normalizeWhitespace(options?.pressure).toLowerCase();
+  const isHighPressure = pressure === "high";
+  const maxTerminalRuns = isHighPressure ? 8 : 25;
+  const pinnedRunIds = uniqueStrings([
+    current.activeRunId,
+    ...current.queue,
+    ...current.runOrder.filter((runId) => isJobOutreachRunActiveStatus(current.runsById[runId]?.status))
+  ]);
+  const terminalRunIds = current.runOrder.filter((runId) => isJobOutreachRunTerminalStatus(current.runsById[runId]?.status));
+  const seenTerminalJobIds = new Set();
+  const retainedTerminalRunIds = [];
+  terminalRunIds.forEach((runId) => {
+    if (retainedTerminalRunIds.length >= maxTerminalRuns) {
+      return;
+    }
+    const run = current.runsById[runId];
+    if (!run) {
+      return;
+    }
+    const jobId = normalizeWhitespace(run.jobId || run.job?.jobId);
+    if (isHighPressure && jobId) {
+      if (seenTerminalJobIds.has(jobId)) {
+        return;
+      }
+      seenTerminalJobIds.add(jobId);
+    }
+    retainedTerminalRunIds.push(runId);
+  });
+  const nextRunOrder = uniqueStrings([...pinnedRunIds, ...retainedTerminalRunIds]);
+  const nextRunsById = Object.fromEntries(nextRunOrder
+    .map((runId) => {
+      const run = current.runsById[runId];
+      if (!run) {
+        return [runId, null];
+      }
+      if (isHighPressure && isJobOutreachRunTerminalStatus(run.status) && !pinnedRunIds.includes(runId)) {
+        return [runId, {
+          ...run,
+          importedPeopleBySearch: {},
+          importedPeopleBySearchKey: {},
+          rankingInput: null,
+          diagnostics: null
+        }];
+      }
+      return [runId, run];
+    })
+    .filter(([, run]) => Boolean(run)));
+  return {
+    ...current,
+    runsById: nextRunsById,
+    runOrder: nextRunOrder,
+    queue: current.queue.filter((runId) => nextRunsById[runId]),
+    activeRunId: nextRunsById[current.activeRunId] ? current.activeRunId : ""
+  };
+}
+
+async function jobOutreachStoragePressure() {
+  try {
+    const quotaBytes = 10 * 1024 * 1024;
+    const bytesInUse = await chrome.storage.local.getBytesInUse(STORAGE_KEYS.jobOutreach);
+    if (!Number.isFinite(bytesInUse) || bytesInUse <= 0) {
+      return "normal";
+    }
+    return bytesInUse >= quotaBytes * 0.85 ? "high" : "normal";
+  } catch (_error) {
+    return "normal";
+  }
+}
+
+function cancelJobOutreachRunInStore(store, requestId) {
+  const current = normalizeJobOutreachStore(store);
+  const runId = normalizeWhitespace(requestId);
+  const run = current.runsById[runId];
+  if (!runId || !run) {
+    throw new Error("No Job Outreach run matches that id.");
+  }
+  if (normalizeJobOutreachRunStatus(run.status) === "queued" || normalizeJobOutreachRunStatus(run.status) === "awaiting_user_action") {
+    return trimJobOutreachRuns({
+      ...current,
+      queue: current.queue.filter((id) => id !== runId),
+      activeRunId: current.activeRunId === runId ? "" : current.activeRunId,
+      runsById: {
+        ...current.runsById,
+        [runId]: {
+          ...run,
+          status: "cancelled",
+          cancelRequested: false,
+          updatedAt: toIsoNow(),
+          completedAt: toIsoNow(),
+          manualAction: null
+        }
+      }
+    });
+  }
+  return {
+    ...current,
+    runsById: {
+      ...current.runsById,
+      [runId]: {
+        ...run,
+        cancelRequested: true,
+        updatedAt: toIsoNow()
+      }
+    }
+  };
+}
+
+function throwIfJobOutreachCancelled(runState) {
+  if (runState?.cancelRequested) {
+    const error = new Error("Job Outreach run cancelled.");
+    error.code = "JOB_OUTREACH_CANCELLED";
+    throw error;
+  }
+}
+
+function dismissJobOutreachRunInStore(store, requestId) {
+  const current = normalizeJobOutreachStore(store);
+  const runId = normalizeWhitespace(requestId);
+  const run = current.runsById[runId];
+  if (!runId || !run) {
+    throw new Error("No Job Outreach run matches that id.");
+  }
+  if (!isJobOutreachRunTerminalStatus(run.status)) {
+    throw new Error("Only completed, failed, or cancelled runs can be dismissed.");
+  }
+  const nextRunsById = { ...current.runsById };
+  delete nextRunsById[runId];
+  const nextJobsById = Object.fromEntries(Object.entries(current.jobsById).map(([jobId, record]) => [
+    jobId,
+    record?.latestRun?.runId === runId
+      ? { ...record, latestRun: null }
+      : record
+  ]));
+  return trimJobOutreachRuns({
+    ...current,
+    jobsById: nextJobsById,
+    runsById: nextRunsById,
+    runOrder: current.runOrder.filter((id) => id !== runId),
+    queue: current.queue.filter((id) => id !== runId),
+    activeRunId: current.activeRunId === runId ? "" : current.activeRunId
+  });
+}
+
+function promoteNextQueuedJobOutreachRun(store) {
+  const current = normalizeJobOutreachStore(store);
+  const [nextRunId, ...restQueue] = current.queue;
+  if (!nextRunId || !current.runsById[nextRunId]) {
+    return {
+      store: {
+        ...current,
+        queue: restQueue.filter((runId) => current.runsById[runId]),
+        activeRunId: ""
+      },
+      nextRun: null
+    };
+  }
+  const nextRun = {
+    ...current.runsById[nextRunId],
+    status: "running",
+    startedAt: normalizeWhitespace(current.runsById[nextRunId].startedAt) || toIsoNow(),
+    updatedAt: toIsoNow(),
+    cancelRequested: false
+  };
+  return {
+    store: {
+      ...current,
+      activeRunId: nextRunId,
+      queue: restQueue.filter((runId) => current.runsById[runId]),
+      runsById: {
+        ...current.runsById,
+        [nextRunId]: nextRun
+      }
+    },
+    nextRun
+  };
+}
+
+const JOB_OUTREACH_FILTER_PARAMS = {
+  company: "currentCompany",
+  location: "geoUrn",
+  school: "schoolFilter"
+};
+
+function cleanJobOutreachCompanyFilterLabel(value) {
+  return cleanLinkedInCompanyDisplayName(value);
+}
+
+function normalizeJobOutreachFilterLabel(type, value) {
+  const normalized = normalizeWhitespace(value);
+  return normalizeWhitespace(type).toLowerCase() === "company"
+    ? cleanJobOutreachCompanyFilterLabel(normalized)
+    : normalized;
+}
+
+function normalizeFilterCacheKey(type, value) {
+  const normalizedType = normalizeWhitespace(type).toLowerCase();
+  const normalizedValue = normalizeWhitespace(value)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+  return normalizedType && normalizedValue ? `${normalizedType}:${normalizedValue}` : "";
+}
+
+function normalizeJobOutreachFilterEntry(entry) {
+  const source = entry && typeof entry === "object" ? entry : {};
+  const type = normalizeWhitespace(source.type).toLowerCase();
+  const param = JOB_OUTREACH_FILTER_PARAMS[type] || normalizeWhitespace(source.param);
+  const id = normalizeWhitespace(source.id);
+  const label = normalizeJobOutreachFilterLabel(type, source.label || source.selectedText || source.sourceText);
+  if (!type || !param || !id || !label) {
+    return null;
+  }
+  const sourceText = normalizeJobOutreachFilterLabel(type, source.sourceText || label);
+  return {
+    type,
+    label,
+    id,
+    param,
+    sourceText,
+    resolvedAt: normalizeWhitespace(source.resolvedAt)
+  };
+}
+
+function normalizeJobOutreachFilterCache(cache) {
+  const normalized = {};
+  Object.entries(cache || {}).forEach(([key, entry]) => {
+    const value = normalizeJobOutreachFilterEntry(entry);
+    if (!value) {
+      return;
+    }
+    const cacheKey = normalizeFilterCacheKey(value.type, key.includes(":") ? key.split(":").slice(1).join(":") : value.sourceText);
+    const sourceKey = normalizeFilterCacheKey(value.type, value.sourceText);
+    const labelKey = normalizeFilterCacheKey(value.type, value.label);
+    [cacheKey, sourceKey, labelKey].filter(Boolean).forEach((nextKey) => {
+      normalized[nextKey] = value;
+    });
+  });
+  return normalized;
+}
+
+function filterCacheSnapshot(stored) {
+  return normalizeJobOutreachStore(stored?.jobOutreach).filterCache;
+}
+
+function parseLinkedInFilterIdsFromUrl(url) {
+  const result = {};
+  try {
+    const parsed = new URL(normalizeUrl(url));
+    Object.values(JOB_OUTREACH_FILTER_PARAMS).forEach((param) => {
+      const raw = normalizeWhitespace(parsed.searchParams.get(param));
+      if (!raw) {
+        return;
+      }
+      try {
+        const ids = JSON.parse(raw);
+        result[param] = Array.isArray(ids) ? ids.map(normalizeWhitespace).filter(Boolean) : [];
+      } catch (_error) {
+        result[param] = raw.replace(/[\[\]"]/g, "").split(",").map(normalizeWhitespace).filter(Boolean);
+      }
+    });
+  } catch (_error) {
+    // Ignore malformed URLs; callers treat missing ids as unresolved.
+  }
+  return result;
+}
+
+function resolvedFilterFromCache(filter, filterCache) {
+  const type = normalizeWhitespace(filter?.type).toLowerCase();
+  const sourceText = normalizeWhitespace(filter?.sourceText || filter?.value || filter?.label);
+  const cached = filterCache?.[normalizeFilterCacheKey(type, sourceText)]
+    || filterCache?.[normalizeFilterCacheKey(type, filter?.label)];
+  if (!cached) {
+    return null;
+  }
+  return {
+    ...cached,
+    sourceText
+  };
+}
+
+function searchFilterCandidates(search) {
+  const criteria = search?.criteria || {};
+  const filters = [];
+  if (Array.isArray(search?.filters)) {
+    search.filters.forEach((filter) => {
+      const type = normalizeWhitespace(filter?.type).toLowerCase();
+      const sourceText = normalizeWhitespace(filter?.sourceText || filter?.value || filter?.label);
+      if (type && sourceText) {
+        filters.push({
+          type,
+          sourceText,
+          label: normalizeWhitespace(filter?.label || sourceText),
+          id: normalizeWhitespace(filter?.id),
+          param: normalizeWhitespace(filter?.param || JOB_OUTREACH_FILTER_PARAMS[type]),
+          origin: normalizeWhitespace(filter?.origin)
+        });
+      }
+    });
+  }
+  (Array.isArray(criteria.locations) ? criteria.locations : []).forEach((value) => filters.push({ type: "location", sourceText: value }));
+  (Array.isArray(criteria.schools) ? criteria.schools : []).forEach((value) => filters.push({ type: "school", sourceText: value }));
+  if (normalizeWhitespace(criteria.currentCompany)) {
+    filters.push({ type: "company", sourceText: criteria.currentCompany });
+  }
+  const seen = new Set();
+  return filters.filter((filter) => {
+    const keys = [
+      filter.id ? `${normalizeWhitespace(filter.type).toLowerCase()}:id:${normalizeWhitespace(filter.id)}` : "",
+      normalizeFilterCacheKey(filter.type, filter.sourceText),
+      normalizeFilterCacheKey(filter.type, filter.label)
+    ].filter(Boolean);
+    if (!keys.length || keys.some((key) => seen.has(key))) {
+      return false;
+    }
+    keys.forEach((key) => seen.add(key));
+    return true;
+  });
+}
+
+function hydrateSearchFilters(search, filterCache) {
+  const resolvedFilters = [];
+  const unresolvedFilters = [];
+  for (const filter of searchFilterCandidates(search)) {
+    const explicit = normalizeJobOutreachFilterEntry(filter);
+    const cached = explicit || resolvedFilterFromCache(filter, filterCache);
+    if (cached) {
+      resolvedFilters.push(cached);
+    } else {
+      unresolvedFilters.push(filter);
+    }
+  }
+  const unresolvedCriteria = {
+    locations: unresolvedFilters.filter((filter) => filter.type === "location").map((filter) => normalizeWhitespace(filter.sourceText)),
+    schools: unresolvedFilters.filter((filter) => filter.type === "school").map((filter) => normalizeWhitespace(filter.sourceText)),
+    currentCompany: normalizeWhitespace(unresolvedFilters.find((filter) => filter.type === "company")?.sourceText)
+  };
+  return {
+    ...search,
+    resolvedFilters,
+    unresolvedFilters,
+    unresolvedCriteria
+  };
+}
+
+function appendResolvedFiltersToSearchUrl(url, resolvedFilters) {
+  const normalizedUrl = normalizeUrl(url);
+  if (!normalizedUrl) {
+    return "";
+  }
+  const parsed = new URL(normalizedUrl);
+  parsed.searchParams.set("origin", "GLOBAL_SEARCH_HEADER");
+  const idsByParam = {};
+  (Array.isArray(resolvedFilters) ? resolvedFilters : []).forEach((filter) => {
+    const entry = normalizeJobOutreachFilterEntry(filter);
+    if (!entry) {
+      return;
+    }
+    idsByParam[entry.param] = uniqueStrings([...(idsByParam[entry.param] || []), entry.id]);
+  });
+  Object.entries(idsByParam).forEach(([param, ids]) => {
+    if (ids.length) {
+      parsed.searchParams.set(param, JSON.stringify(ids));
+    }
+  });
+  return parsed.toString();
+}
+
+function parseLinkedInPeopleSearchUrlState(url) {
+  const normalizedUrl = normalizeUrl(url);
+  if (!normalizedUrl) {
+    return {
+      url: "",
+      keywords: "",
+      idsByParam: {},
+      signature: ""
+    };
+  }
+  try {
+    const parsed = new URL(normalizedUrl);
+    const idsByParam = parseLinkedInFilterIdsFromUrl(normalizedUrl);
+    const signaturePayload = {
+      path: parsed.pathname.replace(/\/+$/g, ""),
+      keywords: normalizeWhitespace(parsed.searchParams.get("keywords")),
+      geoUrn: uniqueStrings((idsByParam.geoUrn || []).map(normalizeWhitespace)).sort(),
+      currentCompany: uniqueStrings((idsByParam.currentCompany || []).map(normalizeWhitespace)).sort(),
+      schoolFilter: uniqueStrings((idsByParam.schoolFilter || []).map(normalizeWhitespace)).sort()
+    };
+    return {
+      url: normalizedUrl,
+      keywords: signaturePayload.keywords,
+      idsByParam,
+      signature: JSON.stringify(signaturePayload)
+    };
+  } catch (_error) {
+    return {
+      url: normalizedUrl,
+      keywords: "",
+      idsByParam: {},
+      signature: ""
+    };
+  }
+}
+
+function linkedInPeopleSearchUrlSignature(url) {
+  return parseLinkedInPeopleSearchUrlState(url).signature;
+}
+
+function matchingSearchFilterForAppliedFilter(search, appliedFilter) {
+  const type = normalizeWhitespace(appliedFilter?.type).toLowerCase();
+  const sourceText = normalizeWhitespace(appliedFilter?.value || appliedFilter?.sourceText || appliedFilter?.label);
+  return [
+    ...(Array.isArray(search?.unresolvedFilters) ? search.unresolvedFilters : []),
+    ...(Array.isArray(search?.filters) ? search.filters : []),
+    ...(Array.isArray(search?.resolvedFilters) ? search.resolvedFilters : [])
+  ].find((filter) => jobOutreachFilterMatchesTarget(filter, { type, sourceText, label: sourceText })) || null;
+}
+
+function allowsResolvedSourceLabelFallback(filter) {
+  return normalizeWhitespace(filter?.origin).toLowerCase() !== "custom";
+}
+
+function cacheUpdatesFromAppliedFilters(appliedFilterResult, finalUrlOverride, search) {
+  const finalUrl = normalizeUrl(finalUrlOverride || appliedFilterResult?.finalUrl);
+  const idsByParam = parseLinkedInFilterIdsFromUrl(finalUrl);
+  const activeFilters = Array.isArray(appliedFilterResult?.activeFilters) ? appliedFilterResult.activeFilters : [];
+  const indexByParam = {};
+  const updates = [];
+  (Array.isArray(appliedFilterResult?.appliedFilters) ? appliedFilterResult.appliedFilters : []).forEach((filter) => {
+    const type = normalizeWhitespace(filter?.type).toLowerCase();
+    const param = JOB_OUTREACH_FILTER_PARAMS[type];
+    const ids = idsByParam[param] || [];
+    const index = indexByParam[param] || 0;
+    const id = normalizeWhitespace(filter?.id) || ids[index];
+    if (!normalizeWhitespace(filter?.id)) {
+      indexByParam[param] = index + 1;
+    }
+    const sourceFilter = matchingSearchFilterForAppliedFilter(search, filter);
+    const sourceText = normalizeWhitespace(sourceFilter?.sourceText || filter?.value || filter?.sourceText);
+    const label = resolvedLinkedInFilterLabel({
+      filter: { ...(sourceFilter || {}), ...filter },
+      type,
+      sourceText,
+      activeFilters,
+      index,
+      allowSourceFallback: allowsResolvedSourceLabelFallback(sourceFilter || filter)
+    });
+    if (type && param && id && label) {
+      updates.push({
+        type,
+        param,
+        id,
+        label,
+        sourceText,
+        resolvedAt: toIsoNow()
+      });
+    }
+  });
+  return updates;
+}
+
+function isGenericLinkedInFilterLabel(label) {
+  const normalized = normalizeWhitespace(label);
+  return !normalized
+    || /^\d+$/.test(normalized)
+    || /^(people|all filters|reset|schools?|locations?|current companies?|companies?|1st|2nd|3rd\+?|1st connections|2nd connections|3rd\+? connections|premium actively hiring|act(?:ively)? hiring)$/i.test(normalized);
+}
+
+function filterLabelLooksLikeType(label, type) {
+  const normalized = normalizeWhitespace(label);
+  if (isGenericLinkedInFilterLabel(normalized)) {
+    return false;
+  }
+  if (type === "location") {
+    return /,|\b(?:area|united states|canada|kingdom|singapore|california|new york|texas|washington|remote)\b/i.test(normalized);
+  }
+  if (type === "school") {
+    return /\b(?:university|college|school|institute|academy|som|mba|nus|mit)\b/i.test(normalized);
+  }
+  if (type === "company") {
+    return !filterLabelLooksLikeType(normalized, "location") && !filterLabelLooksLikeType(normalized, "school");
+  }
+  return false;
+}
+
+function activeLinkedInFilterLabelsForType(activeFilters, type) {
+  return uniqueStrings((Array.isArray(activeFilters) ? activeFilters : [])
+    .map(normalizeWhitespace)
+    .filter((label) => filterLabelLooksLikeType(label, type)));
+}
+
+function matchedActiveLinkedInFilterLabel(activeLabels, sourceText, fallbackIndex) {
+  const sourceKey = normalizeFilterCacheKey("filter", sourceText).replace(/^filter:/, "");
+  const sourceLead = normalizeWhitespace(sourceText).split(",")[0].toLowerCase();
+  const matched = activeLabels.find((label) => {
+    const labelKey = normalizeFilterCacheKey("filter", label).replace(/^filter:/, "");
+    const lowerLabel = label.toLowerCase();
+    return labelKey === sourceKey
+      || (sourceLead.length >= 3 && lowerLabel.startsWith(sourceLead))
+      || (sourceKey.length >= 3 && labelKey.includes(sourceKey));
+  });
+  return matched || activeLabels[fallbackIndex] || "";
+}
+
+function resolvedLinkedInFilterLabel({ filter, type, sourceText, activeFilters, index, allowSourceFallback = false }) {
+  const selectedText = normalizeJobOutreachFilterLabel(type, filter?.selectedText);
+  const selectedTextSource = normalizeWhitespace(filter?.selectedTextSource);
+  const source = normalizeJobOutreachFilterLabel(type, sourceText || filter?.sourceText || filter?.value);
+  if (selectedText && selectedTextSource === "linkedin_option") {
+    return selectedText;
+  }
+  if (selectedText && selectedText.toLowerCase() !== source.toLowerCase()) {
+    return selectedText;
+  }
+  const activeLabel = matchedActiveLinkedInFilterLabel(activeLinkedInFilterLabelsForType(activeFilters, type), source, index);
+  if (activeLabel) {
+    return normalizeJobOutreachFilterLabel(type, activeLabel);
+  }
+  if (selectedText && selectedTextSource === "existing_selection") {
+    const activeLabels = (Array.isArray(activeFilters) ? activeFilters : []).map(normalizeWhitespace);
+    if (activeLabels.some((label) => label.toLowerCase() === selectedText.toLowerCase())) {
+      return selectedText;
+    }
+  }
+  const existingLabel = normalizeJobOutreachFilterLabel(type, filter?.label);
+  if (existingLabel && existingLabel.toLowerCase() !== source.toLowerCase()) {
+    return existingLabel;
+  }
+  return allowSourceFallback ? source : "";
+}
+
+function cacheUpdatesFromSearchUrl(search, url, context) {
+  const finalUrl = normalizeUrl(url);
+  const idsByParam = parseLinkedInFilterIdsFromUrl(finalUrl);
+  const activeFilters = Array.isArray(context?.peopleSearch?.activeFilters) ? context.peopleSearch.activeFilters : [];
+  const resolvedCountsByParam = {};
+  (Array.isArray(search?.resolvedFilters) ? search.resolvedFilters : [])
+    .map(normalizeJobOutreachFilterEntry)
+    .filter(Boolean)
+    .forEach((entry) => {
+      resolvedCountsByParam[entry.param] = Number(resolvedCountsByParam[entry.param] || 0) + 1;
+    });
+  const nextIndexByParam = { ...resolvedCountsByParam };
+  return (Array.isArray(search?.unresolvedFilters) ? search.unresolvedFilters : [])
+    .map((filter) => {
+      const type = normalizeWhitespace(filter?.type).toLowerCase();
+      const param = JOB_OUTREACH_FILTER_PARAMS[type];
+      if (!param) {
+        return null;
+      }
+      const ids = idsByParam[param] || [];
+      const index = Number(nextIndexByParam[param] || 0);
+      const id = ids[index];
+      nextIndexByParam[param] = index + 1;
+      const sourceText = normalizeWhitespace(filter?.sourceText || filter?.value || filter?.label);
+      if (!id || !sourceText) {
+        return null;
+      }
+      const label = resolvedLinkedInFilterLabel({
+        filter,
+        type,
+        sourceText,
+        activeFilters,
+        index,
+        allowSourceFallback: allowsResolvedSourceLabelFallback(filter)
+      });
+      if (!label) {
+        return null;
+      }
+      return {
+        type,
+        param,
+        id,
+        label,
+        sourceText,
+        resolvedAt: toIsoNow()
+      };
+    })
+    .filter(Boolean);
+}
+
+function failedFiltersFromAppliedFilters(appliedFilterResult) {
+  return (Array.isArray(appliedFilterResult?.unresolvedFilters) ? appliedFilterResult.unresolvedFilters : [])
+    .map((filter) => ({
+      type: normalizeWhitespace(filter?.type).toLowerCase(),
+      label: normalizeWhitespace(filter?.selectedText || filter?.label || filter?.value || filter?.sourceText),
+      sourceText: normalizeWhitespace(filter?.value || filter?.sourceText || filter?.label),
+      param: normalizeWhitespace(filter?.param || JOB_OUTREACH_FILTER_PARAMS[normalizeWhitespace(filter?.type).toLowerCase()]),
+      state: "failed",
+      error: normalizeWhitespace(filter?.error)
+    }))
+    .filter((filter) => filter.type && filter.sourceText);
+}
+
+async function mergeJobOutreachFilterCache(stored, updates) {
+  const nextUpdates = (Array.isArray(updates) ? updates : [])
+    .map(normalizeJobOutreachFilterEntry)
+    .filter(Boolean);
+  if (!nextUpdates.length) {
+    return stored;
+  }
+  const currentStore = normalizeJobOutreachStore(stored?.jobOutreach);
+  const filterCache = {
+    ...currentStore.filterCache
+  };
+  nextUpdates.forEach((entry) => {
+    [entry.sourceText, entry.label].map((value) => normalizeFilterCacheKey(entry.type, value)).filter(Boolean).forEach((key) => {
+      filterCache[key] = entry;
+    });
+  });
+  const nextStore = {
+    ...currentStore,
+    filterCache
+  };
+  const persistedStore = await persistNormalizedJobOutreachStore(nextStore);
+  return {
+    ...stored,
+    jobOutreach: persistedStore
+  };
+}
+
+function latestJobOutreachRunForPage(pageContext, stored) {
+  const job = normalizeJobOutreachJob(pageContext?.job || {});
+  const jobId = jobIdFromJob(job);
+  if (!jobId) {
+    return null;
+  }
+  const record = stored?.jobOutreach?.jobsById?.[jobId];
+  if (!record?.latestRun) {
+    return null;
+  }
+  return {
+    jobId,
+    job: record.job || job,
+    latestRun: record.latestRun,
+    analytics: record.analytics || null
+  };
+}
+
+function jobOutreachRunsForPage(pageContext, stored) {
+  const currentStore = normalizeJobOutreachStore(stored?.jobOutreach);
+  const job = normalizeJobOutreachJob(pageContext?.job || {});
+  const jobId = jobIdFromJob(job);
+  const pageRunIds = currentStore.runOrder.filter((runId) => currentStore.runsById[runId]?.jobId === jobId);
+  const activeRunIds = currentStore.runOrder.filter((runId) => isJobOutreachRunActiveStatus(currentStore.runsById[runId]?.status));
+  return {
+    runsById: currentStore.runsById,
+    runOrder: currentStore.runOrder,
+    pageRunIds,
+    activeRunIds,
+    selectedRunId: pageRunIds[0] || ""
+  };
+}
+
+function compactJobOutreachHistoryEntry(run, searches, importedPeopleBySearch) {
+  return {
+    runId: run.runId,
+    createdAt: run.createdAt,
+    searchKeys: searches.map((search) => search.searchKey),
+    keywords: searches.map((search) => ({
+      searchKey: search.searchKey,
+      keywords: search.keywords
+    })),
+    criteriaUsed: run.sharedCriteria,
+    resultCounts: Object.fromEntries(
+      Object.entries(importedPeopleBySearch || {}).map(([key, people]) => [key, Array.isArray(people) ? people.length : 0])
+    )
+  };
+}
+
+async function saveJobOutreachLatestRun(stored, workflow) {
+  const job = normalizeJobOutreachJob(workflow?.job || {});
+  const jobId = jobIdFromJob(job);
+  if (!jobId) {
+    return { stored, savedRun: null };
+  }
+  const now = toIsoNow();
+  const currentStore = normalizeJobOutreachStore(stored?.jobOutreach);
+  const existing = currentStore.jobsById[jobId] || {
+    jobId,
+    firstSeenAt: now,
+    analytics: {
+      totalSearchRuns: 0,
+      lastSearchAt: "",
+      searchTermHistory: []
+    }
+  };
+  const normalizeRunFilter = (filter) => ({
+    type: normalizeWhitespace(filter?.type).toLowerCase(),
+    label: normalizeJobOutreachFilterLabel(filter?.type, filter?.label || filter?.sourceText || filter?.value),
+    sourceText: normalizeJobOutreachFilterLabel(filter?.type, filter?.sourceText || filter?.value || filter?.label),
+    id: normalizeWhitespace(filter?.id),
+    param: normalizeWhitespace(filter?.param || JOB_OUTREACH_FILTER_PARAMS[normalizeWhitespace(filter?.type).toLowerCase()]),
+    state: normalizeWhitespace(filter?.state),
+    origin: normalizeWhitespace(filter?.origin)
+  });
+  const isOneTimeCustomFilter = (filter) => filter.origin === "custom" && !filter.id;
+  const searches = (Array.isArray(workflow.searches) ? workflow.searches : []).map((search) => {
+    const rawFilters = (Array.isArray(search.filters) ? search.filters : [])
+      .map(normalizeRunFilter)
+      .filter((filter) => filter.type && filter.sourceText);
+    const oneTimeCustomKeys = new Set(rawFilters
+      .filter(isOneTimeCustomFilter)
+      .map((filter) => normalizeFilterCacheKey(filter.type, filter.sourceText))
+      .filter(Boolean));
+    const filters = rawFilters.filter((filter) => !isOneTimeCustomFilter(filter));
+    const unresolvedFilters = (Array.isArray(search.unresolvedFilters) ? search.unresolvedFilters : [])
+      .map(normalizeRunFilter)
+      .filter((filter) => filter.type && filter.sourceText && !isOneTimeCustomFilter(filter));
+    const failedFilters = (Array.isArray(search.failedFilters) ? search.failedFilters : [])
+      .map(normalizeRunFilter)
+      .filter((filter) => filter.type && filter.sourceText && !oneTimeCustomKeys.has(normalizeFilterCacheKey(filter.type, filter.sourceText)));
+    const criteriaFilters = [
+      ...filters,
+      ...(Array.isArray(search.resolvedFilters) ? search.resolvedFilters : []).map(normalizeRunFilter).filter((filter) => filter.type && filter.sourceText),
+      ...unresolvedFilters
+    ];
+    const criteria = {
+      locations: uniqueStrings(criteriaFilters.filter((filter) => filter.type === "location").map((filter) => filter.sourceText || filter.label)),
+      schools: uniqueStrings(criteriaFilters.filter((filter) => filter.type === "school").map((filter) => filter.sourceText || filter.label)),
+      currentCompany: normalizeWhitespace(criteriaFilters.find((filter) => filter.type === "company")?.sourceText || criteriaFilters.find((filter) => filter.type === "company")?.label)
+    };
+    return {
+      index: Number(search.index || 0),
+      searchKey: normalizeWhitespace(search.searchKey),
+      searchNumber: Number(search.searchNumber || searchNumberFromKey(search.searchKey)),
+      keywords: normalizeWhitespace(search.keywords),
+      enabledCriteria: Array.isArray(search.enabledCriteria) ? search.enabledCriteria : [],
+      criteria,
+      filters,
+      resolvedFilters: Array.isArray(search.resolvedFilters) ? search.resolvedFilters : [],
+      unresolvedFilters,
+      failedFilters,
+      plannedUrl: normalizeUrl(search.plannedUrl),
+      url: normalizeUrl(search.url),
+      urlSignature: normalizeWhitespace(search.urlSignature),
+      searchContract: search.searchContract && typeof search.searchContract === "object"
+        ? {
+          searchKey: normalizeWhitespace(search.searchContract.searchKey || search.searchKey),
+          workerTabId: typeof search.searchContract.workerTabId === "number" ? search.searchContract.workerTabId : null,
+          keywords: normalizeWhitespace(search.searchContract.keywords || search.keywords),
+          plannedUrl: normalizeUrl(search.searchContract.plannedUrl || search.plannedUrl),
+          plannedUrlSignature: normalizeWhitespace(search.searchContract.plannedUrlSignature),
+          finalUrl: normalizeUrl(search.searchContract.finalUrl || search.url),
+          finalUrlSignature: normalizeWhitespace(search.searchContract.finalUrlSignature || search.urlSignature),
+          expectedFilterCounts: search.searchContract.expectedFilterCounts && typeof search.searchContract.expectedFilterCounts === "object"
+            ? Object.fromEntries(Object.entries(search.searchContract.expectedFilterCounts).map(([param, count]) => [normalizeWhitespace(param), Math.max(0, Number(count || 0))]))
+            : {}
+        }
+        : null
+    };
+  });
+  const sharedCriteria = searches.reduce((criteria, search) => ({
+    locations: criteria.locations.length ? criteria.locations : (Array.isArray(search.criteria?.locations) ? search.criteria.locations : []),
+    schools: criteria.schools.length ? criteria.schools : (Array.isArray(search.criteria?.schools) ? search.criteria.schools : []),
+    currentCompany: criteria.currentCompany || normalizeWhitespace(search.criteria?.currentCompany)
+  }), { locations: [], schools: [], currentCompany: "" });
+  const run = {
+    runId: normalizeWhitespace(workflow.requestId) || `job_outreach_${Date.now()}`,
+    jobId,
+    createdAt: now,
+    startedAt: now,
+    completedAt: now,
+    updatedAt: now,
+    status: "completed",
+    cancelRequested: false,
+    progressText: "Ranked people ready.",
+    progressDetail: `${((workflow.rankingPlan?.people || []).length || 0)} ranked people returned.`,
+    progressPercent: 100,
+    sourceTabId: typeof workflow.sourceTabId === "number" ? workflow.sourceTabId : null,
+    workerTabId: null,
+    sharedCriteria,
+    searches,
+    searchPlan: workflow.searchPlan || null,
+    rankingInput: workflow.rankingInput || null,
+    peopleBySearch: workflow.importedPeopleBySearch || {},
+    peopleBySearchKey: workflow.importedPeopleBySearchKey || {},
+    rankingPlan: workflow.rankingPlan || null,
+    diagnostics: {
+      importedCounts: Object.fromEntries(
+        Object.entries(workflow.importedPeopleBySearch || {}).map(([key, people]) => [key, Array.isArray(people) ? people.length : 0])
+      ),
+      searchGenerationAttempt: Number(workflow.searchGenerationAttempt || 0),
+      rankingGenerationAttempt: Number(workflow.rankingGenerationAttempt || 0)
+    }
+  };
+  const history = [
+    ...(Array.isArray(existing.analytics?.searchTermHistory) ? existing.analytics.searchTermHistory : []),
+    compactJobOutreachHistoryEntry(run, searches, workflow.importedPeopleBySearch)
+  ].slice(-20);
+  currentStore.jobsById[jobId] = {
+    jobId,
+    job: {
+      ...job,
+      descriptionHash: compactHash(job.description)
+    },
+    latestRun: run,
+    analytics: {
+      totalSearchRuns: Math.max(0, Number(existing.analytics?.totalSearchRuns || 0)) + 1,
+      lastSearchAt: now,
+      searchTermHistory: history
+    },
+    firstSeenAt: normalizeWhitespace(existing.firstSeenAt) || now,
+    updatedAt: now
+  };
+  const completedRun = normalizeJobOutreachRun({
+    ...run,
+    job,
+    importedPeopleBySearch: workflow.importedPeopleBySearch || {},
+    importedPeopleBySearchKey: workflow.importedPeopleBySearchKey || {},
+    rankingInput: workflow.rankingInput || null,
+    diagnostics: run.diagnostics || null
+  }, jobId);
+  currentStore.runsById = {
+    ...(currentStore.runsById || {}),
+    [completedRun.runId]: completedRun
+  };
+  currentStore.runOrder = uniqueStrings([completedRun.runId, ...(currentStore.runOrder || [])]);
+  currentStore.queue = (Array.isArray(currentStore.queue) ? currentStore.queue : []).filter((runId) => runId !== completedRun.runId);
+  if (normalizeWhitespace(currentStore.activeRunId) === completedRun.runId) {
+    currentStore.activeRunId = "";
+  }
+  const normalizedStore = await persistNormalizedJobOutreachStore(currentStore);
+  return {
+    stored: {
+      ...stored,
+      jobOutreach: normalizedStore
+    },
+    savedRun: latestJobOutreachRunForPage({ job }, { jobOutreach: normalizedStore })
+  };
+}
+
+function normalizeJobOutreachSearches(searches) {
+  const keys = jobOutreachAi?.SEARCH_KEYS || ["A", "B", "C"];
+  const normalizeCriteriaLocations = (values) => {
+    const raw = Array.isArray(values) ? values.map(normalizeWhitespace).filter(Boolean) : [];
+    const result = [];
+    for (let index = 0; index < raw.length; index += 1) {
+      const current = raw[index];
+      const next = raw[index + 1] || "";
+      if (next && /^[A-Z]{2}$/i.test(next) && !/,/.test(current)) {
+        result.push(`${current}, ${next.toUpperCase()}`);
+        index += 1;
+      } else {
+        result.push(current.replace(/\s*\+\d+\s+more\b/i, "").trim());
+      }
+    }
+    return uniqueStrings(result);
+  };
+  const normalizeCriteriaSchools = (values) => {
+    const normalized = uniqueStrings((Array.isArray(values) ? values : [])
+    .map((school) => normalizeWhitespace(school)
+      .replace(/^(?:education|education highlights?|school|schools)\s*[:\-]?\s*/i, "")
+      .replace(/\b(?:bachelor'?s?|master'?s?|mba|ms|ma|bs|ba|degree|candidate|graduate|alumni)\b.*$/i, "")
+      .replace(/\s*[|\u2022\u00b7]\s*.*$/, "")
+      .trim())
+    .filter((school) => {
+      if (!school || school.length < 3 || /^of\s+/i.test(school)) {
+        return false;
+      }
+      if (/^(?:school|college|institute)\s+of\s+/i.test(school) && !/\b(?:yale|national|singapore|stanford|harvard|mit|university)\b/i.test(school)) {
+        return false;
+      }
+      return true;
+    }));
+    return normalized.filter((school) => {
+      const lower = school.toLowerCase();
+      return !normalized.some((other) => other !== school && other.toLowerCase().includes(lower));
+    });
+  };
+  return (Array.isArray(searches) ? searches : []).slice(0, 3).map((search, index) => {
+    const criteria = search?.criteria || {};
+    return {
+      searchKey: normalizeWhitespace(search?.searchKey || keys[index] || String(index + 1)),
+      searchNumber: Number(search?.searchNumber || index + 1),
+      keywords: normalizeWhitespace(search?.keywords || search?.text),
+      enabledCriteria: Array.isArray(search?.enabledCriteria) ? search.enabledCriteria : [],
+      filters: Array.isArray(search?.filters) ? search.filters.map((filter) => ({
+        type: normalizeWhitespace(filter?.type).toLowerCase(),
+        label: normalizeWhitespace(filter?.label || filter?.sourceText || filter?.value),
+        sourceText: normalizeWhitespace(filter?.sourceText || filter?.value || filter?.label),
+        id: normalizeWhitespace(filter?.id),
+        param: normalizeWhitespace(filter?.param),
+        origin: normalizeWhitespace(filter?.origin)
+      })).filter((filter) => filter.type && filter.sourceText) : [],
+      criteria: {
+        locations: normalizeCriteriaLocations(criteria.locations),
+        schools: normalizeCriteriaSchools(criteria.schools),
+        currentCompany: normalizeWhitespace(criteria.currentCompany)
+      }
+    };
+  }).filter((search) => search.keywords);
+}
+
+function searchNumberFromKey(searchKey) {
+  const keys = jobOutreachAi?.SEARCH_KEYS || ["A", "B", "C"];
+  const index = keys.indexOf(normalizeWhitespace(searchKey).toUpperCase());
+  return index >= 0 ? index + 1 : 1;
+}
+
+function buildJobOutreachImportedPeopleMaps(importedSearches) {
+  const importedPeopleBySearch = {};
+  const importedPeopleBySearchKey = {};
+  (Array.isArray(importedSearches) ? importedSearches : []).forEach((search) => {
+    const searchKey = normalizeWhitespace(search?.searchKey);
+    const searchNumber = Number(search?.searchNumber || searchNumberFromKey(searchKey));
+    const people = Array.isArray(search?.people) ? search.people : [];
+    importedPeopleBySearch[String(searchNumber)] = people;
+    importedPeopleBySearchKey[searchKey] = people;
+  });
+  return {
+    importedPeopleBySearch,
+    importedPeopleBySearchKey
+  };
+}
+
+function buildJobOutreachSearchSnapshot(search, importedSearchByKey) {
+  const source = search && typeof search === "object" ? search : {};
+  const imported = importedSearchByKey.get(normalizeWhitespace(source.searchKey)) || source;
+  const searchKey = normalizeWhitespace(source.searchKey || imported.searchKey);
+  const resolvedFilterUpdates = Array.isArray(imported?.resolvedFilterUpdates) ? imported.resolvedFilterUpdates : [];
+  return {
+    index: Number(source.index || searchNumberFromKey(searchKey) - 1),
+    searchKey,
+    searchNumber: Number(source.searchNumber || searchNumberFromKey(searchKey)),
+    keywords: normalizeWhitespace(source.keywords),
+    enabledCriteria: Array.isArray(source.enabledCriteria) ? source.enabledCriteria : [],
+    criteria: source.criteria || { locations: [], schools: [], currentCompany: "" },
+    filters: searchFilterCandidates(source).map((filter) => ({
+      type: filter.type,
+      label: normalizeWhitespace(filter.label || filter.sourceText),
+      sourceText: normalizeWhitespace(filter.sourceText),
+      id: normalizeWhitespace(filter.id),
+      param: normalizeWhitespace(filter.param || JOB_OUTREACH_FILTER_PARAMS[filter.type]),
+      origin: normalizeWhitespace(filter.origin)
+    })),
+    resolvedFilters: [
+      ...(Array.isArray(source.resolvedFilters) ? source.resolvedFilters : []),
+      ...resolvedFilterUpdates
+    ],
+    unresolvedFilters: Array.isArray(source.unresolvedFilters) ? source.unresolvedFilters : [],
+    failedFilters: Array.isArray(imported?.failedFilters)
+      ? imported.failedFilters
+      : (Array.isArray(source.failedFilters) ? source.failedFilters : []),
+    plannedUrl: normalizeUrl(imported?.plannedUrl || source.plannedUrl || findJobOutreachSearchPlanUrl({ searches: [source] }, searchKey)),
+    url: normalizeUrl(imported?.searchUrl || imported?.url || source.url || source.searchUrl || ""),
+    urlSignature: normalizeWhitespace(imported?.searchUrlSignature || imported?.sourceUrlSignature || source.urlSignature),
+    searchContract: imported?.searchContract || source.searchContract || null
+  };
+}
+
+function buildPersistentJobOutreachRun(runState, overrides = {}) {
+  const importedSearches = (Array.isArray(runState?.importedSearches) ? runState.importedSearches : [])
+    .slice()
+    .sort((left, right) => searchNumberFromKey(left.searchKey) - searchNumberFromKey(right.searchKey));
+  const importedSearchByKey = new Map(importedSearches.map((search) => [normalizeWhitespace(search.searchKey), search]));
+  const { importedPeopleBySearch, importedPeopleBySearchKey } = buildJobOutreachImportedPeopleMaps(importedSearches);
+  const searches = (Array.isArray(runState?.searches) ? runState.searches : []).map((search) => buildJobOutreachSearchSnapshot(search, importedSearchByKey));
+  const sharedCriteria = searches.reduce((criteria, search) => ({
+    locations: criteria.locations.length ? criteria.locations : (Array.isArray(search.criteria?.locations) ? search.criteria.locations : []),
+    schools: criteria.schools.length ? criteria.schools : (Array.isArray(search.criteria?.schools) ? search.criteria.schools : []),
+    currentCompany: criteria.currentCompany || normalizeWhitespace(search.criteria?.currentCompany)
+  }), { locations: [], schools: [], currentCompany: "" });
+  return normalizeJobOutreachRun({
+    runId: overrides.runId || runState?.requestId,
+    jobId: overrides.jobId || jobIdFromJob(overrides.job || runState?.job || {}),
+    job: overrides.job || runState?.job || {},
+    createdAt: overrides.createdAt || runState?.createdAt || toIsoNow(),
+    startedAt: overrides.startedAt ?? runState?.startedAt ?? "",
+    completedAt: overrides.completedAt ?? runState?.completedAt ?? "",
+    updatedAt: toIsoNow(),
+    sourceTabId: typeof overrides.sourceTabId === "number" ? overrides.sourceTabId : runState?.sourceTabId,
+    workerTabId: typeof overrides.workerTabId === "number" ? overrides.workerTabId : runState?.workerTabId,
+    status: overrides.status || runState?.status || "queued",
+    cancelRequested: Object.prototype.hasOwnProperty.call(overrides, "cancelRequested")
+      ? Boolean(overrides.cancelRequested)
+      : Boolean(runState?.cancelRequested),
+    progressText: Object.prototype.hasOwnProperty.call(overrides, "progressText")
+      ? overrides.progressText
+      : (runState?.progressText || ""),
+    progressDetail: Object.prototype.hasOwnProperty.call(overrides, "progressDetail")
+      ? overrides.progressDetail
+      : (runState?.progressDetail || ""),
+    progressPercent: Object.prototype.hasOwnProperty.call(overrides, "progressPercent")
+      ? overrides.progressPercent
+      : Number(runState?.progressPercent || 0),
+    sharedCriteria,
+    searches,
+    searchPlan: overrides.searchPlan || runState?.searchPlan || null,
+    rankingPlan: Object.prototype.hasOwnProperty.call(overrides, "rankingPlan") ? overrides.rankingPlan : (runState?.rankingPlan || null),
+    rankingInput: Object.prototype.hasOwnProperty.call(overrides, "rankingInput") ? overrides.rankingInput : (runState?.rankingInput || null),
+    importedPeopleBySearch: Object.prototype.hasOwnProperty.call(overrides, "importedPeopleBySearch")
+      ? overrides.importedPeopleBySearch
+      : importedPeopleBySearch,
+    importedPeopleBySearchKey: Object.prototype.hasOwnProperty.call(overrides, "importedPeopleBySearchKey")
+      ? overrides.importedPeopleBySearchKey
+      : importedPeopleBySearchKey,
+    diagnostics: Object.prototype.hasOwnProperty.call(overrides, "diagnostics") ? overrides.diagnostics : (runState?.diagnostics || null),
+    manualAction: Object.prototype.hasOwnProperty.call(overrides, "manualAction") ? overrides.manualAction : (runState?.manualAction || null),
+    error: Object.prototype.hasOwnProperty.call(overrides, "error") ? overrides.error : (runState?.error || "")
+  }, overrides.jobId || jobIdFromJob(overrides.job || runState?.job || {}));
+}
+
+async function persistNormalizedJobOutreachStore(currentStore) {
+  const normalizedStore = normalizeJobOutreachStore(currentStore);
+  const pressure = await jobOutreachStoragePressure();
+  let nextStore = trimJobOutreachRuns(normalizedStore, { pressure });
+  try {
+    await chrome.storage.local.set({ [STORAGE_KEYS.jobOutreach]: nextStore });
+    return nextStore;
+  } catch (error) {
+    const message = String(error?.message || error || "");
+    if (!/quota/i.test(message)) {
+      throw error;
+    }
+    nextStore = trimJobOutreachRuns(normalizedStore, { pressure: "high" });
+    await chrome.storage.local.set({ [STORAGE_KEYS.jobOutreach]: nextStore });
+    return nextStore;
+  }
+}
+
+async function persistJobOutreachRunState(runState, overrides = {}, options = {}) {
+  const currentStore = normalizeJobOutreachStore(runState?.stored?.jobOutreach);
+  const nextRun = buildPersistentJobOutreachRun(runState, overrides);
+  const nextQueue = uniqueStrings([
+    ...(Array.isArray(currentStore.queue) ? currentStore.queue : []),
+    ...(options.enqueue ? [nextRun.runId] : [])
+  ]).filter((runId) => runId !== nextRun.runId || normalizeJobOutreachRunStatus(nextRun.status) === "queued");
+  const nextStore = await persistNormalizedJobOutreachStore({
+    ...currentStore,
+    activeRunId: Object.prototype.hasOwnProperty.call(options, "activeRunId")
+      ? normalizeWhitespace(options.activeRunId)
+      : (options.setActive ? nextRun.runId : currentStore.activeRunId),
+    queue: normalizeJobOutreachRunStatus(nextRun.status) === "queued"
+      ? uniqueStrings([nextRun.runId, ...nextQueue])
+      : nextQueue.filter((runId) => runId !== nextRun.runId),
+    runsById: {
+      ...currentStore.runsById,
+      [nextRun.runId]: nextRun
+    },
+    runOrder: uniqueStrings([nextRun.runId, ...(currentStore.runOrder || [])])
+  });
+  runState.stored = {
+    ...(runState.stored || {}),
+    jobOutreach: nextStore
+  };
+  return nextStore.runsById[nextRun.runId];
+}
+
+async function persistTerminalJobOutreachRun(runState, overrides = {}, options = {}) {
+  const currentStore = normalizeJobOutreachStore(runState?.stored?.jobOutreach);
+  const nextRun = buildPersistentJobOutreachRun(runState, overrides);
+  const nextStore = await persistNormalizedJobOutreachStore({
+    ...currentStore,
+    activeRunId: currentStore.activeRunId === nextRun.runId ? "" : currentStore.activeRunId,
+    queue: (currentStore.queue || []).filter((runId) => runId !== nextRun.runId),
+    runsById: {
+      ...currentStore.runsById,
+      [nextRun.runId]: nextRun
+    },
+    runOrder: uniqueStrings([nextRun.runId, ...(currentStore.runOrder || [])])
+  });
+  runState.stored = {
+    ...(runState.stored || {}),
+    jobOutreach: nextStore
+  };
+  if (options.removeFromPending) {
+    pendingJobOutreachRuns.delete(nextRun.runId);
+  }
+  return nextStore.runsById[nextRun.runId];
+}
+
+async function hydrateJobOutreachRunProgress(runState, sourceTabId, progress) {
+  if (!runState) {
+    return null;
+  }
+  const manualAction = progress?.manualAction ? normalizeJobOutreachManualActionSnapshot(progress.manualAction) : null;
+  runState.sourceTabId = typeof sourceTabId === "number" ? sourceTabId : runState.sourceTabId;
+  runState.workerTabId = typeof progress?.workerTabId === "number" ? progress.workerTabId : runState.workerTabId;
+  runState.status = manualAction
+    ? normalizeJobOutreachRunStatus(manualAction.status || "awaiting_user_action")
+    : normalizeJobOutreachRunStatus(progress?.status || runState.status || "running");
+  runState.progressText = normalizeWhitespace(progress?.text);
+  runState.progressDetail = normalizeWhitespace(progress?.detail);
+  runState.progressPercent = Math.max(0, Math.min(100, Number(progress?.progressPercent || 0)));
+  runState.manualAction = manualAction;
+  if (manualAction) {
+    runState.workerTabId = typeof manualAction.workerTabId === "number" ? manualAction.workerTabId : runState.workerTabId;
+  }
+  if (runState.status === "running" || runState.status === "resuming") {
+    runState.startedAt = normalizeWhitespace(runState.startedAt) || toIsoNow();
+  }
+  const activeStatus = normalizeJobOutreachRunStatus(runState.status);
+  await persistJobOutreachRunState(runState, {}, {
+    setActive: activeStatus === "running" || activeStatus === "resuming" || activeStatus === "awaiting_user_action",
+    activeRunId: activeStatus === "queued" ? "" : runState.requestId
+  });
+  return runState;
+}
+
+function buildJobOutreachQueuedResponse(runState, queuePosition) {
+  return {
+    ok: true,
+    queued: true,
+    requestId: runState.requestId,
+    queuePosition,
+    job: runState.job,
+    searches: runState.searches,
+    searchPlan: runState.searchPlan,
+    rankingPlan: null,
+    importedPeopleBySearch: {},
+    importedPeopleBySearchKey: {},
+    jobOutreachLatestRun: latestJobOutreachRunForPage({ job: runState.job }, runState.stored),
+    jobOutreachFilterCache: filterCacheSnapshot(runState.stored)
+  };
+}
+
+async function startQueuedJobOutreachRun(requestId) {
+  const runState = pendingJobOutreachRuns.get(normalizeWhitespace(requestId));
+  if (!runState) {
+    return null;
+  }
+  runState.status = "running";
+  runState.cancelRequested = false;
+  runState.startedAt = normalizeWhitespace(runState.startedAt) || toIsoNow();
+  await persistJobOutreachRunState(runState, {
+    status: "running",
+    startedAt: runState.startedAt,
+    progressText: runState.progressText || "Starting queued Job Outreach.",
+    progressDetail: runState.progressDetail || "A previous Job Outreach run finished, so this run is starting now.",
+    progressPercent: Math.max(5, Number(runState.progressPercent || 5)),
+    manualAction: null
+  }, { setActive: true, activeRunId: runState.requestId });
+  await sendJobOutreachProgress(runState.requestId, runState.sourceTabId, {
+    text: runState.progressText || "Starting queued Job Outreach.",
+    detail: runState.progressDetail || "A previous Job Outreach run finished, so this run is starting now.",
+    progressPercent: Math.max(5, Number(runState.progressPercent || 5)),
+    status: "running",
+    workerTabId: runState.workerTabId
+  });
+  return continueJobOutreachWorkflow(runState, (text, meta) => persistAndSendJobOutreachProgress(runState, runState.sourceTabId, { text, ...(meta || {}) }));
+}
+
+async function maybeStartNextQueuedJobOutreachRun(stored) {
+  const promoted = promoteNextQueuedJobOutreachRun(stored?.jobOutreach);
+  const nextStore = await persistNormalizedJobOutreachStore(promoted.store);
+  if (!promoted.nextRun?.runId) {
+    return {
+      ...(stored || {}),
+      jobOutreach: nextStore
+    };
+  }
+  const updatedStored = {
+    ...(stored || {}),
+    jobOutreach: nextStore
+  };
+  const runState = pendingJobOutreachRuns.get(promoted.nextRun.runId);
+  if (runState) {
+    runState.stored = updatedStored;
+    void startQueuedJobOutreachRun(promoted.nextRun.runId).catch(async (error) => {
+      const failureRunState = pendingJobOutreachRuns.get(promoted.nextRun.runId);
+      if (!failureRunState) {
+        return;
+      }
+      failureRunState.error = error?.message || String(error);
+      failureRunState.status = normalizeWhitespace(error?.code) === "JOB_OUTREACH_CANCELLED" ? "cancelled" : "failed";
+      await persistTerminalJobOutreachRun(failureRunState, {
+        status: failureRunState.status,
+        completedAt: toIsoNow(),
+        progressText: failureRunState.status === "cancelled" ? "Job Outreach cancelled." : "Job Outreach failed.",
+        progressDetail: failureRunState.error,
+        progressPercent: Number(failureRunState.progressPercent || 0),
+        error: failureRunState.error,
+        manualAction: null
+      }, { removeFromPending: true });
+      await sendJobOutreachProgress(promoted.nextRun.runId, failureRunState.sourceTabId, {
+        text: failureRunState.status === "cancelled" ? "Job Outreach cancelled." : "Job Outreach failed.",
+        detail: failureRunState.error,
+        progressPercent: Number(failureRunState.progressPercent || 0),
+        status: failureRunState.status
+      });
+      await maybeStartNextQueuedJobOutreachRun(failureRunState.stored);
+    });
+  }
+  return updatedStored;
+}
+
+async function persistAndSendJobOutreachProgress(runState, sourceTabId, progress) {
+  await hydrateJobOutreachRunProgress(runState, sourceTabId, progress);
+  await sendJobOutreachProgress(runState.requestId, sourceTabId, progress);
+}
+
+async function sendJobOutreachProgress(requestId, sourceTabId, progress) {
+  const normalizedRequestId = normalizeWhitespace(requestId);
+  if (!normalizedRequestId) {
+    return;
+  }
+  const manualAction = progress?.manualAction && typeof progress.manualAction === "object"
+    ? {
+      requestId: normalizeWhitespace(progress.manualAction.requestId || normalizedRequestId),
+      searchKey: normalizeWhitespace(progress.manualAction.searchKey),
+      workerTabId: typeof progress.manualAction.workerTabId === "number" ? progress.manualAction.workerTabId : null,
+      summary: normalizeWhitespace(progress.manualAction.summary),
+      detail: normalizeWhitespace(progress.manualAction.detail),
+      reason: normalizeWhitespace(progress.manualAction.reason),
+      status: normalizeWhitespace(progress.manualAction.status || "awaiting_user_action"),
+      progressPercent: Math.max(0, Math.min(100, Number(progress.manualAction.progressPercent || progress?.progressPercent || 0))),
+      removableFilters: Array.isArray(progress.manualAction.removableFilters)
+        ? progress.manualAction.removableFilters.map((filter) => ({
+          type: normalizeWhitespace(filter?.type).toLowerCase(),
+          label: normalizeWhitespace(filter?.label || filter?.sourceText || filter?.value),
+          sourceText: normalizeWhitespace(filter?.sourceText || filter?.value || filter?.label),
+          param: normalizeWhitespace(filter?.param || JOB_OUTREACH_FILTER_PARAMS[normalizeWhitespace(filter?.type).toLowerCase()])
+        })).filter((filter) => filter.type && filter.sourceText)
+        : []
+    }
+    : null;
+  try {
+    await chrome.runtime.sendMessage({
+      type: MESSAGE_TYPES.JOB_OUTREACH_PROGRESS,
+      requestId: normalizedRequestId,
+      sourceTabId: typeof sourceTabId === "number" ? sourceTabId : null,
+      text: normalizeWhitespace(progress?.text),
+      detail: normalizeWhitespace(progress?.detail),
+      progressPercent: Math.max(0, Math.min(100, Number(progress?.progressPercent || 0))),
+      status: normalizeWhitespace(progress?.status),
+      searchKey: normalizeWhitespace(progress?.searchKey),
+      workerTabId: typeof progress?.workerTabId === "number" ? progress.workerTabId : null,
+      provider: normalizeWhitespace(progress?.provider),
+      outputChars: Number(progress?.outputChars || 0),
+      manualAction
+    });
+  } catch (_error) {
+    // The side panel may have closed while the job was running.
+  }
+}
+
+function describePeopleSearchCriteria(criteria) {
+  const parts = [];
+  const company = normalizeWhitespace(criteria?.currentCompany);
+  if (company) {
+    parts.push(`company "${company}"`);
+  }
+  (Array.isArray(criteria?.locations) ? criteria.locations : []).map(normalizeWhitespace).filter(Boolean).forEach((location) => {
+    parts.push(`location "${location}"`);
+  });
+  (Array.isArray(criteria?.schools) ? criteria.schools : []).map(normalizeWhitespace).filter(Boolean).forEach((school) => {
+    parts.push(`school "${school}"`);
+  });
+  return parts;
+}
+
+function describeAppliedFilterErrors(appliedFilterResult) {
+  const filters = Array.isArray(appliedFilterResult?.unresolvedFilters) && appliedFilterResult.unresolvedFilters.length
+    ? appliedFilterResult.unresolvedFilters
+    : Array.isArray(appliedFilterResult?.errors) ? appliedFilterResult.errors : [];
+  return filters
+    .map((entry) => {
+      const type = normalizeWhitespace(entry?.type || "filter");
+      const value = normalizeWhitespace(entry?.value || entry?.sourceText || entry?.label || entry?.selectedText);
+      return value ? `${type} "${value}"` : "";
+    })
+    .filter(Boolean);
+}
+
+function peopleSearchFilterActionSummary(searchKey) {
+  return `Search ${normalizeWhitespace(searchKey) || "A"} needs LinkedIn confirmation.`;
+}
+
+function peopleSearchFilterActionDetail(criteria, appliedFilterResult) {
+  const filters = describeAppliedFilterErrors(appliedFilterResult);
+  const fallbackFilters = appliedFilterResult ? [] : describePeopleSearchCriteria(criteria);
+  const targets = filters.length ? filters : fallbackFilters;
+  const targetText = targets.length ? targets.join(", ") : "the LinkedIn search filters";
+  return `Open the LinkedIn search tab, confirm ${targetText}, click Show results, then return here and click Continue.`;
+}
+
+function buildPeopleSearchManualAction({ requestId, workerTabId, searchKey, criteria, appliedFilterResult, reason, progressPercent }) {
+  return {
+    requestId: normalizeWhitespace(requestId),
+    searchKey: normalizeWhitespace(searchKey),
+    workerTabId: typeof workerTabId === "number" ? workerTabId : null,
+    summary: peopleSearchFilterActionSummary(searchKey),
+    detail: peopleSearchFilterActionDetail(criteria, appliedFilterResult),
+    reason: normalizeWhitespace(reason || appliedFilterResult?.error || "LinkedIn needs your confirmation before this search can continue."),
+    removableFilters: failedFiltersFromAppliedFilters(appliedFilterResult),
+    status: "awaiting_user_action",
+    progressPercent: Math.max(0, Math.min(100, Number(progressPercent || 0)))
+  };
+}
+
+function expectedResolvedFilterIdsByParam(search) {
+  const idsByParam = {};
+  (Array.isArray(search?.resolvedFilters) ? search.resolvedFilters : [])
+    .map(normalizeJobOutreachFilterEntry)
+    .filter(Boolean)
+    .forEach((entry) => {
+      idsByParam[entry.param] = uniqueStrings([...(idsByParam[entry.param] || []), entry.id]);
+    });
+  return idsByParam;
+}
+
+function expectedFilterCountsByParam(search) {
+  const counts = Object.fromEntries(Object.entries(expectedResolvedFilterIdsByParam(search)).map(([param, ids]) => [param, ids.length]));
+  (Array.isArray(search?.unresolvedFilters) ? search.unresolvedFilters : []).forEach((filter) => {
+    const type = normalizeWhitespace(filter?.type).toLowerCase();
+    const param = JOB_OUTREACH_FILTER_PARAMS[type];
+    if (!param) {
+      return;
+    }
+    counts[param] = Number(counts[param] || 0) + 1;
+  });
+  return counts;
+}
+
+function filterTypeLabelFromParam(param) {
+  return {
+    geoUrn: "location",
+    currentCompany: "company",
+    schoolFilter: "school"
+  }[normalizeWhitespace(param)] || "filter";
+}
+
+function peopleSearchFilterMismatch(search, response, fallbackUrl) {
+  const urlState = parseLinkedInPeopleSearchUrlState(response?.pageUrl || fallbackUrl || "");
+  const expectedIds = expectedResolvedFilterIdsByParam(search);
+  const expectedCounts = expectedFilterCountsByParam(search);
+  const expectedKeywords = normalizeWhitespace(search?.keywords);
+  if (!expectedKeywords && !Object.keys(expectedIds).length && !Object.keys(expectedCounts).length) {
+    return "";
+  }
+  const idsByParam = urlState.idsByParam;
+  const mismatches = [];
+  if (expectedKeywords) {
+    if (!urlState.keywords) {
+      mismatches.push("keywords missing from LinkedIn URL");
+    } else if (urlState.keywords !== expectedKeywords) {
+      mismatches.push(`keywords expected "${expectedKeywords}" but LinkedIn URL has "${urlState.keywords}"`);
+    }
+  }
+  Object.entries(expectedIds).forEach(([param, ids]) => {
+    const actualIds = idsByParam[param] || [];
+    if (ids.some((id) => !actualIds.includes(id))) {
+      mismatches.push(`${filterTypeLabelFromParam(param)} ids missing from LinkedIn URL`);
+    }
+  });
+  Object.entries(expectedCounts).forEach(([param, count]) => {
+    const actualCount = (idsByParam[param] || []).length;
+    if (actualCount < count) {
+      mismatches.push(`${filterTypeLabelFromParam(param)} expected ${count} selection${count === 1 ? "" : "s"} but LinkedIn URL has ${actualCount}`);
+    }
+  });
+  return uniqueStrings(mismatches).join("; ");
+}
+
+function filterTypeFromJobOutreachParam(param) {
+  return {
+    geoUrn: "location",
+    currentCompany: "company",
+    schoolFilter: "school"
+  }[normalizeWhitespace(param)] || "";
+}
+
+function unresolvedFiltersForMismatch(search, response, fallbackUrl) {
+  const urlState = parseLinkedInPeopleSearchUrlState(response?.pageUrl || fallbackUrl || "");
+  const expectedIds = expectedResolvedFilterIdsByParam(search);
+  const expectedCounts = expectedFilterCountsByParam(search);
+  const idsByParam = urlState.idsByParam;
+  const problemParams = new Set();
+  Object.entries(expectedIds).forEach(([param, ids]) => {
+    const actualIds = idsByParam[param] || [];
+    if (ids.some((id) => !actualIds.includes(id))) {
+      problemParams.add(param);
+    }
+  });
+  Object.entries(expectedCounts).forEach(([param, count]) => {
+    const actualCount = (idsByParam[param] || []).length;
+    if (actualCount < count) {
+      problemParams.add(param);
+    }
+  });
+  const filters = [
+    ...(Array.isArray(search?.unresolvedFilters) ? search.unresolvedFilters : []),
+    ...(Array.isArray(search?.resolvedFilters) ? search.resolvedFilters : []),
+    ...(Array.isArray(search?.filters) ? search.filters : [])
+  ];
+  const seen = new Set();
+  return filters
+    .map((filter) => {
+      const type = normalizeWhitespace(filter?.type).toLowerCase();
+      const param = normalizeWhitespace(filter?.param || JOB_OUTREACH_FILTER_PARAMS[type]);
+      const sourceText = normalizeWhitespace(filter?.sourceText || filter?.value || filter?.label);
+      const label = normalizeWhitespace(filter?.label || sourceText);
+      const id = normalizeWhitespace(filter?.id);
+      if (!type || !param || !sourceText || !problemParams.has(param)) {
+        return null;
+      }
+      if (id && (idsByParam[param] || []).includes(id)) {
+        return null;
+      }
+      const key = `${type}:${id || normalizeFilterCacheKey(type, sourceText)}`;
+      if (seen.has(key)) {
+        return null;
+      }
+      seen.add(key);
+      return {
+        type: type || filterTypeFromJobOutreachParam(param),
+        label,
+        sourceText,
+        id,
+        param,
+        state: "failed"
+      };
+    })
+    .filter(Boolean);
+}
+
+function buildAcceptedPeopleSearchContract({ search, plannedUrl, finalUrl, workerTabId }) {
+  const planned = parseLinkedInPeopleSearchUrlState(plannedUrl);
+  const final = parseLinkedInPeopleSearchUrlState(finalUrl);
+  return {
+    searchKey: normalizeWhitespace(search?.searchKey),
+    workerTabId: typeof workerTabId === "number" ? workerTabId : null,
+    keywords: normalizeWhitespace(final.keywords || planned.keywords || search?.keywords),
+    plannedUrl: planned.url,
+    plannedUrlSignature: planned.signature,
+    finalUrl: final.url,
+    finalUrlSignature: final.signature,
+    expectedFilterCounts: expectedFilterCountsByParam(search)
+  };
+}
+
+function attachPeopleSearchContractToPeople(people, contract) {
+  const searchKey = normalizeWhitespace(contract?.searchKey);
+  const sourceUrl = normalizeWhitespace(contract?.finalUrl);
+  const sourceUrlSignature = normalizeWhitespace(contract?.finalUrlSignature);
+  return (Array.isArray(people) ? people : []).map((person) => ({
+    ...person,
+    sourceSearchKey: searchKey,
+    sourceSearchUrl: sourceUrl,
+    sourceSearchUrlSignature: sourceUrlSignature
+  }));
+}
+
+async function waitForStablePeopleSearchState(tabId, search, options = {}) {
+  const attempts = Math.max(2, Number(options.attempts || 6));
+  let lastResponse = null;
+  let lastObservedUrl = normalizeUrl(options.fallbackUrl || options.plannedUrl || "");
+  let lastMismatch = "";
+  let stableSignature = "";
+  let stableHits = 0;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    await delay(attempt === 1 ? 700 : 900);
+    await options.onProgress?.(attempt);
+    const response = await safeSendLinkedInMessage(tabId, { type: MESSAGE_TYPES.GET_PAGE_CONTEXT });
+    lastResponse = response;
+    const liveTab = await chrome.tabs.get(tabId).catch(() => null);
+    const observedUrl = normalizeWhitespace(response?.pageUrl)
+      || normalizeWhitespace(liveTab?.url)
+      || lastObservedUrl
+      || normalizeUrl(options.fallbackUrl || options.plannedUrl || "");
+    lastObservedUrl = observedUrl;
+    const mismatch = peopleSearchFilterMismatch(search, response, observedUrl);
+    if (mismatch) {
+      lastMismatch = mismatch;
+    }
+    const pageType = normalizeWhitespace(response?.pageType);
+    const signature = linkedInPeopleSearchUrlSignature(observedUrl);
+    const isPeopleSearchPage = pageType === "linkedin-people-search"
+      && /^https:\/\/www\.linkedin\.com\/search\/results\/people\/?(?:[?#]|$)/i.test(observedUrl);
+    if (!isPeopleSearchPage || mismatch || !signature) {
+      stableSignature = "";
+      stableHits = 0;
+      continue;
+    }
+    if (signature === stableSignature) {
+      stableHits += 1;
+    } else {
+      stableSignature = signature;
+      stableHits = 1;
+    }
+    if (stableHits >= 2) {
+      return {
+        ok: true,
+        response,
+        sourceUrl: observedUrl,
+        signature,
+        attemptsUsed: attempt
+      };
+    }
+  }
+  return {
+    ok: false,
+    response: lastResponse,
+    sourceUrl: lastObservedUrl,
+    signature: linkedInPeopleSearchUrlSignature(lastObservedUrl),
+    mismatch: lastMismatch
+  };
+}
+
+async function closeTabIfPresent(tabId) {
+  if (typeof tabId !== "number") {
+    return;
+  }
+  await chrome.tabs.remove(tabId).catch(() => {});
+}
+
+async function ensureJobOutreachWorkerTab(existingTabId, desiredUrl) {
+  const normalizedUrl = normalizeUrl(desiredUrl);
+  if (!normalizedUrl) {
+    throw new Error("A valid LinkedIn people-search URL is required.");
+  }
+  if (typeof existingTabId === "number") {
+    try {
+      const existing = await chrome.tabs.get(existingTabId);
+      const updateInfo = normalizeUrl(existing.url) === normalizedUrl
+        ? { active: false }
+        : { url: normalizedUrl, active: false };
+      const updated = await chrome.tabs.update(existing.id, updateInfo);
+      try {
+        await chrome.tabs.update(updated.id, { autoDiscardable: false });
+      } catch (_error) {}
+      await waitForTabComplete(updated.id, 16000);
+      return updated;
+    } catch (_error) {
+      // Recreate the worker tab if the previous one no longer exists.
+    }
+  }
+  const tab = await chrome.tabs.create({ url: normalizedUrl, active: false });
+  if (!tab?.id) {
+    throw new Error("Unable to open the LinkedIn search tab.");
+  }
+  try {
+    await chrome.tabs.update(tab.id, { autoDiscardable: false });
+  } catch (_error) {}
+  await waitForTabComplete(tab.id, 16000);
+  return tab;
+}
+
+function findJobOutreachSearchPlanUrl(searchPlan, searchKey) {
+  const normalizedSearchKey = normalizeWhitespace(searchKey);
+  return normalizeUrl((Array.isArray(searchPlan?.searches) ? searchPlan.searches : [])
+    .find((search) => normalizeWhitespace(search.searchKey) === normalizedSearchKey)?.url);
+}
+
+function buildJobOutreachRunState({ requestId, sourceTabId, job, searches, stored, runnerOptions, searchPlan }) {
+  return {
+    requestId,
+    sourceTabId,
+    job,
+    searches,
+    stored,
+    runnerOptions,
+    searchPlan,
+    importedSearches: [],
+    nextSearchIndex: 0,
+    workerTabId: null,
+    resumeFromCurrentTab: false,
+    createdAt: toIsoNow(),
+    startedAt: "",
+    completedAt: "",
+    status: "queued",
+    cancelRequested: false,
+    progressText: "",
+    progressDetail: "",
+    progressPercent: 0,
+    manualAction: null,
+    rankingPlan: null,
+    rankingInput: null,
+    diagnostics: null,
+    error: ""
+  };
+}
+
+function refreshPendingJobOutreachSearches(runState) {
+  const searchIndex = Number(runState?.nextSearchIndex || 0);
+  const cache = filterCacheSnapshot(runState?.stored);
+  runState.searches = (Array.isArray(runState?.searches) ? runState.searches : []).map((search, index) => (
+    index < searchIndex ? search : hydrateSearchFilters(search, cache)
+  ));
+}
+
+function jobOutreachFilterMatchesTarget(filter, target) {
+  const type = normalizeWhitespace(filter?.type).toLowerCase();
+  const targetType = normalizeWhitespace(target?.type).toLowerCase();
+  if (!type || !targetType || type !== targetType) {
+    return false;
+  }
+  const filterKey = normalizeFilterCacheKey(type, filter?.sourceText || filter?.value || filter?.label);
+  const labelKey = normalizeFilterCacheKey(type, filter?.label || filter?.sourceText || filter?.value);
+  const targetKey = normalizeFilterCacheKey(targetType, target?.sourceText || target?.value || target?.label);
+  const targetLabelKey = normalizeFilterCacheKey(targetType, target?.label || target?.sourceText || target?.value);
+  return Boolean(targetKey && (filterKey === targetKey || labelKey === targetKey || filterKey === targetLabelKey));
+}
+
+function removeJobOutreachFilterFromSearch(search, target) {
+  const source = search && typeof search === "object" ? search : {};
+  const type = normalizeWhitespace(target?.type).toLowerCase();
+  const criteria = source.criteria || {};
+  const withoutTarget = (filters) => (Array.isArray(filters) ? filters : [])
+    .filter((filter) => !jobOutreachFilterMatchesTarget(filter, target));
+  const removeCriteriaValue = (values) => (Array.isArray(values) ? values : [])
+    .filter((value) => !jobOutreachFilterMatchesTarget({ type, sourceText: value, label: value }, target));
+  const nextCriteria = {
+    locations: type === "location" ? removeCriteriaValue(criteria.locations) : criteria.locations,
+    schools: type === "school" ? removeCriteriaValue(criteria.schools) : criteria.schools,
+    currentCompany: type === "company" && jobOutreachFilterMatchesTarget({ type: "company", sourceText: criteria.currentCompany }, target)
+      ? ""
+      : normalizeWhitespace(criteria.currentCompany)
+  };
+  return {
+    ...source,
+    filters: withoutTarget(source.filters),
+    resolvedFilters: withoutTarget(source.resolvedFilters),
+    unresolvedFilters: withoutTarget(source.unresolvedFilters),
+    failedFilters: withoutTarget(source.failedFilters),
+    criteria: nextCriteria
+  };
+}
+
+function removeJobOutreachFilterFromPausedRun(runState, filter) {
+  const searchIndex = Number(runState?.nextSearchIndex || 0);
+  if (!runState?.searches?.[searchIndex]) {
+    return null;
+  }
+  const target = {
+    type: normalizeWhitespace(filter?.type).toLowerCase(),
+    label: normalizeWhitespace(filter?.label || filter?.sourceText || filter?.value),
+    sourceText: normalizeWhitespace(filter?.sourceText || filter?.value || filter?.label)
+  };
+  if (!target.type || !target.sourceText) {
+    return null;
+  }
+  runState.searches[searchIndex] = hydrateSearchFilters(
+    removeJobOutreachFilterFromSearch(runState.searches[searchIndex], target),
+    filterCacheSnapshot(runState.stored)
+  );
+  runState.resumeFromCurrentTab = false;
+  return target;
+}
+
+function upsertImportedJobOutreachSearch(importedSearches, nextSearch) {
+  const normalizedKey = normalizeWhitespace(nextSearch?.searchKey);
+  const remaining = (Array.isArray(importedSearches) ? importedSearches : []).filter((search) => normalizeWhitespace(search?.searchKey) !== normalizedKey);
+  return [...remaining, nextSearch]
+    .sort((left, right) => searchNumberFromKey(left.searchKey) - searchNumberFromKey(right.searchKey));
+}
+
+async function importPeopleSearchUrl(url, searchKey, expectedSearch, options, onProgress) {
+  const normalizedUrl = normalizeUrl(url);
+  if (!normalizedUrl || !/^https:\/\/www\.linkedin\.com\/search\/results\/people\/?(?:[?#]|$)/i.test(normalizedUrl)) {
+    throw new Error(`Search ${searchKey} did not return a valid LinkedIn people-search URL.`);
+  }
+  const resumeFromCurrentTab = Boolean(options?.resumeFromCurrentTab);
+  let tab;
+  if (resumeFromCurrentTab) {
+    if (typeof options?.workerTabId !== "number") {
+      throw new Error(`Search ${searchKey} cannot resume because the LinkedIn search tab is missing.`);
+    }
+    try {
+      tab = await chrome.tabs.get(options.workerTabId);
+    } catch (_error) {
+      throw new Error("The LinkedIn search tab was closed. Run Search again.");
+    }
+    await onProgress?.(`Reading Search ${searchKey} after your LinkedIn changes.`, {
+      status: "resuming_search",
+      searchKey,
+      workerTabId: tab.id
+    });
+    await waitForTabComplete(tab.id, 16000);
+  } else {
+    await onProgress?.("Opening your LinkedIn people search.", {
+      status: "opening_search",
+      searchKey,
+      workerTabId: typeof options?.workerTabId === "number" ? options.workerTabId : null
+    });
+    tab = await ensureJobOutreachWorkerTab(options?.workerTabId, normalizedUrl);
+    await onProgress?.("Waiting for LinkedIn search page to load.", {
+      status: "loading_search",
+      searchKey,
+      workerTabId: tab.id
+    });
+  }
+
+  const criteriaToResolve = expectedSearch?.unresolvedCriteria || expectedSearch?.criteria || {};
+  const hasFilters = Boolean(
+    normalizeWhitespace(criteriaToResolve?.currentCompany)
+    || (Array.isArray(criteriaToResolve?.locations) && criteriaToResolve.locations.length)
+    || (Array.isArray(criteriaToResolve?.schools) && criteriaToResolve.schools.length)
+  );
+  let appliedFilterResult = null;
+  if (!resumeFromCurrentTab && hasFilters) {
+    await onProgress?.(`Applying LinkedIn filters for Search ${searchKey}.`, {
+      status: "applying_search_filters",
+      searchKey,
+      workerTabId: tab.id
+    });
+    appliedFilterResult = await sendLinkedInMessageToFrame(tab.id, 0, {
+      type: MESSAGE_TYPES.APPLY_PEOPLE_SEARCH_FILTERS,
+      search: {
+        ...expectedSearch,
+        criteria: criteriaToResolve
+      }
+    });
+    if (!appliedFilterResult?.ok || !appliedFilterResult?.applied || appliedFilterResult?.requiresUserAction) {
+      const details = Array.isArray(appliedFilterResult?.errors) && appliedFilterResult.errors.length
+        ? appliedFilterResult.errors.map((entry) => entry.error || entry.value).filter(Boolean).join("; ")
+        : appliedFilterResult?.error || "LinkedIn did not apply the selected filters.";
+      if (appliedFilterResult?.requiresUserAction) {
+        const finalUrl = normalizeWhitespace(appliedFilterResult?.finalUrl) || normalizedUrl;
+        return {
+          paused: true,
+          workerTabId: tab.id,
+          manualAction: buildPeopleSearchManualAction({
+            requestId: options?.requestId,
+            workerTabId: tab.id,
+            searchKey,
+            criteria: expectedSearch?.criteria || criteriaToResolve,
+            appliedFilterResult,
+            progressPercent: options?.progressPercent
+          }),
+          sourceUrl: finalUrl,
+          resolvedFilterUpdates: cacheUpdatesFromAppliedFilters(appliedFilterResult, finalUrl, expectedSearch),
+          failedFilters: failedFiltersFromAppliedFilters(appliedFilterResult)
+        };
+      }
+      throw new Error(`Search ${searchKey} filters were not applied: ${details}`);
+    }
+    await delay(1800);
+  }
+
+  const stableSearchState = await waitForStablePeopleSearchState(tab.id, expectedSearch, {
+    plannedUrl: normalizedUrl,
+    fallbackUrl: appliedFilterResult?.finalUrl || normalizedUrl,
+    onProgress: async (attempt) => onProgress?.(`Reading visible results for Search ${searchKey}.`, {
+      status: "reading_search",
+      searchKey,
+      attempt,
+      workerTabId: tab.id
+    })
+  });
+  if (!stableSearchState.ok) {
+    if (stableSearchState.mismatch) {
+      const mismatchResolvedUpdates = cacheUpdatesFromSearchUrl(expectedSearch, stableSearchState.sourceUrl, stableSearchState.response);
+      return {
+        paused: true,
+        workerTabId: tab.id,
+        manualAction: buildPeopleSearchManualAction({
+          requestId: options?.requestId,
+          workerTabId: tab.id,
+          searchKey,
+          criteria: expectedSearch?.criteria || criteriaToResolve,
+          appliedFilterResult: {
+            unresolvedFilters: unresolvedFiltersForMismatch(expectedSearch, stableSearchState.response, stableSearchState.sourceUrl),
+            error: `LinkedIn still does not show the expected search state: ${stableSearchState.mismatch}.`
+          },
+          reason: `LinkedIn still does not show the expected search state: ${stableSearchState.mismatch}.`,
+          progressPercent: options?.progressPercent
+        }),
+        sourceUrl: stableSearchState.sourceUrl,
+        context: stableSearchState.response,
+        resolvedFilterUpdates: mismatchResolvedUpdates,
+        failedFilters: unresolvedFiltersForMismatch(expectedSearch, stableSearchState.response, stableSearchState.sourceUrl)
+      };
+    }
+    throw new Error(`Search ${searchKey} did not settle on a stable LinkedIn people-search URL.`);
+  }
+
+  const acceptedSearchContract = buildAcceptedPeopleSearchContract({
+    search: expectedSearch,
+    plannedUrl: normalizedUrl,
+    finalUrl: stableSearchState.sourceUrl,
+    workerTabId: tab.id
+  });
+  const stablePeople = attachPeopleSearchContractToPeople(
+    stableSearchState.response?.peopleSearch?.results || [],
+    acceptedSearchContract
+  );
+  if (stablePeople.length) {
+    await onProgress?.(`Found ${stablePeople.length} visible people in Search ${searchKey}.`, {
+      status: "imported_search",
+      searchKey,
+      count: stablePeople.length,
+      workerTabId: tab.id
+    });
+    return {
+      searchKey,
+      workerTabId: tab.id,
+      sourceUrl: acceptedSearchContract.finalUrl,
+      sourceUrlSignature: acceptedSearchContract.finalUrlSignature,
+      context: stableSearchState.response,
+      people: stablePeople,
+      searchContract: acceptedSearchContract,
+      resolvedFilterUpdates: resumeFromCurrentTab
+        ? cacheUpdatesFromSearchUrl(expectedSearch, acceptedSearchContract.finalUrl, stableSearchState.response)
+        : cacheUpdatesFromAppliedFilters(appliedFilterResult, acceptedSearchContract.finalUrl, expectedSearch),
+      failedFilters: resumeFromCurrentTab ? [] : failedFiltersFromAppliedFilters(appliedFilterResult)
+    };
+  }
+  await onProgress?.(`No people were found yet for Search ${searchKey}.`, {
+    status: "search_empty",
+    searchKey,
+    workerTabId: tab.id
+  });
+  return {
+    searchKey,
+    workerTabId: tab.id,
+    sourceUrl: acceptedSearchContract.finalUrl,
+    sourceUrlSignature: acceptedSearchContract.finalUrlSignature,
+    context: stableSearchState.response,
+    people: [],
+    searchContract: acceptedSearchContract,
+    resolvedFilterUpdates: resumeFromCurrentTab
+      ? cacheUpdatesFromSearchUrl(expectedSearch, acceptedSearchContract.finalUrl, stableSearchState.response)
+      : cacheUpdatesFromAppliedFilters(appliedFilterResult, acceptedSearchContract.finalUrl, expectedSearch),
+    failedFilters: resumeFromCurrentTab ? [] : failedFiltersFromAppliedFilters(appliedFilterResult)
+  };
+}
+
+async function importJobOutreachSearches(runState, progress) {
+  const plannedSearches = Array.isArray(runState?.searches) ? runState.searches : [];
+  const plannedCount = plannedSearches.filter((search) => findJobOutreachSearchPlanUrl(runState.searchPlan, search.searchKey)).length;
+  const searchCount = Math.max(1, plannedCount);
+  for (let index = Number(runState.nextSearchIndex || 0); index < plannedSearches.length; index += 1) {
+    throwIfJobOutreachCancelled(runState);
+    const search = runState.searches[index];
+    const plannedUrl = appendResolvedFiltersToSearchUrl(
+      findJobOutreachSearchPlanUrl(runState.searchPlan, search.searchKey),
+      search.resolvedFilters || []
+    );
+    if (!plannedUrl) {
+      continue;
+    }
+    const importBase = 36 + (index / searchCount) * 34;
+    const importSpan = 34 / searchCount;
+    const imported = await importPeopleSearchUrl(plannedUrl, search.searchKey, search, {
+      requestId: runState.requestId,
+      workerTabId: runState.workerTabId,
+      resumeFromCurrentTab: Boolean(runState.resumeFromCurrentTab && index === Number(runState.nextSearchIndex || 0)),
+      progressPercent: Math.min(70, importBase + importSpan * 0.5)
+    }, (text, meta) => {
+      const attempt = Number(meta?.attempt || 0);
+      const attemptOffset = attempt ? Math.min(importSpan * 0.7, attempt * (importSpan / 6)) : 0;
+      const statusOffset = meta?.status === "imported_search"
+        ? importSpan
+        : meta?.status === "reading_search"
+          ? importSpan * 0.45 + attemptOffset
+          : meta?.status === "resuming_search"
+            ? importSpan * 0.18
+            : meta?.status === "loading_search"
+              ? importSpan * 0.25
+              : importSpan * 0.1;
+      return progress(`Reading Search ${search.searchKey}.`, {
+        detail: text,
+        progressPercent: Math.min(70, importBase + statusOffset),
+        status: meta?.status || "importing_search",
+        searchKey: search.searchKey,
+        workerTabId: meta?.workerTabId
+      });
+    });
+    runState.workerTabId = typeof imported?.workerTabId === "number" ? imported.workerTabId : runState.workerTabId;
+    if (imported?.paused) {
+      runState.nextSearchIndex = index;
+      runState.resumeFromCurrentTab = true;
+      runState.status = "awaiting_user_action";
+      runState.manualAction = imported.manualAction || null;
+      const partialResolvedUpdates = Array.isArray(imported.resolvedFilterUpdates) ? imported.resolvedFilterUpdates : [];
+      if (partialResolvedUpdates.length) {
+        runState.stored = await mergeJobOutreachFilterCache(runState.stored, [
+          ...(Array.isArray(search.resolvedFilters) ? search.resolvedFilters : []),
+          ...partialResolvedUpdates
+        ]);
+        refreshPendingJobOutreachSearches(runState);
+      }
+      pendingJobOutreachRuns.set(runState.requestId, runState);
+      const manualAction = imported.manualAction;
+      await progress(manualAction.summary, {
+        detail: [manualAction.detail, manualAction.reason].filter(Boolean).join(" "),
+        progressPercent: manualAction.progressPercent,
+        status: manualAction.status,
+        searchKey: manualAction.searchKey,
+        workerTabId: manualAction.workerTabId,
+        manualAction
+      });
+      return {
+        ok: false,
+        paused: true,
+        requestId: runState.requestId,
+        workerTabId: runState.workerTabId,
+        manualAction,
+        jobOutreachFilterCache: filterCacheSnapshot(runState.stored),
+        error: `${manualAction.summary} ${manualAction.reason}`.trim()
+      };
+    }
+    runState.resumeFromCurrentTab = false;
+    runState.nextSearchIndex = index + 1;
+    const importedSearch = {
+      ...search,
+      plannedUrl,
+      searchUrl: imported.sourceUrl || plannedUrl,
+      searchUrlSignature: normalizeWhitespace(imported.sourceUrlSignature),
+      people: imported.people,
+      importContext: imported.context || null,
+      searchContract: imported.searchContract || null,
+      resolvedFilterUpdates: imported.resolvedFilterUpdates || [],
+      failedFilters: imported.failedFilters || []
+    };
+    runState.importedSearches = upsertImportedJobOutreachSearch(runState.importedSearches, importedSearch);
+    runState.stored = await mergeJobOutreachFilterCache(runState.stored, [
+      ...(Array.isArray(search.resolvedFilters) ? search.resolvedFilters : []),
+      ...(Array.isArray(importedSearch.resolvedFilterUpdates) ? importedSearch.resolvedFilterUpdates : [])
+    ]);
+    refreshPendingJobOutreachSearches(runState);
+    await persistJobOutreachRunState(runState, {
+      status: "running",
+      progressText: runState.progressText,
+      progressDetail: runState.progressDetail,
+      progressPercent: runState.progressPercent,
+      manualAction: null
+    }, { setActive: true, activeRunId: runState.requestId });
+  }
+  return null;
+}
+
+async function finalizeJobOutreachRun(runState, progress) {
+  throwIfJobOutreachCancelled(runState);
+  const importedSearches = runState.importedSearches
+    .slice()
+    .sort((left, right) => searchNumberFromKey(left.searchKey) - searchNumberFromKey(right.searchKey));
+  const importedPeopleBySearch = {};
+  const importedPeopleBySearchKey = {};
+  const sourceJobId = jobIdFromJob(runState.job);
+  for (const search of importedSearches) {
+    const attributedPeople = (Array.isArray(search.people) ? search.people : []).map((person) => ({
+      ...person,
+      sourceJobId: normalizeWhitespace(person?.sourceJobId || sourceJobId),
+      sourceSearchKey: normalizeWhitespace(person?.sourceSearchKey || search.searchKey),
+      sourceSearchUrl: normalizeWhitespace(person?.sourceSearchUrl || search.searchUrl),
+      sourceSearchUrlSignature: normalizeWhitespace(person?.sourceSearchUrlSignature || search.searchUrlSignature)
+    }));
+    importedPeopleBySearch[String(searchNumberFromKey(search.searchKey))] = attributedPeople;
+    importedPeopleBySearchKey[search.searchKey] = attributedPeople;
+  }
+  const importedSearchByKey = new Map(importedSearches.map((search) => [search.searchKey, search]));
+  const importedCount = importedSearches.reduce((total, search) => total + search.people.length, 0);
+  await progress("Visible people ready.", {
+    detail: `${importedCount} visible people found from ${importedSearches.length} search${importedSearches.length === 1 ? "" : "es"}.`,
+    progressPercent: 72,
+    status: "people_imported",
+    workerTabId: runState.workerTabId
+  });
+  if (!importedCount) {
+    const emptyResult = {
+      ok: true,
+      job: runState.job,
+      searches: runState.searches.map((search) => ({
+        index: searchNumberFromKey(search.searchKey) - 1,
+        searchKey: search.searchKey,
+        searchNumber: search.searchNumber,
+        keywords: search.keywords,
+        enabledCriteria: search.enabledCriteria,
+        criteria: search.criteria,
+        filters: searchFilterCandidates(search).map((filter) => ({
+          type: filter.type,
+          label: normalizeWhitespace(filter.label || filter.sourceText),
+          sourceText: normalizeWhitespace(filter.sourceText),
+          id: normalizeWhitespace(filter.id),
+          param: normalizeWhitespace(filter.param || JOB_OUTREACH_FILTER_PARAMS[filter.type]),
+          origin: normalizeWhitespace(filter.origin)
+        })),
+        resolvedFilters: [
+          ...(Array.isArray(search.resolvedFilters) ? search.resolvedFilters : []),
+          ...(Array.isArray(importedSearchByKey.get(search.searchKey)?.resolvedFilterUpdates)
+            ? importedSearchByKey.get(search.searchKey).resolvedFilterUpdates
+            : [])
+        ],
+        unresolvedFilters: search.unresolvedFilters || [],
+        failedFilters: importedSearchByKey.get(search.searchKey)?.failedFilters || [],
+        plannedUrl: importedSearchByKey.get(search.searchKey)?.plannedUrl || findJobOutreachSearchPlanUrl(runState.searchPlan, search.searchKey) || "",
+        url: importedSearchByKey.get(search.searchKey)?.searchUrl || findJobOutreachSearchPlanUrl(runState.searchPlan, search.searchKey) || "",
+        urlSignature: normalizeWhitespace(importedSearchByKey.get(search.searchKey)?.searchUrlSignature),
+        searchContract: importedSearchByKey.get(search.searchKey)?.searchContract || null
+      })),
+      searchPlan: runState.searchPlan,
+      rankingPlan: null,
+      rankingInput: null,
+      importedPeopleBySearch,
+      importedPeopleBySearchKey,
+      diagnostics: {
+        searchPrompt: "",
+        rankingPrompt: "",
+        searchGeneration: {
+          mode: "linkedin_ui_filters",
+          provider: "none"
+        },
+        rankingGeneration: null,
+        importedCounts: Object.fromEntries(Object.entries(importedPeopleBySearch).map(([key, people]) => [key, people.length]))
+      }
+    };
+    const saved = await saveJobOutreachLatestRun(runState.stored, {
+      ...emptyResult,
+      requestId: runState.requestId,
+      searchGenerationAttempt: 0,
+      rankingGenerationAttempt: 0
+    });
+    await progress("Search finished with no visible people.", {
+      detail: "LinkedIn returned no visible people across these searches. Saved the search run without ranking results.",
+      progressPercent: 100,
+      status: "search_empty_complete",
+      workerTabId: runState.workerTabId
+    });
+    return {
+      ...emptyResult,
+      jobOutreachLatestRun: saved.savedRun || null,
+      jobOutreachFilterCache: filterCacheSnapshot(saved.stored)
+    };
+  }
+
+  const mapProviderProgress = (base, span, label) => (providerText, meta) => {
+    const providerPercent = Math.max(0, Math.min(100, Number(meta?.progressPercent || 0)));
+    const mappedPercent = Math.max(base, Math.min(base + span, base + (providerPercent / 100) * span));
+    return progress(label, {
+      detail: normalizeWhitespace(providerText),
+      progressPercent: mappedPercent,
+      status: meta?.status || "provider_running",
+      provider: meta?.provider,
+      outputChars: meta?.outputChars,
+      workerTabId: runState.workerTabId
+    });
+  };
+  const rankingInput = {
+    job: runState.job,
+    myProfile: runState.stored.myProfile,
+    searches: importedSearches.map((search) => ({
+      searchKey: search.searchKey,
+      searchNumber: search.searchNumber,
+      keywords: search.keywords,
+      searchUrl: search.searchUrl,
+      people: search.people
+    }))
+  };
+  runState.rankingInput = rankingInput;
+  await ensurePromptPackReady(runState.stored.promptPackSettings);
+  const rankingPrompt = jobOutreachAi.buildRankingPrompt(rankingInput, runState.stored.promptPackSettings);
+  await progress("AI is ranking people.", {
+    detail: "Comparing visible people against the job and saved profile.",
+    progressPercent: 76,
+    status: "ranking_ai_started",
+    workerTabId: runState.workerTabId
+  });
+  throwIfJobOutreachCancelled(runState);
+  const rankingGeneration = await enqueueChatGptRun(() => runProviderJsonPromptWithRetry({
+    prompt: rankingPrompt,
+    validator: (rawOutput) => jobOutreachAi.validateRankingResponse(rawOutput, rankingInput),
+    contractName: jobOutreachAi.RANKING_CONTRACT_VERSION,
+    sourceTabId: runState.sourceTabId,
+    runnerOptions: runState.runnerOptions,
+    onProgress: mapProviderProgress(76, 20, "AI is ranking people.")
+  }));
+  throwIfJobOutreachCancelled(runState);
+  const rankingPlan = rankingGeneration.value;
+  runState.rankingPlan = rankingPlan;
+  await progress("Ranking complete.", {
+    detail: `${rankingPlan.people?.length || 0} ranked people returned.`,
+    progressPercent: 98,
+    status: "ranking_complete",
+    workerTabId: runState.workerTabId
+  });
+
+  const result = {
+    ok: true,
+    job: runState.job,
+    searches: runState.searches.map((search) => ({
+      index: searchNumberFromKey(search.searchKey) - 1,
+      searchKey: search.searchKey,
+      searchNumber: search.searchNumber,
+      keywords: search.keywords,
+      enabledCriteria: search.enabledCriteria,
+      criteria: search.criteria,
+      filters: searchFilterCandidates(search).map((filter) => ({
+        type: filter.type,
+        label: normalizeWhitespace(filter.label || filter.sourceText),
+        sourceText: normalizeWhitespace(filter.sourceText),
+        id: normalizeWhitespace(filter.id),
+        param: normalizeWhitespace(filter.param || JOB_OUTREACH_FILTER_PARAMS[filter.type]),
+        origin: normalizeWhitespace(filter.origin)
+      })),
+      resolvedFilters: [
+        ...(Array.isArray(search.resolvedFilters) ? search.resolvedFilters : []),
+        ...(Array.isArray(importedSearchByKey.get(search.searchKey)?.resolvedFilterUpdates)
+          ? importedSearchByKey.get(search.searchKey).resolvedFilterUpdates
+          : [])
+      ],
+      unresolvedFilters: search.unresolvedFilters || [],
+      failedFilters: importedSearchByKey.get(search.searchKey)?.failedFilters || [],
+      plannedUrl: importedSearchByKey.get(search.searchKey)?.plannedUrl || findJobOutreachSearchPlanUrl(runState.searchPlan, search.searchKey) || "",
+      url: importedSearchByKey.get(search.searchKey)?.searchUrl || findJobOutreachSearchPlanUrl(runState.searchPlan, search.searchKey) || "",
+      urlSignature: normalizeWhitespace(importedSearchByKey.get(search.searchKey)?.searchUrlSignature),
+      searchContract: importedSearchByKey.get(search.searchKey)?.searchContract || null
+    })),
+    searchPlan: runState.searchPlan,
+    rankingPlan,
+    rankingInput,
+    importedPeopleBySearch,
+    importedPeopleBySearchKey,
+    diagnostics: {
+      searchPrompt: "",
+      rankingPrompt,
+      searchGeneration: {
+        mode: "linkedin_ui_filters",
+        provider: "none"
+      },
+      rankingGeneration: {
+        attempt: rankingGeneration.attempt,
+        provider: rankingGeneration.provider,
+        timings: rankingGeneration.timings || null
+      },
+      importedCounts: Object.fromEntries(Object.entries(importedPeopleBySearch).map(([key, people]) => [key, people.length]))
+    }
+  };
+  runState.diagnostics = result.diagnostics;
+  const saved = await saveJobOutreachLatestRun(runState.stored, {
+    ...result,
+    requestId: runState.requestId,
+    searchGenerationAttempt: 0,
+    rankingGenerationAttempt: rankingGeneration.attempt
+  });
+  return {
+    ...result,
+    jobOutreachLatestRun: saved.savedRun || null,
+    jobOutreachFilterCache: filterCacheSnapshot(saved.stored)
+  };
+}
+
+async function continueJobOutreachWorkflow(runState, progress) {
+  let keepWorkerTabOpen = false;
+  try {
+    const pausedResponse = await importJobOutreachSearches(runState, progress);
+    if (pausedResponse?.paused) {
+      keepWorkerTabOpen = true;
+      return pausedResponse;
+    }
+    pendingJobOutreachRuns.delete(runState.requestId);
+    const result = await finalizeJobOutreachRun(runState, progress);
+    runState.completedAt = toIsoNow();
+    runState.status = "completed";
+    runState.manualAction = null;
+    await persistTerminalJobOutreachRun(runState, {
+      status: "completed",
+      completedAt: runState.completedAt,
+      progressText: "Ranked people ready.",
+      progressDetail: `${(result.rankingPlan?.people || []).length || 0} ranked people returned.`,
+      progressPercent: 100,
+      rankingPlan: result.rankingPlan || null,
+      rankingInput: result.rankingInput || null,
+      importedPeopleBySearch: result.importedPeopleBySearch || {},
+      importedPeopleBySearchKey: result.importedPeopleBySearchKey || {},
+      diagnostics: result.diagnostics || null,
+      manualAction: null,
+      error: ""
+    }, { removeFromPending: true });
+    runState.stored = await maybeStartNextQueuedJobOutreachRun(runState.stored);
+    return result;
+  } catch (error) {
+    const cancelled = normalizeWhitespace(error?.code) === "JOB_OUTREACH_CANCELLED";
+    runState.completedAt = toIsoNow();
+    runState.status = cancelled ? "cancelled" : "failed";
+    runState.error = error?.message || String(error);
+    runState.manualAction = null;
+    await persistTerminalJobOutreachRun(runState, {
+      status: runState.status,
+      completedAt: runState.completedAt,
+      progressText: cancelled ? "Job Outreach cancelled." : "Job Outreach failed.",
+      progressDetail: runState.error,
+      progressPercent: Number(runState.progressPercent || 0),
+      manualAction: null,
+      error: runState.error
+    }, { removeFromPending: true });
+    await sendJobOutreachProgress(runState.requestId, runState.sourceTabId, {
+      text: cancelled ? "Job Outreach cancelled." : "Job Outreach failed.",
+      detail: runState.error,
+      progressPercent: Number(runState.progressPercent || 0),
+      status: runState.status
+    });
+    runState.stored = await maybeStartNextQueuedJobOutreachRun(runState.stored);
+    throw error;
+  } finally {
+    if (!keepWorkerTabOpen) {
+      await closeTabIfPresent(runState.workerTabId);
+      runState.workerTabId = null;
+    }
+  }
+}
+
+async function runJobOutreachWorkflow(message) {
+  if (!jobOutreachAi) {
+    throw new Error("Job outreach AI helpers are not available.");
+  }
+  const requestId = normalizeWhitespace(message?.requestId) || `job_outreach_${Date.now()}`;
+  const sourceTabId = typeof message.sourceTabId === "number" ? message.sourceTabId : null;
+  const stored = await getStoredState();
+  if (!normalizeWhitespace(stored.myProfile?.ownProfileUrl) || !normalizeWhitespace(stored.myProfile?.rawSnapshot)) {
+    throw new Error("Save your sender profile first with Update Profile before running Job outreach.");
+  }
+
+  const pageContext = await getPageContext(sourceTabId);
+  const job = normalizeJobOutreachJob(message.job || pageContext?.job || {});
+  if (!job.title || !job.company) {
+    throw new Error("Open a LinkedIn job first.");
+  }
+  const searches = normalizeJobOutreachSearches(message.searches)
+    .map((search) => hydrateSearchFilters(search, filterCacheSnapshot(stored)));
+  if (!searches.length) {
+    throw new Error("Add at least one search entry.");
+  }
+
+  const promptSettings = normalizePromptSettings(stored.promptSettings || defaultPromptSettings());
+  const runnerOptions = {
+    provider: promptSettings.llmProvider,
+    entryUrl: promptSettings.llmEntryUrl
+  };
+  const rawSearchPlan = jobOutreachAi.buildFallbackSearchUrlResponse({ searches });
+  const searchPlan = {
+    contractVersion: normalizeWhitespace(rawSearchPlan?.contractVersion || rawSearchPlan?.contract_version || jobOutreachAi.SEARCH_URL_CONTRACT_VERSION),
+    searches: (Array.isArray(rawSearchPlan?.searches) ? rawSearchPlan.searches : []).map((search) => ({
+      searchKey: normalizeWhitespace(search.searchKey || search.search_key),
+      keywords: normalizeWhitespace(search.keywords),
+      url: normalizeUrl(search.url)
+    })).filter((search) => search.searchKey && search.url)
+  };
+  const runState = buildJobOutreachRunState({
+    requestId,
+    sourceTabId,
+    job,
+    searches,
+    stored,
+    runnerOptions,
+    searchPlan
+  });
+  pendingJobOutreachRuns.set(requestId, runState);
+  const currentStore = normalizeJobOutreachStore(stored?.jobOutreach);
+  const activeRun = currentStore.activeRunId ? currentStore.runsById[currentStore.activeRunId] : null;
+  const hasBlockingRun = Boolean(activeRun && isJobOutreachRunActiveStatus(activeRun.status));
+  const progress = (text, meta) => persistAndSendJobOutreachProgress(runState, sourceTabId, {
+    text,
+    ...(meta || {})
+  });
+  if (hasBlockingRun) {
+    runState.status = "queued";
+    runState.progressText = "Queued...";
+    runState.progressDetail = "Waiting for the current Job Outreach run to finish.";
+    runState.progressPercent = 0;
+    await persistJobOutreachRunState(runState, {
+      status: "queued",
+      progressText: runState.progressText,
+      progressDetail: runState.progressDetail,
+      progressPercent: 0,
+      manualAction: null
+    }, { enqueue: true, activeRunId: currentStore.activeRunId });
+    await sendJobOutreachProgress(requestId, sourceTabId, {
+      text: "Queued...",
+      detail: "Waiting for the current Job Outreach run to finish.",
+      progressPercent: 0,
+      status: "queued"
+    });
+    const nextStore = normalizeJobOutreachStore(runState.stored?.jobOutreach);
+    return {
+      ...buildJobOutreachQueuedResponse(runState, nextStore.queue.indexOf(requestId) + 1),
+      jobOutreachRuns: jobOutreachRunsForPage({ job }, runState.stored)
+    };
+  }
+  runState.status = "running";
+  runState.startedAt = toIsoNow();
+  await persistJobOutreachRunState(runState, {
+    status: "running",
+    startedAt: runState.startedAt,
+    progressText: "Checking saved profile and LinkedIn job.",
+    progressDetail: "Confirming required context before running outreach.",
+    progressPercent: 4,
+    manualAction: null
+  }, { setActive: true, activeRunId: requestId });
+  await progress("Checking saved profile and LinkedIn job.", {
+    detail: "Confirming required context before running outreach.",
+    progressPercent: 4,
+    status: "checking_context"
+  });
+  await progress("Preparing search criteria.", {
+    detail: `${searches.length} active search${searches.length === 1 ? "" : "es"}: ${searches.map((search) => search.searchKey).join(", ")}.`,
+    progressPercent: 8,
+    status: "preparing_searches"
+  });
+  await progress("Preparing LinkedIn search.", {
+    detail: "Opening keyword search in one background tab, then applying LinkedIn filters one search at a time.",
+    progressPercent: 10,
+    status: "preparing_linkedin_search"
+  });
+  await progress("Search ready.", {
+    detail: `${searchPlan.searches.length} LinkedIn keyword search${searchPlan.searches.length === 1 ? "" : "es"} ready for filter application.`,
+    progressPercent: 35,
+    status: "search_links_ready"
+  });
+  return continueJobOutreachWorkflow(runState, progress);
+}
+
+async function resumeJobOutreachWorkflow(message) {
+  const requestId = normalizeWhitespace(message?.requestId);
+  const runState = pendingJobOutreachRuns.get(requestId);
+  if (!requestId || !runState) {
+    throw new Error("No paused LinkedIn search is waiting to continue.");
+  }
+  const sourceTabId = typeof message.sourceTabId === "number" ? message.sourceTabId : runState.sourceTabId;
+  runState.sourceTabId = sourceTabId;
+  runState.status = "resuming";
+  runState.manualAction = null;
+  const removedFilter = removeJobOutreachFilterFromPausedRun(runState, message?.removeFilter);
+  const progress = (text, meta) => persistAndSendJobOutreachProgress(runState, sourceTabId, {
+    text,
+    ...(meta || {})
+  });
+  await progress(`Resuming Search ${runState.searches[runState.nextSearchIndex]?.searchKey || ""}.`, {
+    detail: removedFilter
+      ? `Removed ${removedFilter.type} "${removedFilter.sourceText}" from this search and continuing.`
+      : "Reading the LinkedIn search tab after your filter changes.",
+    progressPercent: 40,
+    status: "resuming_search",
+    workerTabId: runState.workerTabId
+  });
+  return continueJobOutreachWorkflow(runState, progress);
+}
+
+async function cancelJobOutreachWorkflow(message) {
+  const requestId = normalizeWhitespace(message?.requestId);
+  if (!requestId) {
+    throw new Error("No Job Outreach run matches that id.");
+  }
+  let stored = await getStoredState();
+  const nextStore = await persistNormalizedJobOutreachStore(cancelJobOutreachRunInStore(stored?.jobOutreach, requestId));
+  stored = {
+    ...stored,
+    jobOutreach: nextStore
+  };
+  const run = nextStore.runsById[requestId];
+  const runState = pendingJobOutreachRuns.get(requestId);
+  if (runState) {
+    runState.stored = stored;
+    runState.cancelRequested = Boolean(run?.cancelRequested);
+    runState.status = run?.status || runState.status;
+    runState.manualAction = null;
+  }
+  if (normalizeJobOutreachRunStatus(run?.status) === "cancelled") {
+    if (runState) {
+      pendingJobOutreachRuns.delete(requestId);
+    }
+    await sendJobOutreachProgress(requestId, runState?.sourceTabId || message?.sourceTabId || run?.sourceTabId || null, {
+      text: "Job Outreach cancelled.",
+      detail: "This run was cancelled before completion.",
+      progressPercent: Number(run?.progressPercent || 0),
+      status: "cancelled"
+    });
+    stored = await maybeStartNextQueuedJobOutreachRun(stored);
+  } else {
+    await sendJobOutreachProgress(requestId, runState?.sourceTabId || message?.sourceTabId || run?.sourceTabId || null, {
+      text: "Stopping after the current step.",
+      detail: "This run will stop at the next safe checkpoint.",
+      progressPercent: Number(run?.progressPercent || 0),
+      status: run?.status || "running"
+    });
+  }
+  return {
+    ok: true,
+    requestId,
+    cancelled: normalizeJobOutreachRunStatus(run?.status) === "cancelled",
+    jobOutreachRuns: jobOutreachRunsForPage(message?.pageContext || {}, stored),
+    jobOutreachFilterCache: filterCacheSnapshot(stored)
+  };
+}
+
+async function dismissJobOutreachRunWorkflow(message) {
+  const requestId = normalizeWhitespace(message?.requestId);
+  if (!requestId) {
+    throw new Error("No Job Outreach run matches that id.");
+  }
+  let stored = await getStoredState();
+  const nextStore = await persistNormalizedJobOutreachStore(dismissJobOutreachRunInStore(stored?.jobOutreach, requestId));
+  pendingJobOutreachRuns.delete(requestId);
+  stored = {
+    ...stored,
+    jobOutreach: nextStore
+  };
+  return {
+    ok: true,
+    requestId,
+    dismissed: true,
+    jobOutreachRuns: jobOutreachRunsForPage(message?.pageContext || {}, stored),
+    jobOutreachFilterCache: filterCacheSnapshot(stored)
+  };
+}
+
+async function openJobOutreachWorkerTab(message) {
+  const requestId = normalizeWhitespace(message?.requestId);
+  const pendingRun = requestId ? pendingJobOutreachRuns.get(requestId) : null;
+  const workerTabId = typeof pendingRun?.workerTabId === "number"
+    ? pendingRun.workerTabId
+    : (typeof message?.workerTabId === "number" ? message.workerTabId : null);
+  if (typeof workerTabId !== "number") {
+    throw new Error("No LinkedIn search tab is waiting for confirmation.");
+  }
+  const tab = await chrome.tabs.update(workerTabId, { active: true });
+  if (Number.isInteger(tab?.windowId)) {
+    await chrome.windows.update(tab.windowId, { focused: true }).catch(() => {});
+  }
+  return {
+    ok: true,
+    workerTabId
   };
 }
 
@@ -4573,6 +8077,56 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         return;
       }
 
+      if (message.type === MESSAGE_TYPES.RUN_JOB_OUTREACH) {
+        const result = await runJobOutreachWorkflow(message);
+        sendResponse(result);
+        return;
+      }
+
+      if (message.type === MESSAGE_TYPES.RESUME_JOB_OUTREACH) {
+        const result = await resumeJobOutreachWorkflow(message);
+        sendResponse(result);
+        return;
+      }
+
+      if (message.type === MESSAGE_TYPES.CANCEL_JOB_OUTREACH) {
+        const result = await cancelJobOutreachWorkflow(message);
+        sendResponse(result);
+        return;
+      }
+
+      if (message.type === MESSAGE_TYPES.DISMISS_JOB_OUTREACH_RUN) {
+        const result = await dismissJobOutreachRunWorkflow(message);
+        sendResponse(result);
+        return;
+      }
+
+      if (message.type === MESSAGE_TYPES.OPEN_JOB_OUTREACH_WORKER_TAB) {
+        const result = await openJobOutreachWorkerTab(message);
+        sendResponse(result);
+        return;
+      }
+
+      if (message.type === MESSAGE_TYPES.CAPTURE_LINKEDIN_POST_DISCUSSION) {
+        const result = await captureLinkedInPostDiscussion(message.sourceTabId);
+        sendResponse(result);
+        return;
+      }
+
+      if (message.type === MESSAGE_TYPES.GENERATE_POST_SUGGESTIONS) {
+        const requestId = normalizeWhitespace(message?.requestId) || `post_suggestions_${Date.now()}`;
+        void runPostSuggestionWorkflow({
+          ...message,
+          requestId
+        });
+        sendResponse({
+          ok: true,
+          queued: true,
+          requestId
+        });
+        return;
+      }
+
       if (message.type === MESSAGE_TYPES.GET_STORAGE_STATE) {
         const storageStateTiming = {
           storage_state_total_ms: 0,
@@ -4607,6 +8161,8 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
           normalizeWhitespace(stored.myProfile?.ownProfileUrl)
           && normalizeWhitespace(stored.myProfile?.rawSnapshot)
         );
+        const jobOutreachLatestRun = latestJobOutreachRunForPage(pageContext, stored);
+        const jobOutreachRuns = jobOutreachRunsForPage(pageContext, stored);
         const suppressPersonWorkflow = isPendingProfilePageContext(pageContext, stored);
         if (!hasSavedSenderProfile) {
           sendResponse({
@@ -4614,10 +8170,14 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
             myProfile: stored.myProfile,
             fixedTail: stored.fixedTail,
             promptSettings: stored.promptSettings,
+            promptPackSettings: stored.promptPackSettings,
             chatGptProjectUrl: stored.chatGptProjectUrl,
             allPeople: Object.values(stored.people || {}),
             generationJobs: generationJobsSnapshot(),
             pageContext,
+            jobOutreachLatestRun,
+            jobOutreachRuns,
+            jobOutreachFilterCache: filterCacheSnapshot(stored),
             activeTabId: pageContext?.tabId || null,
             backgroundObservedLinkedInTabId: lastObservedLinkedInTabId,
             backgroundObservedLinkedInTabUrl: lastObservedLinkedInTabUrl,
@@ -4638,10 +8198,14 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
             myProfile: stored.myProfile,
             fixedTail: stored.fixedTail,
             promptSettings: stored.promptSettings,
+            promptPackSettings: stored.promptPackSettings,
             chatGptProjectUrl: stored.chatGptProjectUrl,
             allPeople: Object.values(stored.people || {}),
             generationJobs: generationJobsSnapshot(),
             pageContext,
+            jobOutreachLatestRun,
+            jobOutreachRuns,
+            jobOutreachFilterCache: filterCacheSnapshot(stored),
             activeTabId: pageContext?.tabId || null,
             backgroundObservedLinkedInTabId: lastObservedLinkedInTabId,
             backgroundObservedLinkedInTabUrl: lastObservedLinkedInTabUrl,
@@ -4668,6 +8232,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         let currentPerson = pageContext.supported
           ? await timedStep(storageStateTiming, "storage_state_load_current_person_ms", async () => loadCurrentPersonFromPage(pageContext, stored))
           : null;
+        const pendingProfileHandoff = getPendingProfileIdentityHandoffForPage(pageContext, stored);
         const resolutionDiagnostics = {
           sourceTabId: typeof message.sourceTabId === "number" ? message.sourceTabId : null,
           activeTabId: pageContext?.tabId ?? null,
@@ -4686,6 +8251,9 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
             ]
           ),
           tabBoundPersonId: normalizeWhitespace(stored?.tabPersonBindings?.[String(pageContext?.tabId ?? "")]),
+          pendingProfileHandoffPersonId: normalizeWhitespace(pendingProfileHandoff?.record?.personId || pendingProfileHandoff?.handoff?.personId),
+          pendingProfileHandoffTargetHref: normalizeWhitespace(pendingProfileHandoff?.handoff?.targetHref),
+          pendingProfileHandoffResolvedAt: normalizeWhitespace(pendingProfileHandoff?.handoff?.resolvedAt),
           matchType: normalizeWhitespace(identityResolution?.matchType),
           matchedPersonId: normalizeWhitespace(identityResolution?.matchedRecord?.personId),
           matchedFullName: normalizeWhitespace(identityResolution?.matchedRecord?.fullName),
@@ -4745,10 +8313,14 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
           myProfile: stored.myProfile,
           fixedTail: stored.fixedTail,
           promptSettings: stored.promptSettings,
+          promptPackSettings: stored.promptPackSettings,
           chatGptProjectUrl: stored.chatGptProjectUrl,
           allPeople: Object.values(stored.people || {}),
           generationJobs: generationJobsSnapshot(),
           pageContext,
+          jobOutreachLatestRun,
+          jobOutreachRuns,
+          jobOutreachFilterCache: filterCacheSnapshot(stored),
           activeTabId: pageContext?.tabId || null,
           backgroundObservedLinkedInTabId: lastObservedLinkedInTabId,
           backgroundObservedLinkedInTabUrl: lastObservedLinkedInTabUrl,
@@ -4842,6 +8414,22 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
           });
           return;
         }
+        if (!isForcedFullProfileExtractionResponse(response)) {
+          sendResponse({
+            ok: false,
+            error: "LinkedIn did not finish loading your full profile yet. Scroll the profile once, then try Refresh my profile again.",
+            extractedProfile: response?.profile || null,
+            extractedProfileDebug: {
+              ...(response?.debug || {}),
+              update_my_profile_frame_id: Number.isInteger(response?._frameId) ? response._frameId : 0,
+              update_my_profile_full_profile_rejected: true,
+              update_my_profile_has_section_data: hasFullProfileSectionData(response?.profile),
+              update_my_profile_scroll_passes_run: Number(response?.debug?.profile_scroll_passes_run || 0),
+              update_my_profile_scroll_steps_run: Number(response?.debug?.profile_scroll_steps_run || 0)
+            }
+          });
+          return;
+        }
 
         const stored = await getStoredState();
         const extractedProfile = response.profile || null;
@@ -4851,17 +8439,31 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
           normalizeWhitespace(extractedProfile?.location),
           normalizeWhitespace(extractedProfile?.about)
         ].filter(Boolean).join("\n"));
-        const profile = {
+        const profile = normalizeMyProfileForStorage({
           ownProfileUrl: normalizeLinkedInProfileUrl(activeTab.url)
             || normalizeLinkedInProfileUrl(extractedProfile?.profileUrl || ""),
+          profileData: extractedProfile,
           manualNotes: stored.myProfile?.manualNotes || "",
+          fullName: extractedProfile?.fullName,
+          firstName: extractedProfile?.firstName,
+          headline: extractedProfile?.headline,
+          location: extractedProfile?.location,
+          profileSummary: "",
+          about: extractedProfile?.about,
+          experienceHighlights: extractedProfile?.experienceHighlights,
+          educationHighlights: extractedProfile?.educationHighlights,
+          activitySnippets: extractedProfile?.activitySnippets,
+          languageSnippets: extractedProfile?.languageSnippets,
+          visibleSignals: extractedProfile?.visibleSignals,
+          profileFacts: extractedProfile?.profileFacts,
+          profileCaptureMode: "full",
           rawSnapshot: response.draft?.rawSnapshot || extractedProfile?.rawSnapshot || fallbackRawSnapshot,
           updatedAt: toIsoNow(),
           latestActivitySnippets: Array.isArray(extractedProfile?.activitySnippets) ? extractedProfile.activitySnippets : (stored.myProfile?.latestActivitySnippets || []),
           lastActivitySyncedAt: Array.isArray(extractedProfile?.activitySnippets) && extractedProfile.activitySnippets.length
             ? toIsoNow()
             : normalizeWhitespace(stored.myProfile?.lastActivitySyncedAt)
-        };
+        }, stored.myProfile);
         if (!profile.ownProfileUrl) {
           profile.ownProfileUrl = normalizeLinkedInProfileUrl(stored.myProfile?.ownProfileUrl || "");
         }
@@ -4920,24 +8522,65 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         return;
       }
 
+      if (message.type === MESSAGE_TYPES.LINK_PROFILE_URL_TO_PERSON) {
+        const stored = await getStoredState();
+        const explicitPersonId = normalizeWhitespace(message.personId);
+        const profileUrl = normalizeLinkedInProfileUrl(message.profileUrl);
+        const sourceTabId = Number.isInteger(message.sourceTabId) ? message.sourceTabId : null;
+        const hintedPersonRecord = message.personRecord ? normalizePersonRecord(message.personRecord) : null;
+        let targetPerson = resolveLinkProfileTargetPerson(explicitPersonId, hintedPersonRecord, stored);
+        if (!targetPerson?.personId) {
+          throw new Error("Could not find the saved person record to link this profile URL.");
+        }
+        if (!profileUrl) {
+          throw new Error("No LinkedIn profile URL was provided to link.");
+        }
+        let nextStored = stored;
+        if (!stored?.people?.[targetPerson.personId]) {
+          const seedResult = await upsertPersonRecord(targetPerson, stored);
+          targetPerson = seedResult.merged;
+          nextStored = {
+            ...stored,
+            people: seedResult.people,
+            tabPersonBindings: seedResult.tabPersonBindings,
+            threadPersonBindings: seedResult.threadPersonBindings
+          };
+        }
+        const linkedPerson = linkProfileUrlToPersonRecord(targetPerson, profileUrl);
+        const result = await upsertPersonRecord(linkedPerson, nextStored);
+        nextStored = {
+          ...nextStored,
+          people: result.people,
+          tabPersonBindings: result.tabPersonBindings,
+          threadPersonBindings: result.threadPersonBindings
+        };
+        if (sourceTabId !== null) {
+          const tabBindingResult = await ensureCurrentTabPersonBinding({ tabId: sourceTabId }, result.merged, nextStored);
+          nextStored = tabBindingResult.stored;
+          setPendingProfileIdentityHandoff(sourceTabId, result.merged, profileUrl);
+        }
+        sendResponse({
+          ok: true,
+          personRecord: nextStored.people?.[result.merged.personId] || result.merged
+        });
+        return;
+      }
+
       if (message.type === MESSAGE_TYPES.OPEN_PERSON_MESSAGES) {
-        const targetTab = await getTabForRequest(message.sourceTabId);
+        const sourceTab = await getTabForRequest(message.sourceTabId);
         const profileUrl = normalizeLinkedInProfileUrl(message.profileUrl || "");
         const explicitPersonId = normalizeWhitespace(message.personId);
         const openMessagesStartedAt = Date.now();
-        if (!targetTab?.id) {
+        if (!sourceTab?.id) {
           throw new Error("Could not find the active LinkedIn tab.");
         }
         if (!profileUrl) {
           throw new Error("No LinkedIn profile URL is saved for this person yet.");
         }
-        const currentUrl = normalizeLinkedInProfileUrl(targetTab.url || "") || normalizeWhitespace(targetTab.url || "");
-        const requiresNavigation = currentUrl.replace(/\/+$/, "") !== profileUrl.replace(/\/+$/, "");
-        if (requiresNavigation) {
-          await chrome.tabs.update(targetTab.id, { url: profileUrl, active: true });
-          await waitForTabComplete(targetTab.id, 12000);
-          await delay(700);
-        }
+        const targetTab = await chrome.tabs.create(buildOpenPersonMessagesTabCreateProperties(sourceTab, profileUrl));
+        rememberLinkedInTab(targetTab.id, targetTab.url);
+        await waitForTabComplete(targetTab.id, 12000);
+        await delay(700);
         const response = await sendLinkedInMessageToFrame(targetTab.id, 0, {
           type: MESSAGE_TYPES.OPEN_CURRENT_PROFILE_MESSAGES
         });
@@ -5058,7 +8701,10 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         sendResponse({
           ok: true,
           profileUrl,
-          navigatedToProfile: requiresNavigation,
+          navigatedToProfile: true,
+          openedInNewTab: true,
+          sourceTabId: sourceTab.id,
+          openedTabId: targetTab.id,
           autoImport,
           personRecord,
           openMessagesDebug: {
@@ -5084,16 +8730,29 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       }
 
       if (message.type === MESSAGE_TYPES.SAVE_MY_PROFILE) {
-        const profile = {
+        let stored = await getStoredState();
+        const profile = normalizeMyProfileForStorage({
           ownProfileUrl: normalizeLinkedInProfileUrl(message.profile?.ownProfileUrl || ""),
           pendingProfileUrl: "",
           manualNotes: message.profile?.manualNotes || "",
+          fullName: message.profile?.fullName,
+          firstName: message.profile?.firstName,
+          headline: message.profile?.headline,
+          location: message.profile?.location,
+          profileSummary: "",
+          about: message.profile?.about,
+          profileData: message.profile?.profileData || null,
+          experienceHighlights: message.profile?.experienceHighlights,
+          educationHighlights: message.profile?.educationHighlights,
+          activitySnippets: message.profile?.activitySnippets,
+          languageSnippets: message.profile?.languageSnippets,
+          visibleSignals: message.profile?.visibleSignals,
+          profileFacts: message.profile?.profileFacts,
           rawSnapshot: message.profile?.rawSnapshot || "",
           updatedAt: toIsoNow(),
           latestActivitySnippets: Array.isArray(message.profile?.latestActivitySnippets) ? message.profile.latestActivitySnippets : [],
           lastActivitySyncedAt: normalizeWhitespace(message.profile?.lastActivitySyncedAt)
-        };
-        let stored = await getStoredState();
+        }, stored.myProfile);
         profile.latestActivitySnippets = profile.latestActivitySnippets.length
           ? profile.latestActivitySnippets
           : (Array.isArray(stored.myProfile?.latestActivitySnippets) ? stored.myProfile.latestActivitySnippets : []);
@@ -5133,6 +8792,16 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         }
         await chrome.storage.local.set(updates);
         sendResponse({ ok: true, promptSettings });
+        return;
+      }
+
+      if (message.type === MESSAGE_TYPES.SAVE_PROMPT_PACK_SETTINGS) {
+        const promptPackSettings = normalizePromptPackSettings(message.promptPackSettings || {});
+        await ensurePromptPackReady(promptPackSettings);
+        await chrome.storage.local.set({
+          [STORAGE_KEYS.promptPackSettings]: promptPackSettings
+        });
+        sendResponse({ ok: true, promptPackSettings });
         return;
       }
 
@@ -5359,10 +9028,13 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         try {
           const result = validateWorkspaceResult(
             shared.extractJsonFromText(rawOutput),
-            normalizeFixedTail(message.fixedTail || stored.fixedTail || FIXED_TAIL),
+            normalizeFixedTail(message.fixedTail ?? stored.fixedTail),
             normalizeWhitespace(message.flowType),
             {
               fullName: normalizeWhitespace(message.recipientFullName)
+            },
+            {
+              draftCharacterLimit: normalizeDraftCharacterLimit(message.draftCharacterLimit)
             }
           );
           const workspace = {

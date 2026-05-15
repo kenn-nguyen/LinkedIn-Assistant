@@ -1,9 +1,11 @@
 (function initSidePanel() {
   const shared = globalThis.LinkedInAssistantShared;
   const prompts = globalThis.LinkedInAssistantPrompts;
+  const promptPackRuntime = globalThis.LumiPromptPackRuntime;
   const {
     BUILD_DEBUG_VERSION,
     buildFreshGenerateForRecipientCommand,
+    buildGeneratePostSuggestionsCommand,
     extractOwnProfileName,
     formatConversationTimestampForDisplay,
     MESSAGE_TYPES,
@@ -29,8 +31,19 @@
     FIXED_TAIL,
     normalizeLlmEntryUrl,
     normalizeLlmProvider,
-    providerDisplayName
+    providerDisplayName,
+    SHORT_DRAFT_CHARACTER_LIMIT
   } = prompts;
+  const {
+    defaultPromptPackSettings,
+    getBuiltInPromptSource,
+    listBuiltInPromptChoices,
+    normalizePromptPackSettings
+  } = promptPackRuntime;
+  const promptPackReadyPromise = promptPackRuntime.ensureReady().catch((error) => {
+    console.error("Unable to load prompt pack runtime", error);
+    throw error;
+  });
 
   const state = {
     pageContext: null,
@@ -38,16 +51,37 @@
     attachedLinkedInTabId: null,
     myProfile: defaultMyProfile(),
     promptSettings: defaultPromptSettings(),
+    promptPackSettings: defaultPromptPackSettings(),
+    promptPackDraftSettings: defaultPromptPackSettings(),
+    promptTemplateEditorKey: "relationship",
     fixedTail: FIXED_TAIL,
+    savedFixedTail: FIXED_TAIL,
+    fixedTailDirty: false,
     allPeople: [],
     personRecord: defaultPersonRecord(),
     workspace: null,
     manualRecovery: null,
     extraContext: "",
+    pendingJobDraftContext: "",
+    pendingJobDraftContextTargetUrl: "",
+    pendingJobDraftContextCreatedAt: 0,
+    postDiscussion: null,
+    postCaptureInFlight: false,
+    postCaptureStatus: "",
+    postSuggestionRequestId: "",
+    postSuggestionsInFlight: false,
+    postSuggestionsStatus: "",
+    postSuggestionsResult: null,
+    postTextExpanded: false,
+    postCommentsExpanded: false,
+    postExpandedCommentKeys: {},
+    draftUnder300: true,
     lastImportSyncMessage: "",
     lastStatusIsError: false,
     fixedTailSaveTimer: null,
     showingAlternatives: false,
+    primaryView: "workspace",
+    workspaceType: "person",
     viewMode: "workspace",
     dashboardSection: "reply_now",
     dashboardFilter: "reply_now",
@@ -90,6 +124,7 @@
     refreshInFlight: false,
     refreshPromise: null,
     pendingRefreshOptions: null,
+    personCardRefreshInFlight: false,
     refreshCache: {
       key: "",
       savedAt: 0,
@@ -120,12 +155,30 @@
     panelLoadingOverlay: document.querySelector("#panel-loading-overlay"),
     panelLoadingText: document.querySelector("#panel-loading-text"),
     topToolbar: document.querySelector("#top-toolbar"),
+    workspaceContextToggle: document.querySelector("#workspace-context-toggle"),
+    jobView: document.querySelector("#job-view"),
+    postView: document.querySelector("#post-view"),
+    postCaptureButton: document.querySelector("#post-capture-discussion"),
+    postCaptureStatus: document.querySelector("#post-capture-status"),
+    postCaptureOutput: document.querySelector("#post-capture-output"),
+    postCaptureAuthor: document.querySelector("#post-capture-author"),
+    postCaptureText: document.querySelector("#post-capture-text"),
+    postCaptureCommentCount: document.querySelector("#post-capture-comment-count"),
+    postCommentsList: document.querySelector("#post-comments-list"),
+    postSuggestButton: document.querySelector("#post-generate-suggestions"),
+    postSuggestionsOutput: document.querySelector("#post-suggestions-output"),
+    postSuggestionsSummary: document.querySelector("#post-suggestions-summary"),
+    postSuggestionsAngle: document.querySelector("#post-suggestions-angle"),
+    postSuggestionsList: document.querySelector("#post-suggestions-list"),
     workspaceView: document.querySelector("#workspace-view"),
     statusCard: document.querySelector("#status-card"),
     onboardingSection: document.querySelector("#onboarding-section"),
     recommendationSection: document.querySelector("#recommendation-section"),
     dashboardView: document.querySelector("#dashboard-view"),
     personRecordUuid: document.querySelector("#person-record-uuid"),
+    personViewButton: document.querySelector("#person-view-button"),
+    jobViewButton: document.querySelector("#job-view-button"),
+    postViewButton: document.querySelector("#post-view-button"),
     workspaceViewButton: document.querySelector("#workspace-view-button"),
     dashboardViewButton: document.querySelector("#dashboard-view-button"),
     pageStatus: document.querySelector("#page-status"),
@@ -143,10 +196,10 @@
     connectionStatusPill: document.querySelector("#connection-status-pill"),
     unsupportedPageMessage: document.querySelector("#unsupported-page-message"),
     conversationImportMeta: document.querySelector("#conversation-import-meta"),
+    personCardRefreshButton: document.querySelector("#person-card-refresh-button"),
     personCardEditButton: document.querySelector("#person-card-edit-button"),
     personCardEditor: document.querySelector("#person-card-editor"),
-    settingsButton: document.querySelector("#settings-button"),
-    closeSettingsButton: document.querySelector("#close-settings-button"),
+    settingsViewButton: document.querySelector("#settings-view-button"),
     nextActionButton: document.querySelector("#next-action-button"),
     nextHelperButton: document.querySelector("#next-helper-button"),
     updateProfileButton: document.querySelector("#update-profile-button"),
@@ -174,6 +227,7 @@
     personNoteInput: document.querySelector("#person-note-input"),
     personGoalSelect: document.querySelector("#person-goal-select"),
     extraContextInput: document.querySelector("#extra-context-input"),
+    draftUnder300Checkbox: document.querySelector("#draft-under-300-checkbox"),
     savePersonNoteButton: document.querySelector("#save-person-note-button"),
     recipientSummaryCard: document.querySelector("#recipient-summary-card"),
     recipientProfileMeta: document.querySelector("#recipient-profile-meta"),
@@ -189,6 +243,11 @@
     promptSettingsForm: document.querySelector("#prompt-settings-form"),
     llmProviderSettingsSelect: document.querySelector("#llm-provider-settings-select"),
     llmProviderUrlInput: document.querySelector("#llm-provider-url-input"),
+    promptPackSelect: document.querySelector("#prompt-pack-select"),
+    promptTemplateSelect: document.querySelector("#prompt-template-select"),
+    promptTemplateSource: document.querySelector("#prompt-template-source"),
+    promptTemplateEditor: document.querySelector("#prompt-template-editor"),
+    resetPromptTemplateOverride: document.querySelector("#reset-prompt-template-override"),
     senderProfileSettingsUrl: document.querySelector("#sender-profile-settings-url"),
     openSenderProfileLink: document.querySelector("#open-sender-profile-link"),
     savePromptSettingsButton: document.querySelector("#save-prompt-settings-button"),
@@ -239,6 +298,51 @@
     manualNotes: document.querySelector("#profile-manual-notes"),
     rawSnapshot: document.querySelector("#profile-raw-snapshot")
   };
+
+  function senderProfileJsonForDisplay(profile) {
+    const source = profile || {};
+    const profileData = source.profileData || null;
+    const facts = profileData?.profileFacts || source.profileFacts || {};
+    const recentActivityItems = Array.isArray(facts?.recentActivity?.items)
+      ? facts.recentActivity.items
+      : (Array.isArray(source.latestActivitySnippets) ? source.latestActivitySnippets : [])
+        .map((text, index) => ({
+          rank: index + 1,
+          isLatest: index === 0,
+          type: "post",
+          timestampText: "",
+          text,
+          source: "visible_profile_activity"
+        }));
+    const displayFacts = {
+      schemaVersion: Number(facts.schemaVersion || 1),
+      profileCaptureMode: normalizeWhitespace(profileData?.profileCaptureMode || source.profileCaptureMode || ""),
+      capturedAt: normalizeWhitespace(source.updatedAt || ""),
+      identity: {
+        profileUrl: normalizeWhitespace(source.ownProfileUrl || facts?.identity?.profileUrl || profileData?.profileUrl || ""),
+        fullName: normalizeWhitespace(facts?.identity?.fullName || profileData?.fullName || source.fullName || ""),
+        firstName: normalizeWhitespace(facts?.identity?.firstName || profileData?.firstName || source.firstName || ""),
+        headline: normalizeWhitespace(facts?.identity?.headline || profileData?.headline || source.headline || ""),
+        location: normalizeWhitespace(facts?.identity?.location || profileData?.location || source.location || ""),
+        connectionStatus: normalizeWhitespace(facts?.identity?.connectionStatus || profileData?.connectionStatus || "")
+      },
+      manualContext: {
+        notes: normalizeWhitespace(source.manualNotes || "")
+      },
+      about: {
+        text: normalizeWhitespace(facts?.about?.text || profileData?.about || source.about || "")
+      },
+      experience: Array.isArray(facts.experience) ? facts.experience : [],
+      education: Array.isArray(facts.education) ? facts.education : [],
+      languages: Array.isArray(facts.languages) ? facts.languages : [],
+      recentActivity: {
+        lastSyncedAt: normalizeWhitespace(source.lastActivitySyncedAt || ""),
+        items: recentActivityItems.slice(0, 3)
+      },
+      visibleSignals: facts.visibleSignals || profileData?.visibleSignals || source.visibleSignals || {}
+    };
+    return JSON.stringify(displayFacts, null, 2);
+  }
 
   function setLoading(button, loadingText, isLoading) {
     if (!button) {
@@ -411,6 +515,107 @@
     );
   }
 
+  function canonicalLinkedInProfileUrl(value) {
+    const raw = normalizeWhitespace(value);
+    if (!raw) {
+      return "";
+    }
+    try {
+      const parsed = new URL(raw);
+      const match = parsed.pathname.match(/^\/in\/([^/?#]+)\/?/i);
+      if (match) {
+        return `${parsed.origin}/in/${match[1]}`.toLowerCase();
+      }
+    } catch (_error) {
+      // Fall through to a conservative text comparison.
+    }
+    return raw.replace(/[?#].*$/g, "").replace(/\/+$/g, "").toLowerCase();
+  }
+
+  function clearPendingJobDraftContext() {
+    state.pendingJobDraftContext = "";
+    state.pendingJobDraftContextTargetUrl = "";
+    state.pendingJobDraftContextCreatedAt = 0;
+  }
+
+  function fixedTailFromRefreshResponse(response) {
+    if (Object.prototype.hasOwnProperty.call(response || {}, "fixedTail")) {
+      return response.fixedTail ?? "";
+    }
+    return FIXED_TAIL;
+  }
+
+  function applyFixedTailRefreshResponse(response) {
+    const nextFixedTail = fixedTailFromRefreshResponse(response);
+    state.savedFixedTail = nextFixedTail;
+    if (!state.fixedTailDirty) {
+      state.fixedTail = nextFixedTail;
+    }
+  }
+
+  function syncFixedTailInputFromState() {
+    if (!el.fixedTailInput) {
+      return;
+    }
+    if (document.activeElement === el.fixedTailInput) {
+      state.fixedTail = el.fixedTailInput.value;
+      state.fixedTailDirty = state.fixedTail !== state.savedFixedTail;
+      return;
+    }
+    el.fixedTailInput.value = state.fixedTail;
+  }
+
+  function setPendingJobDraftContext(text, targetUrl) {
+    state.pendingJobDraftContext = String(text || "").trim();
+    state.pendingJobDraftContextTargetUrl = normalizeWhitespace(targetUrl);
+    state.pendingJobDraftContextCreatedAt = Date.now();
+  }
+
+  function buildJobDemoDraftHandoffText(job, person, draftContext) {
+    const jobTitle = normalizeWhitespace(job?.title);
+    const jobCompany = normalizeWhitespace(job?.company);
+    const applyingText = [jobTitle, jobCompany ? `at ${jobCompany}` : ""].filter(Boolean).join(" ");
+    return [
+      normalizeWhitespace(draftContext?.jobBrief) ? `Job brief: ${normalizeWhitespace(draftContext.jobBrief)}` : "",
+      applyingText ? `I am applying to ${applyingText}.` : "",
+      normalizeWhitespace(person?.name) ? `Person: ${normalizeWhitespace(person.name)}.` : "",
+      jobDemoBestUseLabel(draftContext?.bestUse || person?.bestUse) ? `Best use: ${jobDemoBestUseLabel(draftContext?.bestUse || person?.bestUse)}.` : "",
+      normalizeWhitespace(draftContext?.approachStrategy) ? `Approach: ${normalizeWhitespace(draftContext.approachStrategy)}` : "",
+      normalizeWhitespace(draftContext?.reason) ? `Why this person: ${normalizeWhitespace(draftContext.reason)}` : ""
+    ].filter(Boolean).join("\n");
+  }
+
+  function jobDemoBestUseLabel(bestUse) {
+    return {
+      direct_referral_path: "Direct referral path",
+      hiring_context: "Hiring context",
+      warm_entry_point: "Warm entry point",
+      peer_team_insight: "Peer team insight",
+      low_value: "Low value"
+    }[normalizeWhitespace(bestUse)] || "";
+  }
+
+  function pendingJobDraftContextMatchesCurrentPerson(pageContext, personRecord) {
+    const text = String(state.pendingJobDraftContext || "").trim();
+    const targetUrl = canonicalLinkedInProfileUrl(state.pendingJobDraftContextTargetUrl);
+    if (!text || !targetUrl) {
+      return false;
+    }
+    const ageMs = Date.now() - Number(state.pendingJobDraftContextCreatedAt || 0);
+    if (ageMs > 15 * 60 * 1000) {
+      clearPendingJobDraftContext();
+      return false;
+    }
+    const candidates = [
+      pageContext?.pageUrl,
+      pageContext?.profile?.profileUrl,
+      pageContext?.person?.profileUrl,
+      personRecord?.profileUrl,
+      currentProfileUrl()
+    ].map(canonicalLinkedInProfileUrl).filter(Boolean);
+    return candidates.some((candidate) => candidate === targetUrl);
+  }
+
   function isSavedOwnProfilePage() {
     const ownProfileUrl = normalizedOwnProfileUrl();
     const pageUrl = currentProfileUrl();
@@ -447,6 +652,12 @@
 
   function canCaptureCurrentProfilePage() {
     return state.pageContext?.pageType === "linkedin-profile" && Boolean(currentProfileUrl());
+  }
+
+  function canRefreshCurrentPersonCard() {
+    return state.pageContext?.pageType === "linkedin-profile"
+      && !isOwnProfilePage()
+      && Boolean(normalizeWhitespace(state.personRecord?.personId));
   }
 
   function hasSavedSenderProfile() {
@@ -606,6 +817,10 @@
     return `${value.length} chars • ${countWords(value)} words`;
   }
 
+  function selectedDraftCharacterLimit() {
+    return state.draftUnder300 ? SHORT_DRAFT_CHARACTER_LIMIT : null;
+  }
+
   function renderPrimaryDraftMetrics() {
     if (!el.primaryDraftMetrics) {
       return;
@@ -684,6 +899,31 @@
     }
   }
 
+  function subtitleLooksLikeInjectedProfileSuggestion(value) {
+    const normalized = normalizeWhitespace(value);
+    if (!normalized) {
+      return false;
+    }
+    const lower = normalized.toLowerCase();
+    if (/^explore premium profiles\b/i.test(lower)) {
+      return true;
+    }
+    const degreeMatches = normalized.match(/\b(?:1st|2nd|3rd\+?|\d+(?:st|nd|rd|th))\b/ig) || [];
+    return /\bmessage\b/i.test(normalized) && degreeMatches.length >= 1;
+  }
+
+  function extractRoleFromActivitySnapshot(rawSnapshot, displayName) {
+    const text = String(rawSnapshot || "");
+    const name = normalizeWhitespace(displayName);
+    if (!text || !name) {
+      return "";
+    }
+    const match = text.match(
+      new RegExp(`${escapeRegExp(name)}\\s*[•·-]\\s*(?:1st|2nd|3rd\\+?|\\d+(?:st|nd|rd|th))\\s+([^•|\\n]+?)\\s+\\d+(?:yr|yrs|mo|mos|w|d)\\b`, "i")
+    );
+    return cleanHeaderSubtitle(match?.[1] || "", displayName);
+  }
+
   function cleanHeaderSubtitle(value, displayName) {
     const normalized = normalizeWhitespace(value);
     if (!normalized) {
@@ -694,7 +934,43 @@
       ? normalized.replace(new RegExp(`^${escapeRegExp(displayName)}\\s*(?:[-|·:]+\\s*)?`, "i"), "")
       : normalized;
     const cleaned = normalizeWhitespace(withoutName);
+    if (!cleaned) {
+      return "";
+    }
+    if (subtitleLooksLikeInjectedProfileSuggestion(cleaned)) {
+      return "";
+    }
+    if (/^(?:he\/him|she\/her|they\/them)$/i.test(cleaned)) {
+      return "";
+    }
+    if (/reposted this$/i.test(cleaned)) {
+      return "";
+    }
+    const lower = cleaned.toLowerCase();
+    if (/^\d+(?:st|nd|rd|th)\b/.test(lower)) {
+      return "";
+    }
+    if (
+      /^[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\s*[·-]\s*\d+(?:st|nd|rd|th)\b/.test(cleaned)
+      || /^[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\s*[·-]\s*(?:1st|2nd|3rd|\d+th)\b/i.test(cleaned)
+    ) {
+      return "";
+    }
+    if (/\b\d{1,2}(?:mo|yr|w|d)\b/i.test(cleaned) && /^[A-Z]/.test(cleaned)) {
+      return "";
+    }
     return cleaned && cleaned.toLowerCase() !== normalizeWhitespace(displayName).toLowerCase() ? cleaned : "";
+  }
+
+  function resolveHeaderSubtitle(candidates, displayName) {
+    const values = Array.isArray(candidates) ? candidates : [candidates];
+    for (const value of values) {
+      const cleaned = cleanHeaderSubtitle(value, displayName);
+      if (cleaned) {
+        return cleaned;
+      }
+    }
+    return "";
   }
 
   function extractSubtitleFromProfileSummary(summary, displayName) {
@@ -712,6 +988,11 @@
       return "";
     }
 
+    const activityRole = extractRoleFromActivitySnapshot(text, displayName);
+    if (activityRole) {
+      return activityRole;
+    }
+
     const topCardBlockMatch = text.match(/Top card:\s*([\s\S]*?)(?:\n\n|$)/i);
     const topCardText = topCardBlockMatch ? topCardBlockMatch[1] : text;
     const lineCandidates = topCardText
@@ -719,13 +1000,14 @@
       .split("\n")
       .map((segment) => cleanHeaderSubtitle(segment, displayName))
       .filter(Boolean)
+      .filter((segment) => !/^about\b/i.test(segment))
       .filter((segment) => !/^(contact info|message|connect|follow)$/i.test(segment))
       .filter((segment) => !/(united states|area|county|province|contact info)/i.test(segment))
       .filter((segment) => segment.length <= 140)
       .filter((segment) => !/[.!?]\s+[A-Z]/.test(segment));
 
     const best = lineCandidates.find((segment) =>
-      /(manager|director|founder|student|mba|som|program|product|engineer|strategy|marketing|sales|ads|platform|banking|fintech|ai|risk|fraud|yale)/i.test(segment)
+      /(manager|director|founder|student|mba|som|program|product|engineer|strategy|marketing|sales|ads|platform|banking|fintech|ai|risk|fraud|yale|partnership|partnerships|account)/i.test(segment)
     );
     return best || lineCandidates[0] || "";
   }
@@ -947,6 +1229,46 @@
     ].filter(Boolean);
   }
 
+  function buildMissingMessageHistoryNextStep(options) {
+    const visibleThread = Boolean(options?.visibleThread);
+    const connectionStatus = normalizeWhitespace(options?.connectionStatus);
+    const helperProfileAction = options?.helperProfileAction || null;
+    const helperThreadAction = options?.helperThreadAction || null;
+    const draftAction = options?.draftAction || null;
+    const onRecipientProfilePage = Boolean(options?.onRecipientProfilePage);
+    const profileUrl = normalizeWhitespace(options?.profileUrl || "");
+
+    if (visibleThread) {
+      return {
+        badgeLabel: "Thread needed",
+        reason: "Profile is saved. Import the visible thread to tailor the next touch.",
+        primary: { label: "Import conversation", mode: "import_conversation", disabled: false },
+        helper: helperProfileAction,
+        statusText: ""
+      };
+    }
+
+    if (connectionStatus === "connected" && helperThreadAction) {
+      return {
+        badgeLabel: "Thread needed",
+        reason: "Profile is saved. Open the thread before deciding the next touch.",
+        primary: { label: "Open thread", mode: "open_thread", disabled: false, targetUrl: helperThreadAction.targetUrl },
+        helper: helperProfileAction,
+        statusText: ""
+      };
+    }
+
+    return {
+      badgeLabel: "Ready to draft",
+      reason: connectionStatus === "connected"
+        ? "Profile is saved. If you need thread context, open it manually first. Otherwise draft now."
+        : "Profile is saved. You can draft a first message now.",
+      primary: draftAction,
+      helper: helperThreadAction || (!onRecipientProfilePage ? helperProfileAction : (profileUrl ? helperProfileAction : null)),
+      statusText: ""
+    };
+  }
+
   function currentNextStepState() {
     const person = currentNextStepPerson();
     const profileReady = hasRecipientProfileSnapshot(person);
@@ -981,46 +1303,17 @@
     }
 
     if (!messageReady) {
-      if (visibleThread) {
-        return {
-          badgeLabel: "Thread needed",
-          reason: "Profile is saved. Import the visible thread to tailor the next touch.",
-          primary: { label: "Import conversation", mode: "import_conversation", disabled: false },
-          helper: helperProfileAction,
-          evidence: nextStepEvidence(person),
-          statusText: ""
-        };
-      }
-
-      if (connectionStatus === "connected" && helperThreadAction) {
-        return {
-          badgeLabel: "Thread needed",
-          reason: "Profile is saved. Open the thread before deciding the next touch.",
-          primary: { label: "Open thread", mode: "open_thread", disabled: false, targetUrl: threadUrl },
-          helper: helperProfileAction,
-          evidence: nextStepEvidence(person),
-          statusText: ""
-        };
-      }
-
-      if (connectionStatus === "connected") {
-        return {
-          badgeLabel: "No thread yet",
-          reason: "You are connected. Open messages if you want to check for an existing thread before drafting.",
-          primary: { label: "Open messages", mode: "open_messages", disabled: !profileUrl, targetUrl: profileUrl },
-          helper: draftAction,
-          evidence: nextStepEvidence(person),
-          statusText: ""
-        };
-      }
-
       return {
-        badgeLabel: "Ready to draft",
-        reason: "Profile is saved. You can draft a first message now.",
-        primary: draftAction,
-        helper: helperThreadAction || helperProfileAction,
-        evidence: nextStepEvidence(person),
-        statusText: ""
+        ...buildMissingMessageHistoryNextStep({
+          visibleThread,
+          connectionStatus,
+          helperProfileAction,
+          helperThreadAction,
+          draftAction,
+          onRecipientProfilePage,
+          profileUrl
+        }),
+        evidence: nextStepEvidence(person)
       };
     }
 
@@ -1063,7 +1356,7 @@
           title: "No thread yet",
           body: [
             `<p><span class="pill-info__label">What it is:</span> there is no saved message history for this relationship.</p>`,
-            `<p><span class="pill-info__label">What to do:</span> check messages once. If nothing exists, send a crisp first note with one clear reason.</p>`
+            `<p><span class="pill-info__label">What to do:</span> draft from the saved profile context, or open the thread manually first if you need conversation history.</p>`
           ].join("")
         };
       case "Ready to draft":
@@ -2061,7 +2354,7 @@
   }
 
   function isLinkedInWorkspaceUrl(url) {
-    return /^https:\/\/www\.linkedin\.com\/(?:in|messaging)\b/i.test(normalizeWhitespace(url || ""));
+    return /^https:\/\/www\.linkedin\.com\/(?:(?:in|messaging|jobs|search\/results\/people|feed|posts)(?:[/?#]|$)|company\/[^/]+\/posts(?:[/?#]|$))/i.test(normalizeWhitespace(url || ""));
   }
 
   function attachToLinkedInTab(tabId, url) {
@@ -2359,6 +2652,7 @@
 
   function readProfileForm() {
     return {
+      ...state.myProfile,
       ownProfileUrl: normalizeWhitespace(el.senderProfileSettingsUrl?.value || el.senderProfileUrlInput?.value || state.myProfile?.ownProfileUrl || ""),
       manualNotes: configuredSenderManualNotes(),
       rawSnapshot: typeof profileFields.rawSnapshot?.value === "string"
@@ -2390,6 +2684,107 @@
 
   function shouldPreserveUnsavedPromptSettings() {
     return settingsSheetOpen() && state.promptSettingsDirty;
+  }
+
+  function promptTemplateChoices() {
+    return listBuiltInPromptChoices();
+  }
+
+  function normalizePromptTemplateKey(value) {
+    const choices = promptTemplateChoices();
+    const requested = normalizeWhitespace(value);
+    const match = choices.find((choice) => choice.key === requested);
+    return match?.key || choices[0]?.key || "relationship";
+  }
+
+  function clonePromptPackSettings(settings) {
+    return normalizePromptPackSettings(JSON.parse(JSON.stringify(settings || defaultPromptPackSettings())));
+  }
+
+  function builtInPromptTemplateForKey(promptKey, promptPackSettings) {
+    return getBuiltInPromptSource(promptKey, {
+      activePackId: normalizePromptPackSettings(promptPackSettings).activePackId,
+      templateOverrides: {}
+    }).template;
+  }
+
+  function syncPromptTemplateEditor() {
+    const promptPackSettings = clonePromptPackSettings(state.promptPackDraftSettings || state.promptPackSettings);
+    const promptKey = normalizePromptTemplateKey(state.promptTemplateEditorKey);
+    state.promptTemplateEditorKey = promptKey;
+    const source = getBuiltInPromptSource(promptKey, promptPackSettings);
+    if (el.promptPackSelect && document.activeElement !== el.promptPackSelect) {
+      el.promptPackSelect.value = promptPackSettings.activePackId;
+    }
+    if (el.promptTemplateSelect && document.activeElement !== el.promptTemplateSelect) {
+      el.promptTemplateSelect.value = promptKey;
+    }
+    if (el.promptTemplateEditor && document.activeElement !== el.promptTemplateEditor) {
+      el.promptTemplateEditor.value = source.template;
+    }
+    if (el.promptTemplateSource) {
+      el.promptTemplateSource.textContent = source.source === "override" ? "Saved override" : "Built-in template";
+    }
+    if (el.resetPromptTemplateOverride) {
+      el.resetPromptTemplateOverride.disabled = source.source !== "override";
+    }
+  }
+
+  function ensurePromptTemplateSelectOptions() {
+    if (!el.promptTemplateSelect) {
+      return;
+    }
+    const choices = promptTemplateChoices();
+    if (el.promptTemplateSelect.options.length === choices.length) {
+      return;
+    }
+    el.promptTemplateSelect.innerHTML = "";
+    for (const choice of choices) {
+      const option = document.createElement("option");
+      option.value = choice.key;
+      option.textContent = choice.label;
+      el.promptTemplateSelect.appendChild(option);
+    }
+  }
+
+  function populatePromptPackSettingsForm(settings) {
+    if (shouldPreserveUnsavedPromptSettings()) {
+      return;
+    }
+    state.promptPackSettings = clonePromptPackSettings(settings);
+    state.promptPackDraftSettings = clonePromptPackSettings(settings);
+    state.promptTemplateEditorKey = normalizePromptTemplateKey(state.promptTemplateEditorKey);
+    if (el.promptPackSelect) {
+      el.promptPackSelect.innerHTML = "";
+      const option = document.createElement("option");
+      option.value = state.promptPackSettings.activePackId;
+      option.textContent = state.promptPackSettings.activePackId === "default"
+        ? "Default"
+        : state.promptPackSettings.activePackId;
+      el.promptPackSelect.appendChild(option);
+    }
+    ensurePromptTemplateSelectOptions();
+    syncPromptTemplateEditor();
+  }
+
+  function readPromptPackSettingsForm() {
+    return clonePromptPackSettings({
+      ...(state.promptPackDraftSettings || defaultPromptPackSettings()),
+      activePackId: normalizeWhitespace(el.promptPackSelect?.value || state.promptPackSettings?.activePackId || "default")
+    });
+  }
+
+  function updateDraftPromptTemplate(promptKey, nextTemplate) {
+    const normalizedKey = normalizePromptTemplateKey(promptKey);
+    const nextSettings = clonePromptPackSettings(state.promptPackDraftSettings || state.promptPackSettings);
+    const normalizedTemplate = String(nextTemplate || "").replace(/\r\n?/g, "\n");
+    const builtInTemplate = builtInPromptTemplateForKey(normalizedKey, nextSettings);
+    if (!normalizeWhitespace(normalizedTemplate) || normalizedTemplate === builtInTemplate) {
+      delete nextSettings.templateOverrides[normalizedKey];
+    } else {
+      nextSettings.templateOverrides[normalizedKey] = normalizedTemplate;
+    }
+    state.promptPackDraftSettings = nextSettings;
   }
 
   function selectedLlmProviderUrl(providerOverride) {
@@ -2457,7 +2852,7 @@
 
   function isSupportedWorkspaceSurfaceUrl(url) {
     const normalized = normalizeWhitespace(url);
-    return /^https:\/\/www\.linkedin\.com\/(?:in|messaging)\b/i.test(normalized);
+    return /^https:\/\/www\.linkedin\.com\/(?:in|messaging|jobs|search\/results\/people)(?:[/?#]|$)/i.test(normalized);
   }
 
   function clearNavigationHold() {
@@ -2477,7 +2872,11 @@
         ? "linkedin-messaging"
         : /^https:\/\/www\.linkedin\.com\/in\//i.test(normalizedUrl)
           ? "linkedin-profile"
-          : ""
+          : /^https:\/\/www\.linkedin\.com\/jobs(?:[/?#]|$)/i.test(normalizedUrl)
+            ? "linkedin-job"
+            : /^https:\/\/www\.linkedin\.com\/search\/results\/people(?:[/?#]|$)/i.test(normalizedUrl)
+              ? "linkedin-people-search"
+              : ""
     };
   }
 
@@ -2520,6 +2919,7 @@
     state.resolutionDiagnostics = null;
     state.lastOpenMessagesDiagnostics = null;
     state.extraContext = "";
+    clearPendingJobDraftContext();
     state.showingAlternatives = false;
     state.conversationHistoryExpanded = false;
     state.identityResolutionRequest = null;
@@ -2549,24 +2949,23 @@
       || fallbackProfileNameFromPageContext()
       || ""
     ) || loadingDisplayName;
-    const displaySubtitle = cleanHeaderSubtitle(
-      state.pageContext?.person?.headline
-      || state.pageContext?.profile?.headline
-      || state.personRecord?.headline
-      || extractSubtitleFromRawSnapshot(
+    const displaySubtitle = resolveHeaderSubtitle([
+      state.pageContext?.person?.headline,
+      state.pageContext?.profile?.headline,
+      state.personRecord?.headline,
+      extractSubtitleFromRawSnapshot(
         state.pageContext?.profile?.rawSnapshot
         || state.pageContext?.person?.rawSnapshot
         || state.personRecord?.rawSnapshot
         || "",
         displayName
-      )
-      || (
+      ),
+      (
         isTransientMessagingLoad || isTransientProfileLoad
           ? normalizeWhitespace(state.pageContext?.reason || "")
           : ""
-      ),
-      displayName
-    );
+      )
+    ], displayName);
     const observedConversation = currentObservedConversation();
     const draftWorkspace = currentDraftWorkspace();
     const importedAt = observedConversation?.importedAt;
@@ -2604,6 +3003,12 @@
       if (!canEdit) {
         setPersonCardEditorOpen(false);
       }
+    }
+    if (el.personCardRefreshButton) {
+      const canRefresh = canRefreshCurrentPersonCard();
+      el.personCardRefreshButton.classList.toggle("hidden", !canRefresh);
+      el.personCardRefreshButton.disabled = !canRefresh || state.personCardRefreshInFlight;
+      el.personCardRefreshButton.textContent = state.personCardRefreshInFlight ? "Refreshing…" : "Refresh";
     }
     el.conversationImportMeta.textContent = "";
     el.conversationImportMeta.classList.add("hidden");
@@ -2793,7 +3198,14 @@
 
     el.personNoteInput.value = state.personRecord?.personNote || "";
     el.personGoalSelect.value = state.personRecord?.userGoal || "";
-    el.extraContextInput.value = state.extraContext || "";
+    if (document.activeElement === el.extraContextInput) {
+      state.extraContext = el.extraContextInput.value;
+    } else {
+      el.extraContextInput.value = state.extraContext || "";
+    }
+    if (el.draftUnder300Checkbox) {
+      el.draftUnder300Checkbox.checked = state.draftUnder300;
+    }
 
     if (summary || latestActivitySnippets.length || lastProfileSyncedAt) {
       el.recipientSummaryCard.classList.remove("hidden");
@@ -2925,6 +3337,12 @@
       }
       if (/^https:\/\/www\.linkedin\.com\/in\//i.test(normalized)) {
         return "profile";
+      }
+      if (/^https:\/\/www\.linkedin\.com\/jobs(?:[/?#]|$)/i.test(normalized)) {
+        return "job";
+      }
+      if (/^https:\/\/www\.linkedin\.com\/search\/results\/people(?:[/?#]|$)/i.test(normalized)) {
+        return "people_search";
       }
       return "other";
     }
@@ -3062,7 +3480,7 @@
       return;
     }
     el.pageDiagnostics.value = JSON.stringify(diagnostics, null, 2);
-    el.senderProfileExtracted.value = state.myProfile?.rawSnapshot || "";
+    el.senderProfileExtracted.value = senderProfileJsonForDisplay(state.myProfile);
     el.manualPrompt.value = state.manualRecovery?.prompt || liveProviderPrompt || draftWorkspace?.providerPrompt || "";
     el.manualRawOutput.value = state.manualRecovery?.rawOutput || draftWorkspace?.rawOutput || "";
   }
@@ -3171,14 +3589,300 @@
     });
   }
 
+  function workspaceModeFromViewMode(viewMode) {
+    if (viewMode === "job") {
+      return "job";
+    }
+    if (viewMode === "post") {
+      return "post";
+    }
+    return "person";
+  }
+
+  function viewModeFromWorkspaceType(workspaceType) {
+    if (workspaceType === "job") {
+      return "job";
+    }
+    if (workspaceType === "post") {
+      return "post";
+    }
+    return "workspace";
+  }
+
+  function postDiscussionKey(discussion, pageContext) {
+    return normalizeWhitespace(
+      discussion?.postUrl
+      || pageContext?.postDiscussion?.postUrl
+      || pageContext?.pageUrl
+      || ""
+    ).toLowerCase();
+  }
+
+  function truncatePostText(text, limit) {
+    const raw = String(text || "").trim();
+    if (!raw || raw.length <= limit) {
+      return raw;
+    }
+    const slice = raw.slice(0, Math.max(0, limit));
+    const boundary = Math.max(slice.lastIndexOf(" "), slice.lastIndexOf("\n"));
+    const trimmed = (boundary >= Math.floor(limit * 0.6) ? slice.slice(0, boundary) : slice).trim();
+    return `${trimmed}...`;
+  }
+
+  function buildExpandToggle(expanded, onToggle) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "post-inline-toggle";
+    button.textContent = expanded ? "...less" : "...more";
+    button.addEventListener("click", onToggle);
+    return button;
+  }
+
+  function renderExpandableInlineText(element, text, options = {}) {
+    if (!element) {
+      return;
+    }
+    const normalized = String(text || "").trim();
+    const limit = Number.isFinite(Number(options.limit)) ? Number(options.limit) : 300;
+    const expanded = Boolean(options.expanded);
+    const shouldCollapse = normalized.length > limit;
+    const displayText = shouldCollapse && !expanded ? truncatePostText(normalized, limit) : normalized;
+    element.replaceChildren();
+    element.append(document.createTextNode(displayText));
+    if (shouldCollapse) {
+      element.append(document.createTextNode(" "));
+      element.append(buildExpandToggle(expanded, options.onToggle));
+    }
+  }
+
+  function postCommentKey(comment, index) {
+    return normalizeWhitespace(
+      comment?.commentUrn
+      || comment?.authorUrl
+      || comment?.authorName
+      || `comment-${index + 1}`
+    ).toLowerCase();
+  }
+
+  function renderPostComments(comments) {
+    if (!el.postCommentsList) {
+      return;
+    }
+    el.postCommentsList.replaceChildren();
+    const visibleComments = Array.isArray(comments) ? comments.filter((comment) => normalizeWhitespace(comment?.text || comment?.authorName || "")) : [];
+    if (!visibleComments.length) {
+      const empty = document.createElement("p");
+      empty.className = "meta-text post-empty-state";
+      empty.textContent = "No visible comments captured yet.";
+      el.postCommentsList.append(empty);
+      return;
+    }
+    const visibleLimit = state.postCommentsExpanded ? 10 : 4;
+    visibleComments.slice(0, visibleLimit).forEach((comment, index) => {
+      const commentKey = postCommentKey(comment, index);
+      const isExpanded = Boolean(state.postExpandedCommentKeys?.[commentKey]);
+      const item = document.createElement("article");
+      item.className = "post-comment-item";
+      const author = document.createElement("p");
+      author.className = "post-comment-author";
+      author.textContent = normalizeWhitespace(comment.authorName || "LinkedIn member");
+      const text = document.createElement("p");
+      text.className = "post-comment-text";
+      renderExpandableInlineText(text, normalizeWhitespace(comment.text || ""), {
+        expanded: isExpanded,
+        limit: 220,
+        onToggle: () => {
+          state.postExpandedCommentKeys = {
+            ...(state.postExpandedCommentKeys || {}),
+            [commentKey]: !isExpanded
+          };
+          renderPostWorkspace();
+        }
+      });
+      item.append(author, text);
+      el.postCommentsList.append(item);
+    });
+    if (visibleComments.length > 4) {
+      const footer = document.createElement("div");
+      footer.className = "post-comments-footer";
+      footer.append(buildExpandToggle(state.postCommentsExpanded, () => {
+        state.postCommentsExpanded = !state.postCommentsExpanded;
+        renderPostWorkspace();
+      }));
+      el.postCommentsList.append(footer);
+    }
+  }
+
+  function renderPostSuggestions(result) {
+    if (!el.postSuggestionsList) {
+      return;
+    }
+    el.postSuggestionsList.replaceChildren();
+    const suggestions = Array.isArray(result?.suggestions) ? result.suggestions.filter((item) => normalizeWhitespace(item?.message)) : [];
+    el.postSuggestionsOutput?.classList.toggle("hidden", !suggestions.length);
+    if (el.postSuggestionsSummary) {
+      el.postSuggestionsSummary.textContent = normalizeWhitespace(result?.postSummary || "");
+    }
+    if (el.postSuggestionsAngle) {
+      el.postSuggestionsAngle.textContent = normalizeWhitespace(result?.interactionRead || "");
+    }
+    suggestions.forEach((suggestion) => {
+      const item = document.createElement("article");
+      item.className = "post-suggestion-item";
+      const meta = document.createElement("p");
+      meta.className = "post-suggestion-meta";
+      meta.textContent = [
+        normalizeWhitespace(suggestion.type || "").replace(/^\w/, (char) => char.toUpperCase()),
+        normalizeWhitespace(suggestion.target || "")
+      ].filter(Boolean).join(" · ");
+      const message = document.createElement("p");
+      message.className = "post-suggestion-message";
+      message.textContent = normalizeWhitespace(suggestion.message || "");
+      const footer = document.createElement("div");
+      footer.className = "post-suggestion-footer";
+      const reason = document.createElement("p");
+      reason.className = "post-suggestion-reason meta-text";
+      reason.textContent = normalizeWhitespace(suggestion.reason || "");
+      const copyButton = document.createElement("button");
+      copyButton.type = "button";
+      copyButton.className = "secondary-button post-suggestion-copy";
+      copyButton.textContent = "Copy";
+      copyButton.addEventListener("click", () => {
+        void copyToClipboard(suggestion.message || "");
+      });
+      footer.append(reason, copyButton);
+      item.append(meta, message, footer);
+      el.postSuggestionsList.append(item);
+    });
+  }
+
+  function renderPostWorkspace() {
+    const pageType = normalizeWhitespace(state.pageContext?.pageType || "");
+    const hasPostContext = pageType === "linkedin-post" || Boolean(state.postDiscussion || state.pageContext?.postDiscussion);
+    const discussion = state.postDiscussion || state.pageContext?.postDiscussion || null;
+    if (el.postCaptureButton) {
+      el.postCaptureButton.disabled = !hasPostContext || state.postCaptureInFlight;
+      el.postCaptureButton.textContent = state.postCaptureInFlight ? "Capturing..." : "Capture";
+    }
+    if (el.postSuggestButton) {
+      el.postSuggestButton.disabled = !discussion || state.postSuggestionsInFlight;
+      el.postSuggestButton.textContent = state.postSuggestionsInFlight ? "Thinking..." : "Suggest";
+    }
+    if (el.postCaptureStatus) {
+      el.postCaptureStatus.textContent = state.postSuggestionsStatus
+        || state.postCaptureStatus
+        || (hasPostContext
+          ? "Double-click a post or click its comment action, then capture the visible discussion."
+          : "Open a LinkedIn feed or company post to use this workspace.");
+      el.postCaptureStatus.classList.toggle("is-error", Boolean((state.postCaptureStatus || state.postSuggestionsStatus) && !discussion));
+    }
+    el.postCaptureOutput?.classList.toggle("hidden", !discussion);
+    if (!discussion) {
+      el.postSuggestionsOutput?.classList.add("hidden");
+      renderPostComments([]);
+      renderPostSuggestions(null);
+      return;
+    }
+    if (el.postCaptureAuthor) {
+      const author = normalizeWhitespace(discussion.authorName || "");
+      const commentCount = Number(discussion.commentCount || (Array.isArray(discussion.comments) ? discussion.comments.length : 0));
+      el.postCaptureAuthor.textContent = [author || "LinkedIn post", commentCount ? `${commentCount} comments` : ""].filter(Boolean).join(" · ");
+    }
+    if (el.postCaptureText) {
+      renderExpandableInlineText(
+        el.postCaptureText,
+        normalizeWhitespace(discussion.postText || "No visible post text captured yet."),
+        {
+          expanded: state.postTextExpanded,
+          limit: 420,
+          onToggle: () => {
+            state.postTextExpanded = !state.postTextExpanded;
+            renderPostWorkspace();
+          }
+        }
+      );
+    }
+    if (el.postCaptureCommentCount) {
+      const commentCount = Number(discussion.commentCount || (Array.isArray(discussion.comments) ? discussion.comments.length : 0));
+      el.postCaptureCommentCount.textContent = commentCount ? `${commentCount} captured` : "";
+    }
+    renderPostComments(discussion.comments);
+    renderPostSuggestions(state.postSuggestionsResult);
+  }
+
+  function applyWorkspaceContextAvailability(pageContext) {
+    const pageType = normalizeWhitespace(pageContext?.pageType || "");
+    const hasPersonContext = Boolean(
+      normalizeWhitespace(state.personRecord?.personId)
+      || pageType === "linkedin-profile"
+      || pageType === "linkedin-messaging"
+    );
+    const hasJobContext = pageType === "linkedin-job" || Boolean(pageContext?.job);
+    if (el.personViewButton) {
+      el.personViewButton.disabled = !hasPersonContext;
+      el.personViewButton.title = hasPersonContext ? "" : "Open a LinkedIn profile or message thread";
+    }
+    if (el.jobViewButton) {
+      el.jobViewButton.disabled = !hasJobContext;
+      el.jobViewButton.title = hasJobContext ? "" : "Open a LinkedIn job";
+    }
+    if (el.postViewButton) {
+      const hasPostContext = pageType === "linkedin-post" || Boolean(pageContext?.postDiscussion);
+      el.postViewButton.disabled = !hasPostContext;
+      el.postViewButton.title = hasPostContext ? "" : "Open a LinkedIn feed or company post";
+    }
+  }
+
   function setViewMode(nextMode) {
-    state.viewMode = nextMode === "dashboard" ? "dashboard" : "workspace";
+    state.primaryView = nextMode === "dashboard"
+      ? "dashboard"
+      : nextMode === "settings"
+        ? "settings"
+        : "workspace";
+    if (state.primaryView === "workspace") {
+      state.workspaceType = workspaceModeFromViewMode(nextMode);
+    }
+    state.viewMode = state.primaryView === "dashboard"
+      ? "dashboard"
+      : state.primaryView === "settings"
+        ? "settings"
+        : viewModeFromWorkspaceType(state.workspaceType);
+    applyWorkspaceContextAvailability(state.pageContext);
+    el.workspaceContextToggle?.classList.toggle("hidden", state.primaryView !== "workspace");
+    el.jobView?.classList.toggle("hidden", state.viewMode !== "job");
+    el.postView?.classList.toggle("hidden", state.viewMode !== "post");
     el.workspaceView.classList.toggle("hidden", state.viewMode !== "workspace");
     el.dashboardView.classList.toggle("hidden", state.viewMode !== "dashboard");
-    el.workspaceViewButton.classList.toggle("is-active", state.viewMode === "workspace");
-    el.dashboardViewButton.classList.toggle("is-active", state.viewMode === "dashboard");
-    if (state.viewMode === "dashboard") {
+    el.settingsSection?.classList.toggle("hidden", state.viewMode !== "settings");
+    el.workspaceViewButton.classList.toggle("is-active", state.primaryView === "workspace");
+    el.dashboardViewButton.classList.toggle("is-active", state.primaryView === "dashboard");
+    el.settingsViewButton?.classList.toggle("is-active", state.primaryView === "settings");
+    el.personViewButton?.classList.toggle("is-active", state.workspaceType === "person");
+    el.jobViewButton?.classList.toggle("is-active", state.workspaceType === "job");
+    el.postViewButton?.classList.toggle("is-active", state.workspaceType === "post");
+    if (state.workspaceType === "job" && state.primaryView === "workspace") {
+      globalThis.LumiJobOutreachDemo?.render?.();
+    }
+    if (state.workspaceType === "post" && state.primaryView === "workspace") {
+      renderPostWorkspace();
+    }
+    if (state.primaryView === "dashboard") {
       renderDashboard();
+    }
+  }
+
+  function syncViewModeToPageContext(pageContext) {
+    applyWorkspaceContextAvailability(pageContext);
+    if (state.primaryView === "dashboard" || state.primaryView === "settings") {
+      return;
+    }
+    const pageType = normalizeWhitespace(pageContext?.pageType || "");
+    if (pageType === "linkedin-job" && state.workspaceType !== "job") {
+      setViewMode("job");
+    } else if (pageType === "linkedin-post" && state.workspaceType !== "post" && !el.postViewButton?.disabled) {
+      setViewMode("post");
+    } else if ((pageType === "linkedin-profile" || pageType === "linkedin-messaging") && state.workspaceType !== "person") {
+      setViewMode("workspace");
     }
   }
 
@@ -3331,6 +4035,7 @@
     );
 
     el.topToolbar?.classList.remove("hidden");
+    el.workspaceContextToggle?.classList.toggle("hidden", state.primaryView !== "workspace");
 
     renderHeader();
     const nextStep = renderRecommendation();
@@ -3528,6 +4233,7 @@
     const previousPersonRecord = state.personRecord;
     const previousWorkspace = state.workspace;
     const previousPageUrl = normalizeWhitespace(state.pageContext?.pageUrl || "");
+    const previousPostKey = postDiscussionKey(state.postDiscussion || state.pageContext?.postDiscussion, state.pageContext);
     const previousViewKey = personViewKey(previousPersonRecord, state.pageContext?.conversation);
     const nextPageContext = response.pageContext;
     const isTransientMessagingLoad = nextPageContext?.pageType === "linkedin-messaging"
@@ -3544,6 +4250,19 @@
     );
 
     state.pageContext = nextPageContext;
+    const nextPostKey = postDiscussionKey(nextPageContext?.postDiscussion, nextPageContext);
+    if (!nextPostKey || (previousPostKey && nextPostKey !== previousPostKey)) {
+      state.postDiscussion = nextPageContext?.postDiscussion || null;
+      state.postSuggestionsResult = null;
+      state.postSuggestionsStatus = "";
+      state.postSuggestionRequestId = "";
+      state.postSuggestionsInFlight = false;
+      state.postTextExpanded = false;
+      state.postCommentsExpanded = false;
+      state.postExpandedCommentKeys = {};
+    } else if (!state.postDiscussion && nextPageContext?.postDiscussion) {
+      state.postDiscussion = nextPageContext.postDiscussion;
+    }
     state.activeTabId = response.activeTabId || response.pageContext?.tabId || null;
     state.attachedLinkedInTabId = response.activeTabId
       || response.pageContext?.tabId
@@ -3556,8 +4275,18 @@
     state.pendingLinkedInNavigation = response.pendingLinkedInNavigation || null;
     state.messagingReload = response.messagingReload || null;
     state.myProfile = response.myProfile || defaultMyProfile();
-    state.fixedTail = response.fixedTail || FIXED_TAIL;
+    applyFixedTailRefreshResponse(response);
     state.promptSettings = response.promptSettings || defaultPromptSettings();
+    state.promptPackSettings = response.promptPackSettings || defaultPromptPackSettings();
+    globalThis.LumiJobOutreachDemo?.setRuntimeContext?.({
+      pageContext: state.pageContext,
+      jobOutreachLatestRun: response.jobOutreachLatestRun || null,
+      jobOutreachRuns: response.jobOutreachRuns || null,
+      jobOutreachFilterCache: response.jobOutreachFilterCache || {},
+      myProfile: state.myProfile,
+      activeTabId: state.activeTabId
+    });
+    syncViewModeToPageContext(state.pageContext);
     state.allPeople = Array.isArray(response.allPeople) ? response.allPeople : [];
     state.generationJobs = Array.isArray(response.generationJobs) ? response.generationJobs : [];
     state.identityWarning = response.identityWarning || null;
@@ -3604,13 +4333,17 @@
     } else if (!state.extraContext && currentDraftWorkspace(state.personRecord)?.extra_context) {
       state.extraContext = currentDraftWorkspace(state.personRecord).extra_context;
     }
+    if (pendingJobDraftContextMatchesCurrentPerson(nextPageContext, state.personRecord)) {
+      state.extraContext = state.pendingJobDraftContext;
+    }
     const currentViewKey = personViewKey(state.personRecord, state.pageContext?.conversation);
     if (normalizeWhitespace(state.personRecord?.personId) && currentViewKey) {
       markCtaReady(currentViewKey, state.personRecord.personId);
     }
-    el.fixedTailInput.value = state.fixedTail;
+    syncFixedTailInputFromState();
     populateProfileForm(state.myProfile);
     populatePromptSettingsForm(state.promptSettings);
+    populatePromptPackSettingsForm(state.promptPackSettings);
     const shouldPreserveStatus = Boolean(options?.preserveStatus) && currentViewKey === previousViewKey;
     restoreStatusStateForCurrentScope();
     renderPageStatus({ preserveStatus: shouldPreserveStatus });
@@ -3638,6 +4371,7 @@
   }
 
   async function performRefreshState(options) {
+    await promptPackReadyPromise;
     const requestedSourceTabId = await getSourceTabId();
     const refreshCacheKey = buildRefreshCacheKey(requestedSourceTabId);
     const cachedResponse = readCachedRefreshResponse(refreshCacheKey, options);
@@ -3678,13 +4412,19 @@
   }
 
   async function saveFixedTail(nextValue) {
+    const submittedValue = String(nextValue ?? "");
     const response = await chrome.runtime.sendMessage({
       type: MESSAGE_TYPES.SAVE_FIXED_TAIL,
-      fixedTail: nextValue
+      fixedTail: submittedValue
     });
     if (response?.ok) {
-      state.fixedTail = response.fixedTail;
-      el.fixedTailInput.value = state.fixedTail;
+      const persistedValue = response.fixedTail ?? "";
+      state.savedFixedTail = persistedValue;
+      if ((el.fixedTailInput?.value || "") === submittedValue) {
+        state.fixedTail = persistedValue;
+        state.fixedTailDirty = false;
+        syncFixedTailInputFromState();
+      }
     }
   }
 
@@ -3693,6 +4433,7 @@
     const response = await chrome.runtime.sendMessage({
       type: MESSAGE_TYPES.SAVE_MY_PROFILE,
       profile: {
+        ...state.myProfile,
         ownProfileUrl,
         manualNotes: state.myProfile?.manualNotes || "",
         rawSnapshot: state.myProfile?.rawSnapshot || ""
@@ -3727,7 +4468,6 @@
     const currentUrl = currentProfileUrl();
     if (currentUrl && currentUrl.replace(/\/+$/, "") === url.replace(/\/+$/, "")) {
       setViewMode("workspace");
-      el.settingsSection?.classList.add("hidden");
       void refreshState({ preserveStatus: true, suppressImportStatus: true });
       renderPageStatus({ preserveStatus: true });
       setStatus("You are already on your LinkedIn profile.", false);
@@ -3736,7 +4476,6 @@
     try {
       const sourceTabId = await getSourceTabId();
       setViewMode("workspace");
-      el.settingsSection?.classList.add("hidden");
       applyOptimisticNavigationHint(url, "");
       if (sourceTabId) {
         await chrome.tabs.update(sourceTabId, { url, active: true });
@@ -3773,7 +4512,20 @@
 
     try {
       const sourceTabId = await getSourceTabId();
-      if (sourceTabId) {
+      if (kind === "profile" && person?.personId && destinationUrl) {
+        const linkResponse = await chrome.runtime.sendMessage({
+          type: MESSAGE_TYPES.LINK_PROFILE_URL_TO_PERSON,
+          sourceTabId: typeof sourceTabId === "number" ? sourceTabId : null,
+          personId: normalizeWhitespace(person.personId),
+          profileUrl: destinationUrl,
+          personRecord: person
+        });
+        if (linkResponse?.ok && linkResponse.personRecord?.personId) {
+          state.personRecord = mergePersonRecord(state.personRecord, linkResponse.personRecord);
+          upsertLocalPersonRecord(linkResponse.personRecord);
+        }
+      }
+      if (typeof sourceTabId === "number") {
         await chrome.tabs.update(sourceTabId, { url: destinationUrl, active: true });
       } else {
         window.open(destinationUrl, "_blank", "noopener,noreferrer");
@@ -3786,20 +4538,50 @@
     }
   }
 
+  function normalizeOpenCurrentLinkedInMessagesOptions(profileUrlOverride) {
+    if (typeof profileUrlOverride === "string") {
+      return {
+        profileUrl: normalizeWhitespace(profileUrlOverride),
+        progressStatusText: "",
+        openedStatusText: "",
+        suppressImportStatus: false,
+        source: "next_step"
+      };
+    }
+    return {
+      profileUrl: normalizeWhitespace(profileUrlOverride?.profileUrl || ""),
+      progressStatusText: normalizeWhitespace(profileUrlOverride?.progressStatusText || ""),
+      openedStatusText: normalizeWhitespace(profileUrlOverride?.openedStatusText || ""),
+      suppressImportStatus: Boolean(profileUrlOverride?.suppressImportStatus),
+      source: normalizeWhitespace(profileUrlOverride?.source || "next_step")
+    };
+  }
+
+  function isAutomatedMessageOpenAllowed(options) {
+    return normalizeWhitespace(options?.source || "") === "job_demo";
+  }
+
   async function openCurrentLinkedInMessages(profileUrlOverride) {
+    const options = normalizeOpenCurrentLinkedInMessagesOptions(profileUrlOverride);
     const person = currentNextStepPerson();
-    const profileUrl = normalizeWhitespace(profileUrlOverride || currentRecipientProfileUrl(person));
+    const profileUrl = normalizeWhitespace(options.profileUrl || currentRecipientProfileUrl(person));
     const personId = normalizeWhitespace(person?.personId || state.personRecord?.personId || "");
     if (!profileUrl) {
       setStatus("No LinkedIn profile URL is saved for this person yet.", true);
       return;
     }
+    if (!isAutomatedMessageOpenAllowed(options)) {
+      setStatus("Draft stays in the sidepanel. Open the profile or thread tab manually if you need LinkedIn messaging.", false);
+      return;
+    }
 
-    setStatus("Opening LinkedIn messages for this person.", false, "progress");
+    const progressStatusText = options.progressStatusText || "Opening LinkedIn messages for this person.";
+    setStatus(progressStatusText, false, "progress");
     try {
+      const sourceTabId = await getSourceTabId();
       const response = await chrome.runtime.sendMessage({
         type: MESSAGE_TYPES.OPEN_PERSON_MESSAGES,
-        sourceTabId: await getSourceTabId(),
+        sourceTabId,
         profileUrl,
         personId
       });
@@ -3810,8 +4592,18 @@
       if (response.personRecord?.personId) {
         state.personRecord = mergePersonRecord(state.personRecord, response.personRecord);
       }
-      await refreshState({ preserveStatus: true });
-      scheduleNavigationRefreshBurst({ suppressImportStatus: false });
+      const openedProfileUrl = normalizeWhitespace(response.profileUrl || profileUrl);
+      if (typeof response.openedTabId === "number" && openedProfileUrl) {
+        attachToLinkedInTab(response.openedTabId, openedProfileUrl);
+        applyOptimisticNavigationHint(openedProfileUrl, "");
+      }
+      await refreshState({ preserveStatus: true, suppressImportStatus: options.suppressImportStatus });
+      scheduleNavigationRefreshBurst({ suppressImportStatus: options.suppressImportStatus });
+      const openedStatusText = options.openedStatusText || (
+        response?.openedInNewTab
+          ? "Opened LinkedIn messaging in a new tab."
+          : "Opened LinkedIn messaging."
+      );
       const syncMessage = normalizeWhitespace(response?.autoImport?.syncMessage || "");
       if (syncMessage) {
         setStatus(syncMessage, false);
@@ -3821,7 +4613,7 @@
         case "thread_visible":
         case "imported":
         case "unchanged":
-          setStatus("Opened LinkedIn messaging.", false);
+          setStatus(openedStatusText, false);
           return;
         case "messaging_surface_no_messages":
         case "compose_overlay_visible":
@@ -3832,9 +4624,12 @@
           return;
         default:
           setStatus(
-            response.navigatedToProfile
-              ? "Opened the profile and triggered LinkedIn messaging."
-              : "Opened LinkedIn messaging.",
+            options.openedStatusText
+              || (response?.openedInNewTab
+                ? "Opened LinkedIn messaging in a new tab."
+                : response.navigatedToProfile
+                ? "Opened the profile and triggered LinkedIn messaging."
+                : "Opened LinkedIn messaging."),
             false
           );
       }
@@ -3848,6 +4643,8 @@
       setStatus("Open the recipient's LinkedIn profile first.", true);
       return;
     }
+    state.personCardRefreshInFlight = true;
+    renderHeader();
     setStatus("Refreshing profile context from the current LinkedIn page. LinkedIn needs a short scroll pass to load the full profile.", false, "progress");
     try {
       const response = await chrome.runtime.sendMessage({
@@ -3858,6 +4655,7 @@
         throw new Error(response?.error || "Unable to refresh profile context.");
       }
       state.personRecord = response.personRecord || state.personRecord;
+      state.lastProfileExtractionDiagnostics = response?.profileDebug || null;
       const refreshed = hasRecipientProfileSnapshot(currentNextStepPerson());
       await refreshState({ preserveStatus: true });
       setStatus(
@@ -3868,6 +4666,9 @@
       );
     } catch (error) {
       setStatus(error.message || String(error), true);
+    } finally {
+      state.personCardRefreshInFlight = false;
+      renderHeader();
     }
   }
 
@@ -3923,7 +4724,8 @@
         fixedTail: el.fixedTailInput.value,
         personNote: el.personNoteInput.value,
         userGoal: el.personGoalSelect.value,
-        extraContext: el.extraContextInput.value
+        extraContext: el.extraContextInput.value,
+        draftCharacterLimit: selectedDraftCharacterLimit()
       }));
       if (!response?.ok) {
         state.manualRecovery = response?.manualRecovery || null;
@@ -3931,6 +4733,7 @@
         throw new Error(response?.error || "Generation failed.");
       }
       state.extraContext = el.extraContextInput.value;
+      clearPendingJobDraftContext();
       state.showingAlternatives = false;
       renderPageStatus({ preserveStatus: true });
     } catch (error) {
@@ -3950,9 +4753,11 @@
 
   async function handleUpdateProfile(options) {
     const allowCurrentPageCapture = Boolean(options?.allowCurrentPageCapture);
+    const profileNeedsSetup = !hasSavedSenderProfile();
     const firstTimeSave = !normalizeWhitespace(state.myProfile?.rawSnapshot);
     const pendingOwnProfilePage = isPendingOwnProfilePage();
-    const shouldAutoSaveProfile = firstTimeSave || pendingOwnProfilePage;
+    const savedOwnProfilePage = isSavedOwnProfilePage();
+    const shouldAutoSaveProfile = profileNeedsSetup || pendingOwnProfilePage || savedOwnProfilePage;
     const targetProfileUrl = normalizeWhitespace(el.senderProfileUrlInput?.value || configuredOwnProfileUrl());
     const pageProfileUrl = normalizeWhitespace(currentProfileUrl());
     const hasDifferentTargetProfile = Boolean(
@@ -3988,7 +4793,9 @@
         source: "handleUpdateProfile",
         stage: "after_update_my_profile",
         firstTimeSave,
+        profileNeedsSetup,
         pendingOwnProfilePage,
+        savedOwnProfilePage,
         shouldAutoSaveProfile,
         currentProfileUrl: normalizeWhitespace(currentProfileUrl()),
         configuredOwnProfileUrl: normalizeWhitespace(configuredOwnProfileUrl()),
@@ -4010,6 +4817,9 @@
       ].filter(Boolean).join("\n"));
       const nextProfile = {
         ...state.myProfile,
+        ...(response.extractedProfile || {}),
+        ...(response.profile || {}),
+        profileData: response.profile?.profileData || response.extractedProfile || state.myProfile?.profileData || null,
         ownProfileUrl: response.profile?.ownProfileUrl
           || response.extractedProfile?.profileUrl
           || currentProfileUrl()
@@ -4142,11 +4952,20 @@
       if (!response?.ok) {
         throw new Error(response?.error || "Unable to save prompt settings.");
       }
+      const promptPackResponse = await chrome.runtime.sendMessage({
+        type: MESSAGE_TYPES.SAVE_PROMPT_PACK_SETTINGS,
+        promptPackSettings: readPromptPackSettingsForm()
+      });
+      if (!promptPackResponse?.ok) {
+        throw new Error(promptPackResponse?.error || "Unable to save prompt pack settings.");
+      }
 
       state.promptSettings = response.promptSettings || defaultPromptSettings();
+      state.promptPackSettings = promptPackResponse.promptPackSettings || defaultPromptPackSettings();
+      state.promptPackDraftSettings = clonePromptPackSettings(state.promptPackSettings);
       resetPromptSettingsDirty();
       populatePromptSettingsForm(state.promptSettings);
-      el.settingsSection.classList.add("hidden");
+      populatePromptPackSettingsForm(state.promptPackSettings);
       setStatus("Settings saved.", false);
     } catch (error) {
       setStatus(error.message || String(error), true);
@@ -4250,6 +5069,72 @@
     setStatus("Copied.", false);
   }
 
+  async function handleCapturePostDiscussion() {
+    const sourceTabId = await getSourceTabId();
+    state.postCaptureInFlight = true;
+    state.postCaptureStatus = "Capturing visible post discussion...";
+    state.postSuggestionsStatus = "";
+    renderPostWorkspace();
+    try {
+      const response = await chrome.runtime.sendMessage({
+        type: MESSAGE_TYPES.CAPTURE_LINKEDIN_POST_DISCUSSION,
+        sourceTabId
+      });
+      if (!response?.ok || !response?.postDiscussion) {
+        throw new Error(response?.error || "Unable to capture the visible LinkedIn post discussion.");
+      }
+      state.postDiscussion = response.postDiscussion;
+      state.postSuggestionsResult = null;
+      state.postTextExpanded = false;
+      state.postCommentsExpanded = false;
+      state.postExpandedCommentKeys = {};
+      state.postCaptureStatus = "Visible post discussion captured.";
+      renderPostWorkspace();
+      setStatus("Visible post discussion captured.", false);
+    } catch (error) {
+      state.postCaptureStatus = error.message || String(error);
+      renderPostWorkspace();
+      setStatus(state.postCaptureStatus, true);
+    } finally {
+      state.postCaptureInFlight = false;
+      renderPostWorkspace();
+    }
+  }
+
+  async function handleGeneratePostSuggestions() {
+    const discussion = state.postDiscussion || state.pageContext?.postDiscussion || null;
+    if (!discussion) {
+      setStatus("Capture the visible post discussion first.", true);
+      return;
+    }
+    const requestId = makeRequestId();
+    state.postSuggestionRequestId = requestId;
+    state.postSuggestionsInFlight = true;
+    state.postSuggestionsStatus = "Sending visible post context to AI...";
+    state.postSuggestionsResult = null;
+    renderPostWorkspace();
+    try {
+      const response = await chrome.runtime.sendMessage(buildGeneratePostSuggestionsCommand({
+        requestId,
+        sourceTabId: await getSourceTabId(),
+        postDiscussion: discussion,
+        draftCharacterLimit: selectedDraftCharacterLimit()
+      }));
+      if (!response?.ok) {
+        throw new Error(response?.error || "Unable to start post suggestions.");
+      }
+      setStatus("AI is preparing suggestions.", false, "progress");
+    } catch (error) {
+      if (state.postSuggestionRequestId === requestId) {
+        state.postSuggestionRequestId = "";
+        state.postSuggestionsInFlight = false;
+        state.postSuggestionsStatus = "";
+      }
+      renderPostWorkspace();
+      setStatus(error.message || String(error), true);
+    }
+  }
+
   async function openWorkspaceForPerson(personId) {
     const target = state.allPeople.find((entry) => entry.personId === personId);
     if (!target) {
@@ -4292,6 +5177,7 @@
         recipientProfileUrl: state.personRecord?.profileUrl || state.pageContext?.person?.profileUrl || "",
         pageType: state.pageContext?.pageType || "",
         flowType: currentDraftWorkspace()?.flowType || "relationship",
+        draftCharacterLimit: selectedDraftCharacterLimit(),
         prompt: state.manualRecovery?.prompt || ""
       });
       if (!response?.ok) {
@@ -4359,7 +5245,12 @@
       state.viewMode = "workspace";
       state.myProfile = defaultMyProfile();
       state.promptSettings = defaultPromptSettings();
+      state.promptPackSettings = defaultPromptPackSettings();
+      state.promptPackDraftSettings = defaultPromptPackSettings();
+      state.promptTemplateEditorKey = "relationship";
       state.fixedTail = FIXED_TAIL;
+      state.savedFixedTail = FIXED_TAIL;
+      state.fixedTailDirty = false;
       state.allPeople = [];
       state.personRecord = defaultPersonRecord();
       state.workspace = null;
@@ -4368,6 +5259,8 @@
       state.identityResolutionRequest = null;
       state.dismissedIdentityResolutionRequestKey = "";
       state.extraContext = "";
+      clearPendingJobDraftContext();
+      state.draftUnder300 = true;
       state.showingAlternatives = false;
       state.generationJobs = [];
       state.activeGenerationRequestId = "";
@@ -4382,7 +5275,8 @@
       el.settingsSection.classList.add("hidden");
       populateProfileForm(state.myProfile);
       populatePromptSettingsForm(state.promptSettings);
-      el.fixedTailInput.value = state.fixedTail;
+      populatePromptPackSettingsForm(state.promptPackSettings);
+      syncFixedTailInputFromState();
       setViewMode("workspace");
       renderPageStatus({ preserveStatus: false });
       await refreshState();
@@ -4394,32 +5288,105 @@
     }
   }
 
-  el.settingsButton.addEventListener("click", () => {
+  el.settingsViewButton?.addEventListener("click", () => {
     resetPromptSettingsDirty();
     populatePromptSettingsForm(state.promptSettings);
-    el.settingsSection.classList.remove("hidden");
-  });
-
-  el.closeSettingsButton.addEventListener("click", () => {
-    resetPromptSettingsDirty();
-    populatePromptSettingsForm(state.promptSettings);
-    el.settingsSection.classList.add("hidden");
-  });
-
-  el.settingsSection.addEventListener("click", (event) => {
-    if (event.target === el.settingsSection) {
-      resetPromptSettingsDirty();
-      populatePromptSettingsForm(state.promptSettings);
-      el.settingsSection.classList.add("hidden");
-    }
+    populatePromptPackSettingsForm(state.promptPackSettings);
+    setViewMode("settings");
   });
 
   el.workspaceViewButton.addEventListener("click", () => {
+    setViewMode(viewModeFromWorkspaceType(state.workspaceType));
+  });
+
+  el.personViewButton?.addEventListener("click", () => {
+    if (el.personViewButton.disabled) {
+      return;
+    }
     setViewMode("workspace");
+  });
+
+  el.jobViewButton?.addEventListener("click", () => {
+    if (el.jobViewButton.disabled) {
+      return;
+    }
+    setViewMode("job");
+    void refreshState({ preserveStatus: true, allowCached: false, suppressImportStatus: true });
+  });
+
+  el.postViewButton?.addEventListener("click", () => {
+    if (el.postViewButton.disabled) {
+      return;
+    }
+    setViewMode("post");
+  });
+
+  el.postCaptureButton?.addEventListener("click", () => {
+    void handleCapturePostDiscussion();
+  });
+
+  el.postSuggestButton?.addEventListener("click", () => {
+    void handleGeneratePostSuggestions();
   });
 
   el.dashboardViewButton.addEventListener("click", () => {
     setViewMode("dashboard");
+  });
+
+  window.addEventListener("lumi-job-demo-open-messages", async (event) => {
+    const profileUrl = normalizeWhitespace(event.detail?.profileUrl || "");
+    if (!profileUrl) {
+      return;
+    }
+    event.preventDefault();
+    try {
+      const job = event.detail?.job || {};
+      const person = event.detail?.person || {};
+      const draftContext = event.detail?.draftContext || {};
+      const handoffText = buildJobDemoDraftHandoffText(job, person, draftContext);
+      setViewMode("workspace");
+      el.settingsSection?.classList.add("hidden");
+      if (handoffText) {
+        setPendingJobDraftContext(handoffText, profileUrl);
+        state.extraContext = handoffText;
+        if (el.extraContextInput) {
+          el.extraContextInput.value = handoffText;
+        }
+      }
+      await openCurrentLinkedInMessages({
+        profileUrl,
+        progressStatusText: "Opening LinkedIn messaging in a new tab for tailoring.",
+        openedStatusText: "Opened LinkedIn messaging in a new tab for tailoring.",
+        suppressImportStatus: true,
+        source: "job_demo"
+      });
+    } catch (error) {
+      setStatus(error.message || String(error), true);
+    }
+  });
+
+  window.addEventListener("lumi-job-demo-refresh-context", async (event) => {
+    event.preventDefault();
+    const refreshButton = document.querySelector("#job-demo-refresh");
+    refreshButton?.classList.add("is-loading");
+    refreshButton?.setAttribute("aria-busy", "true");
+    setStatus("Refreshing job details from the current LinkedIn page.", false, "progress");
+    try {
+      await refreshState({ preserveStatus: true, allowCached: false, suppressImportStatus: true });
+      const job = state.pageContext?.job || {};
+      const hasDetails = Boolean(normalizeWhitespace(job.title) && normalizeWhitespace(job.company));
+      setStatus(
+        hasDetails
+          ? "Job details refreshed."
+          : "LinkedIn has not exposed the job title and company yet. Try again after the job details appear on the page.",
+        !hasDetails
+      );
+    } catch (error) {
+      setStatus(error.message || String(error), true);
+    } finally {
+      refreshButton?.classList.remove("is-loading");
+      refreshButton?.removeAttribute("aria-busy");
+    }
   });
 
   [el.dashboardActivityWindowToday, el.dashboardActivityWindow7d].forEach((button) => {
@@ -4433,14 +5400,6 @@
     downloadDashboardActivityCsv();
   });
 
-  window.addEventListener("keydown", (event) => {
-    if (event.key === "Escape" && !el.settingsSection.classList.contains("hidden")) {
-      resetPromptSettingsDirty();
-      populatePromptSettingsForm(state.promptSettings);
-      el.settingsSection.classList.add("hidden");
-    }
-  });
-
   el.nextActionButton.addEventListener("click", () => {
     handleNextStepAction(el.nextActionButton);
   });
@@ -4452,6 +5411,10 @@
   el.personCardEditButton?.addEventListener("click", () => {
     const willOpen = Boolean(el.personCardEditor?.classList.contains("hidden"));
     setPersonCardEditorOpen(willOpen);
+  });
+
+  el.personCardRefreshButton?.addEventListener("click", () => {
+    void refreshRecipientProfileContext();
   });
 
   el.nextStepEvidence?.addEventListener("click", (event) => {
@@ -4476,6 +5439,7 @@
 
   el.fixedTailInput.addEventListener("input", () => {
     state.fixedTail = el.fixedTailInput.value;
+    state.fixedTailDirty = state.fixedTail !== state.savedFixedTail;
     scheduleFixedTailSave();
   });
 
@@ -4532,13 +5496,45 @@
     markPromptSettingsDirty();
   });
 
+  el.promptPackSelect?.addEventListener("change", () => {
+    markPromptSettingsDirty();
+    state.promptPackDraftSettings = clonePromptPackSettings({
+      ...(state.promptPackDraftSettings || state.promptPackSettings || defaultPromptPackSettings()),
+      activePackId: el.promptPackSelect.value
+    });
+    syncPromptTemplateEditor();
+  });
+
+  el.promptTemplateSelect?.addEventListener("change", () => {
+    state.promptTemplateEditorKey = normalizePromptTemplateKey(el.promptTemplateSelect.value);
+    syncPromptTemplateEditor();
+  });
+
+  el.promptTemplateEditor?.addEventListener("input", () => {
+    markPromptSettingsDirty();
+    updateDraftPromptTemplate(state.promptTemplateEditorKey, el.promptTemplateEditor.value);
+    syncPromptTemplateEditor();
+  });
+
+  el.resetPromptTemplateOverride?.addEventListener("click", () => {
+    markPromptSettingsDirty();
+    updateDraftPromptTemplate(state.promptTemplateEditorKey, "");
+    syncPromptTemplateEditor();
+  });
+
   el.extraContextInput.addEventListener("input", () => {
     state.extraContext = el.extraContextInput.value;
+    clearPendingJobDraftContext();
+  });
+
+  el.draftUnder300Checkbox?.addEventListener("change", () => {
+    state.draftUnder300 = Boolean(el.draftUnder300Checkbox.checked);
   });
 
   el.resetFixedTail.addEventListener("click", async () => {
     el.fixedTailInput.value = FIXED_TAIL;
     state.fixedTail = FIXED_TAIL;
+    state.fixedTailDirty = state.fixedTail !== state.savedFixedTail;
     await saveFixedTail(FIXED_TAIL);
     setStatus("Cold outreach default reset.", false);
   });
@@ -4559,7 +5555,7 @@
     if (el.senderProfileUrlInput && el.senderProfileSettingsUrl) {
       el.senderProfileSettingsUrl.value = el.senderProfileUrlInput.value;
     }
-    el.settingsSection.classList.remove("hidden");
+    setViewMode("settings");
   });
 
   el.senderProfileUpdateNow.addEventListener("click", () => {
@@ -4688,6 +5684,45 @@
   });
 
   chrome.runtime.onMessage.addListener((message, sender) => {
+    if (message?.type === MESSAGE_TYPES.POST_SUGGESTIONS_PROGRESS) {
+      const matchesAttachedTab = messageMatchesAttachedLinkedInTab(message);
+      if (matchesAttachedTab && message?.requestId && message.requestId === state.postSuggestionRequestId) {
+        state.postSuggestionsStatus = normalizeWhitespace(message.text);
+        state.postSuggestionsInFlight = true;
+        renderPostWorkspace();
+        setStatus(state.postSuggestionsStatus, false, "progress");
+      }
+      return;
+    }
+
+    if (message?.type === MESSAGE_TYPES.POST_SUGGESTIONS_COMPLETE) {
+      const matchesAttachedTab = messageMatchesAttachedLinkedInTab(message);
+      if (matchesAttachedTab && message?.requestId && message.requestId === state.postSuggestionRequestId) {
+        state.postSuggestionRequestId = "";
+        state.postSuggestionsInFlight = false;
+        state.postSuggestionsStatus = "Suggestions ready.";
+        state.postSuggestionsResult = message?.result || null;
+        if (message?.postDiscussion) {
+          state.postDiscussion = message.postDiscussion;
+        }
+        renderPostWorkspace();
+        setStatus("Suggestions ready.", false);
+      }
+      return;
+    }
+
+    if (message?.type === MESSAGE_TYPES.POST_SUGGESTIONS_FAILED) {
+      const matchesAttachedTab = messageMatchesAttachedLinkedInTab(message);
+      if (matchesAttachedTab && message?.requestId && message.requestId === state.postSuggestionRequestId) {
+        state.postSuggestionRequestId = "";
+        state.postSuggestionsInFlight = false;
+        state.postSuggestionsStatus = normalizeWhitespace(message?.error || "Unable to generate suggestions.");
+        renderPostWorkspace();
+        setStatus(state.postSuggestionsStatus, true);
+      }
+      return;
+    }
+
     if (message?.type === MESSAGE_TYPES.GENERATION_PROGRESS) {
       const matchesAttachedTab = messageMatchesAttachedLinkedInTab(message);
       const personId = normalizeWhitespace(message?.personId);

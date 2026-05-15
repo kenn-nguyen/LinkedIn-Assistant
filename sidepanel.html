@@ -14,13 +14,138 @@
           <p id="panel-loading-text" class="panel-loading-text">Loading LinkedIn data…</p>
         </div>
       </div>
+      <div id="job-demo-manual-overlay" class="job-demo-manual-overlay hidden" aria-hidden="true">
+        <div class="job-demo-manual-overlay__sheet" role="dialog" aria-modal="true" aria-labelledby="job-demo-manual-title">
+          <p id="job-demo-manual-eyebrow" class="job-demo-manual-eyebrow">LinkedIn confirmation needed</p>
+          <h2 id="job-demo-manual-title" class="job-demo-manual-title">Check LinkedIn filters</h2>
+          <p id="job-demo-manual-detail" class="job-demo-manual-detail"></p>
+          <p id="job-demo-manual-reason" class="job-demo-manual-reason"></p>
+          <div id="job-demo-manual-filters" class="job-demo-manual-filters hidden"></div>
+          <div class="button-row compact-row job-demo-manual-actions">
+            <button id="job-demo-open-worker-tab" type="button" class="secondary-button">Open LinkedIn tab</button>
+            <button id="job-demo-resume-run" type="button">Continue</button>
+          </div>
+        </div>
+      </div>
       <div id="top-toolbar" class="top-toolbar hidden">
         <div class="mode-toggle" role="tablist" aria-label="App views">
-          <button id="workspace-view-button" class="toolbar-pill is-active" type="button">Person</button>
+          <button id="workspace-view-button" class="toolbar-pill is-active" type="button">Workspace</button>
           <button id="dashboard-view-button" class="toolbar-pill" type="button">Dashboard</button>
+          <button id="settings-view-button" class="toolbar-pill" type="button">Settings</button>
         </div>
-        <button id="settings-button" class="toolbar-link-button" type="button" title="Settings">Settings</button>
       </div>
+
+      <div id="workspace-context-toggle" class="workspace-context-toggle hidden" role="tablist" aria-label="Workspace context">
+        <button id="person-view-button" class="context-pill is-active" type="button">Person</button>
+        <button id="job-view-button" class="context-pill" type="button" disabled title="Open a LinkedIn job">Job</button>
+        <button id="post-view-button" class="context-pill" type="button" disabled title="Open a LinkedIn feed or company post">Posts</button>
+      </div>
+
+      <section id="post-view" class="post-reply-view hidden" aria-label="Post suggestion workspace">
+        <section class="panel post-reply-panel">
+          <div class="section-heading post-reply-heading">
+            <div>
+              <h2>Post suggestions</h2>
+              <p id="post-capture-status" class="meta-text">Double-click a post or click its comment action, then capture the visible discussion.</p>
+            </div>
+            <div class="post-reply-actions">
+              <button id="post-capture-discussion" class="secondary-button post-capture-button" type="button">Capture</button>
+              <button id="post-generate-suggestions" class="post-suggest-button" type="button">Suggest</button>
+            </div>
+          </div>
+          <div id="post-capture-output" class="post-capture-output hidden" aria-live="polite">
+            <div class="post-capture-card">
+              <p id="post-capture-author" class="post-capture-author"></p>
+              <p id="post-capture-text" class="post-capture-text"></p>
+            </div>
+            <div id="post-suggestions-output" class="post-suggestions-output hidden">
+              <div class="post-suggestions-card">
+                <p id="post-suggestions-summary" class="post-suggestions-summary"></p>
+                <p id="post-suggestions-angle" class="post-suggestions-angle meta-text"></p>
+              </div>
+              <div id="post-suggestions-list" class="post-suggestions-list"></div>
+            </div>
+            <div class="post-comments-card">
+              <div class="post-comments-heading">
+                <h3>Visible comments</h3>
+                <span id="post-capture-comment-count" class="meta-text"></span>
+              </div>
+              <div id="post-comments-list" class="post-comments-list"></div>
+            </div>
+          </div>
+        </section>
+      </section>
+
+      <section id="job-view" class="job-demo-view hidden" aria-label="Job outreach demo">
+        <section class="panel job-demo-job-panel">
+          <div class="job-demo-job-header">
+            <div class="job-demo-title-block">
+              <div class="job-demo-title-row">
+                <h1><a id="job-demo-job-link" href="#" target="_blank" rel="noreferrer"></a></h1>
+                <button id="job-demo-refresh" class="job-demo-refresh-button" type="button" aria-label="Refresh job details" title="Refresh job details">
+                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M20 6v5h-5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"></path>
+                    <path d="M4 18v-5h5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"></path>
+                    <path d="M19 11a7 7 0 0 0-12-4L4 10" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"></path>
+                    <path d="M5 13a7 7 0 0 0 12 4l3-3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"></path>
+                  </svg>
+                </button>
+              </div>
+              <p id="job-demo-job-subtitle" class="job-demo-subtitle-line"></p>
+            </div>
+          </div>
+        </section>
+
+        <section id="job-demo-search-panel" class="panel job-demo-search-panel">
+          <div class="section-heading job-demo-section-heading">
+            <div class="job-demo-heading-copy">
+              <h2>Search for referrals</h2>
+            </div>
+            <button id="job-demo-run-search" class="job-demo-header-search-button" type="button">Search</button>
+          </div>
+          <p id="job-demo-search-error" class="job-demo-error">Add a keyword.</p>
+          <div id="job-demo-strategy-summary" class="job-demo-strategy-summary hidden">
+            <span id="job-demo-strategy-summary-text"></span>
+          </div>
+          <div id="job-demo-strategy-form" class="job-demo-strategy-form">
+            <div id="job-demo-search-entries" class="job-demo-entry-stack"></div>
+            <input id="job-demo-global-locations" type="hidden" value="">
+            <input id="job-demo-global-schools" type="hidden" value="">
+            <input id="job-demo-global-company" type="hidden" value="">
+            <button id="job-demo-add-search" class="job-demo-add-search" type="button">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M12 5v14M5 12h14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"></path>
+              </svg>
+              <span>Add keyword variation</span>
+            </button>
+            <div class="button-row compact-row job-demo-editor-actions">
+              <button id="job-demo-submit-search" type="button">Search</button>
+              <button id="job-demo-cancel-search-edit" type="button" class="secondary-button">Cancel</button>
+            </div>
+          </div>
+        </section>
+
+        <div id="job-demo-run-panel" class="job-demo-run-status hidden" aria-label="Search progress">
+          <div class="job-demo-run-status-row">
+            <strong id="job-demo-run-summary" class="job-demo-run-summary-text">Ready.</strong>
+          </div>
+          <p id="job-demo-run-detail" class="job-demo-run-detail hidden"></p>
+          <a id="job-demo-run-link" class="job-demo-run-link hidden" href="#" target="_blank" rel="noreferrer"></a>
+          <span class="job-demo-progress-bar"><span id="job-demo-progress-fill"></span></span>
+        </div>
+
+        <div id="job-demo-activity-banner" class="job-demo-activity-banner hidden" aria-live="polite">
+          <p id="job-demo-activity-title" class="job-demo-activity-title"></p>
+          <a id="job-demo-activity-link" class="job-demo-activity-link hidden" href="#" target="_blank" rel="noreferrer"></a>
+        </div>
+
+        <section id="job-demo-rank-panel" class="panel job-demo-results-panel hidden">
+          <h2 id="job-demo-rank-title">Results</h2>
+          <div id="job-demo-rank-tabs" class="job-demo-tabs" role="tablist"></div>
+          <div id="job-demo-results-search-links" class="job-demo-results-search-links hidden"></div>
+          <div id="job-demo-rank-list" class="job-demo-rank-list"></div>
+        </section>
+      </section>
 
       <div id="workspace-view">
       <section id="status-card" class="status-card hidden">
@@ -28,6 +153,7 @@
           <div class="person-copy">
             <div class="person-title-row">
               <h1><a id="person-name" class="person-name-link" href="#" target="_blank" rel="noreferrer">Checking current page…</a></h1>
+              <button id="person-card-refresh-button" type="button" class="link-button hidden">Refresh</button>
               <button id="person-card-edit-button" type="button" class="link-button hidden">Edit</button>
             </div>
             <p id="person-subtitle" class="muted-text">Open a LinkedIn profile or messaging thread.</p>
@@ -100,6 +226,10 @@
         <div id="next-step-evidence" class="next-step-evidence hidden"></div>
         <div class="next-step-context">
           <textarea id="extra-context-input" rows="1" aria-label="Extra context for this draft" placeholder="Extra context for the next draft"></textarea>
+          <label class="draft-limit-toggle">
+            <input id="draft-under-300-checkbox" type="checkbox" checked>
+            <span>Under 300 chars</span>
+          </label>
         </div>
         <div class="button-row">
           <button id="next-action-button" type="button">Draft message</button>
@@ -228,14 +358,13 @@
         <div id="dashboard-list" class="dashboard-list"></div>
       </section>
 
-      <section id="settings-section" class="settings-overlay hidden">
+      <section id="settings-section" class="settings-view hidden" aria-label="Settings">
         <div class="settings-sheet">
           <div class="section-heading settings-header">
             <div class="settings-header-copy">
               <h2>Settings</h2>
               <p class="meta-text">Provider, profile, and defaults.</p>
             </div>
-            <button id="close-settings-button" type="button" class="link-button">Done</button>
           </div>
           <form id="prompt-settings-form" class="profile-form settings-form">
           <label>
@@ -262,6 +391,29 @@
             <textarea id="strategy-guidance" rows="8" placeholder="Optional. Add your own tone, caution, or networking preferences."></textarea>
           </label>
           <p class="meta-text settings-help">Adds your preferences only. Core prompt rules stay fixed.</p>
+          <div class="prompt-pack-settings-card">
+            <div class="section-heading">
+              <div>
+                <span class="meta-text prompt-pack-title">Prompt templates</span>
+                <p class="meta-text settings-help">Edit one saved prompt override at a time. Validators stay fixed in code.</p>
+              </div>
+            </div>
+            <label>
+              Active prompt pack
+              <select id="prompt-pack-select">
+                <option value="default">Default</option>
+              </select>
+            </label>
+            <label>
+              Template
+              <select id="prompt-template-select"></select>
+            </label>
+            <div class="section-heading prompt-template-toolbar">
+              <span id="prompt-template-source" class="meta-text">Built-in template</span>
+              <button id="reset-prompt-template-override" type="button" class="link-button">Reset template</button>
+            </div>
+            <textarea id="prompt-template-editor" class="prompt-template-editor" rows="14" spellcheck="false"></textarea>
+          </div>
           <details class="fixed-tail-details">
             <summary>First-message default</summary>
             <div class="fixed-tail-editor">
@@ -294,7 +446,7 @@
               <textarea id="page-diagnostics" rows="8" readonly></textarea>
             </label>
             <label>
-              Saved sender profile text
+              Saved sender profile JSON
               <textarea id="sender-profile-extracted" rows="10" readonly></textarea>
             </label>
             <label>
@@ -312,7 +464,10 @@
 
     <script src="identity.js"></script>
     <script src="shared.js"></script>
+    <script src="prompt-pack-runtime.js"></script>
     <script src="prompt.js"></script>
+    <script src="job-outreach-ai.js"></script>
+    <script src="job-outreach-demo.js"></script>
     <script src="sidepanel.js"></script>
   </body>
 </html>

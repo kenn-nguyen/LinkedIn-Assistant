@@ -1,0 +1,9 @@
+Please regenerate your last answer in this same thread.
+The extension rejected it for this reason: {{error_message}}
+Check your previous answer and fix the issue.
+Return every required top-level and nested field from the locked JSON schema.
+If ai_assessment or referral_readiness was missing or incomplete, include the full objects with neutral defaults rather than omitting them.
+Do not use the em dash character (—). Use a normal hyphen (-) instead.
+Return JSON only.
+Do not use markdown fences.
+Do not add any text before or after the JSON.

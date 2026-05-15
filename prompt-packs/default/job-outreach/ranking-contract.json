@@ -1,0 +1,10 @@
+{
+  "prompt_id": "job_outreach_ranking",
+  "contract_id": "job_outreach_ranking_v1",
+  "validator": "validateRankingResponse",
+  "supported_placeholders": [
+    "ranking_contract_shape",
+    "ranking_contract_version",
+    "searches_json"
+  ]
+}

@@ -1,0 +1,28 @@
+{
+  "prompt_id": "relationship",
+  "contract_id": "relationship_draft_v1",
+  "validator": "validateWorkspaceResult",
+  "supported_placeholders": [
+    "conversation_context",
+    "current_objective",
+    "draft_length_rule",
+    "extra_context",
+    "fixed_tail",
+    "imported_conversation",
+    "logic_metrics",
+    "page_context",
+    "person_note",
+    "profile_change_summary",
+    "recipient_full_name",
+    "recipient_profile",
+    "referral_readiness_scoring_guidance",
+    "relationship_memory",
+    "relationship_output_contract",
+    "relationship_strategy_playbook",
+    "relationship_triage",
+    "sender_profile",
+    "strategy_guidance",
+    "working_definitions",
+    "locked_json_rules"
+  ]
+}
