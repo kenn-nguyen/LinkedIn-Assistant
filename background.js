@@ -159,19 +159,43 @@ function resetRuntimeCaches() {
 async function initializeStorageDefaults(resetAll) {
   if (resetAll) {
     await chrome.storage.local.clear();
+    try {
+      const db = await openDatabase();
+      await Promise.all([
+        idbClear(db, "people"),
+        idbClear(db, "jobOutreachRuns"),
+        idbClear(db, "jobOutreachJobs"),
+        idbClear(db, "profileRedirects"),
+        idbClear(db, "identityResolutionSeen"),
+        idbClear(db, "meta")
+      ]);
+    } catch (_error) {
+      // IndexedDB may not be ready yet during a full reset
+    }
   }
+
+  try {
+    await migrateFromChromeStorage();
+  } catch (error) {
+    console.warn("[Lumi] Migration failed, will retry next startup:", error);
+  }
+
+  const migrated = await isMigrated();
+
   const current = await chrome.storage.local.get([
     STORAGE_KEYS.fixedTail,
     STORAGE_KEYS.myProfile,
     STORAGE_KEYS.promptSettings,
     STORAGE_KEYS.promptPackSettings,
     STORAGE_KEYS.chatGptProjectUrl,
-    STORAGE_KEYS.people,
-    STORAGE_KEYS.jobOutreach,
+    ...(migrated ? [] : [
+      STORAGE_KEYS.people,
+      STORAGE_KEYS.jobOutreach,
+      STORAGE_KEYS.profileRedirects,
+      STORAGE_KEYS.identityResolutionSeenOpaqueUrls
+    ]),
     STORAGE_KEYS.tabPersonBindings,
-    STORAGE_KEYS.threadPersonBindings,
-    STORAGE_KEYS.profileRedirects,
-    STORAGE_KEYS.identityResolutionSeenOpaqueUrls
+    STORAGE_KEYS.threadPersonBindings
   ]);
 
   const nextState = {};
@@ -195,23 +219,25 @@ async function initializeStorageDefaults(resetAll) {
   if (!current[STORAGE_KEYS.chatGptProjectUrl]) {
     nextState[STORAGE_KEYS.chatGptProjectUrl] = DEFAULT_CHATGPT_PROJECT_URL;
   }
-  if (!current[STORAGE_KEYS.people]) {
-    nextState[STORAGE_KEYS.people] = {};
-  }
-  if (!current[STORAGE_KEYS.jobOutreach]) {
-    nextState[STORAGE_KEYS.jobOutreach] = { jobsById: {}, filterCache: {}, runsById: {}, runOrder: [], queue: [], activeRunId: "" };
+  if (!migrated) {
+    if (!current[STORAGE_KEYS.people]) {
+      nextState[STORAGE_KEYS.people] = {};
+    }
+    if (!current[STORAGE_KEYS.jobOutreach]) {
+      nextState[STORAGE_KEYS.jobOutreach] = { jobsById: {}, filterCache: {}, runsById: {}, runOrder: [], queue: [], activeRunId: "" };
+    }
+    if (!current[STORAGE_KEYS.profileRedirects]) {
+      nextState[STORAGE_KEYS.profileRedirects] = {};
+    }
+    if (!current[STORAGE_KEYS.identityResolutionSeenOpaqueUrls]) {
+      nextState[STORAGE_KEYS.identityResolutionSeenOpaqueUrls] = {};
+    }
   }
   if (!current[STORAGE_KEYS.tabPersonBindings]) {
     nextState[STORAGE_KEYS.tabPersonBindings] = {};
   }
   if (!current[STORAGE_KEYS.threadPersonBindings]) {
     nextState[STORAGE_KEYS.threadPersonBindings] = {};
-  }
-  if (!current[STORAGE_KEYS.profileRedirects]) {
-    nextState[STORAGE_KEYS.profileRedirects] = {};
-  }
-  if (!current[STORAGE_KEYS.identityResolutionSeenOpaqueUrls]) {
-    nextState[STORAGE_KEYS.identityResolutionSeenOpaqueUrls] = {};
   }
   if (Object.keys(nextState).length) {
     await chrome.storage.local.set(nextState);
@@ -320,7 +346,8 @@ function rememberLinkedInTab(tabId, url) {
   linkedInTabUrls.set(tabId, normalizeWhitespace(url));
   lastObservedLinkedInTabId = tabId;
   lastObservedLinkedInTabUrl = normalizeWhitespace(url);
-  syncAssistantActivationForTab(tabId).catch(() => {});
+  // Sync all tabs: only the newly focused tab becomes active, all others deactivate.
+  syncAssistantActivationForKnownLinkedInTabs().catch(() => {});
 }
 
 function isAssistantSessionActive() {
@@ -342,7 +369,17 @@ async function syncAssistantActivationForTab(tabId) {
 }
 
 async function syncAssistantActivationForKnownLinkedInTabs() {
-  const tasks = Array.from(linkedInTabUrls.keys()).map((tabId) => syncAssistantActivationForTab(tabId).catch(() => {}));
+  const sessionActive = isAssistantSessionActive();
+  // Only the most recently focused LinkedIn tab is activated.
+  // All other open LinkedIn tabs are deactivated so their MutationObservers
+  // and polling timers stop running in the background.
+  const tasks = Array.from(linkedInTabUrls.keys()).map((tabId) => {
+    const shouldBeActive = sessionActive && tabId === lastObservedLinkedInTabId;
+    return safeSendMessage(tabId, {
+      type: MESSAGE_TYPES.SET_ASSISTANT_ACTIVE,
+      active: shouldBeActive
+    }).catch(() => {});
+  });
   await Promise.all(tasks);
 }
 
@@ -647,12 +684,27 @@ async function getTabForRequest(tabId) {
   return getActiveTab();
 }
 
+async function isContentScriptAlreadyInjected(tabId) {
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => Boolean(window.__lumiAssistInjected)
+    });
+    return results?.[0]?.result === true;
+  } catch {
+    return false;
+  }
+}
+
 async function injectContentScriptsForTab(tab) {
   if (!tab?.id || !tab?.url) {
     throw new Error("Cannot inject content scripts without a valid tab.");
   }
 
   if (tab.url.startsWith("https://www.linkedin.com/")) {
+    if (await isContentScriptAlreadyInjected(tab.id)) {
+      return;
+    }
     await chrome.scripting.executeScript({
       target: { tabId: tab.id, allFrames: true },
       files: LINKEDIN_CONTENT_SCRIPT_FILES
@@ -865,6 +917,9 @@ async function waitForLinkedInMessagingFrame(tabId, timeoutMs) {
   const attempts = [];
   while (Date.now() - startedAt < timeoutMs) {
     latestProbes = await probeLinkedInFrames(tabId);
+    if (attempts.length >= 5) {
+      attempts.shift();
+    }
     attempts.push({
       elapsedMs: roundMs(Date.now() - startedAt),
       probes: latestProbes.slice(0, 5).map((probe) => ({
@@ -1266,7 +1321,7 @@ async function resolveLinkedInProfileUrlWithOptions(rawUrl, stored, options) {
       ...(stored?.profileRedirects || {}),
       [normalized]: normalized
     };
-    await chrome.storage.local.set({ [STORAGE_KEYS.profileRedirects]: nextRedirects });
+    await persistProfileRedirect(normalized, normalized);
     return {
       resolvedUrl: normalized,
       stored: {
@@ -1289,7 +1344,10 @@ async function resolveLinkedInProfileUrlWithOptions(rawUrl, stored, options) {
   if (resolvedUrl) {
     nextRedirects[resolvedUrl] = resolvedUrl;
   }
-  await chrome.storage.local.set({ [STORAGE_KEYS.profileRedirects]: nextRedirects });
+  await persistProfileRedirect(normalized, resolvedUrl || normalized);
+  if (resolvedUrl) {
+    await persistProfileRedirect(resolvedUrl, resolvedUrl);
+  }
   return {
     resolvedUrl: resolvedUrl || normalized,
     stored: {
@@ -1297,6 +1355,17 @@ async function resolveLinkedInProfileUrlWithOptions(rawUrl, stored, options) {
       profileRedirects: nextRedirects
     }
   };
+}
+
+async function persistProfileRedirect(sourceUrl, targetUrl) {
+  if (await isMigrated()) {
+    const db = await openDatabase();
+    await idbPut(db, "profileRedirects", { sourceUrl, targetUrl, createdAt: toIsoNow() });
+  } else {
+    const current = (await chrome.storage.local.get([STORAGE_KEYS.profileRedirects]))?.[STORAGE_KEYS.profileRedirects] || {};
+    current[sourceUrl] = targetUrl;
+    await chrome.storage.local.set({ [STORAGE_KEYS.profileRedirects]: current });
+  }
 }
 
 function buildIdentityResolutionRequest(pageContext, stored) {
@@ -1340,11 +1409,17 @@ async function markIdentityResolutionPromptSeen(profileUrl, stored) {
   if (existing[normalized]) {
     return stored;
   }
+  const now = toIsoNow();
   const nextSeen = {
     ...existing,
-    [normalized]: toIsoNow()
+    [normalized]: now
   };
-  await chrome.storage.local.set({ [STORAGE_KEYS.identityResolutionSeenOpaqueUrls]: nextSeen });
+  if (await isMigrated()) {
+    const db = await openDatabase();
+    await idbPut(db, "identityResolutionSeen", { opaqueUrl: normalized, seenAt: now });
+  } else {
+    await chrome.storage.local.set({ [STORAGE_KEYS.identityResolutionSeenOpaqueUrls]: nextSeen });
+  }
   return {
     ...stored,
     identityResolutionSeenOpaqueUrls: nextSeen
@@ -1913,6 +1988,19 @@ function bindProviderTabToPerson(providerTabId, payload) {
   }
 }
 
+function purgeStaleGenerationJobs() {
+  // Remove completed/failed/cancelled jobs older than 2 minutes — they are
+  // only needed long enough for the sidepanel to read the final status once.
+  const cutoff = Date.now() - 2 * 60 * 1000;
+  for (const [requestId, job] of generationJobs.entries()) {
+    const terminal = ["completed", "failed", "cancelled", "error"].includes(normalizeWhitespace(job?.status));
+    const completedAt = job?.completedAt ? new Date(job.completedAt).getTime() : 0;
+    if (terminal && completedAt && completedAt < cutoff) {
+      generationJobs.delete(requestId);
+    }
+  }
+}
+
 function updateGenerationJobState(requestId, patch) {
   const normalizedRequestId = normalizeWhitespace(requestId);
   if (!normalizedRequestId || !generationJobs.has(normalizedRequestId)) {
@@ -1924,6 +2012,8 @@ function updateGenerationJobState(requestId, patch) {
     ...(patch || {}),
     requestId: normalizedRequestId
   });
+  // Opportunistically purge stale jobs to keep the map lean.
+  purgeStaleGenerationJobs();
 }
 
 function generationJobsSnapshot() {
@@ -2889,37 +2979,679 @@ function formatElapsedWait(ms) {
   return remainder ? `${minutes}m ${remainder}s` : `${minutes}m`;
 }
 
-async function getStoredState() {
-  const stored = await chrome.storage.local.get([
-    STORAGE_KEYS.myProfile,
-    STORAGE_KEYS.fixedTail,
-    STORAGE_KEYS.promptSettings,
-    STORAGE_KEYS.promptPackSettings,
-    STORAGE_KEYS.chatGptProjectUrl,
+// ---------------------------------------------------------------------------
+// IndexedDB storage layer
+// ---------------------------------------------------------------------------
+
+const IDB_NAME = "lumi-assist-db";
+const IDB_VERSION = 1;
+
+let _idbInstance = null;
+
+function openDatabase() {
+  if (_idbInstance) {
+    return Promise.resolve(_idbInstance);
+  }
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(IDB_NAME, IDB_VERSION);
+    request.onupgradeneeded = (event) => {
+      const db = event.target.result;
+      if (!db.objectStoreNames.contains("people")) {
+        const people = db.createObjectStore("people", { keyPath: "personId" });
+        people.createIndex("byLastInteraction", "system.lastInteractionAt", { unique: false });
+        people.createIndex("byUpdatedAt", "system.updatedAt", { unique: false });
+      }
+      if (!db.objectStoreNames.contains("jobOutreachRuns")) {
+        const runs = db.createObjectStore("jobOutreachRuns", { keyPath: "runId" });
+        runs.createIndex("byJobId", "jobId", { unique: false });
+        runs.createIndex("byStatus", "status", { unique: false });
+        runs.createIndex("byCreatedAt", "createdAt", { unique: false });
+      }
+      if (!db.objectStoreNames.contains("jobOutreachJobs")) {
+        const jobs = db.createObjectStore("jobOutreachJobs", { keyPath: "jobId" });
+        jobs.createIndex("byUpdatedAt", "updatedAt", { unique: false });
+      }
+      if (!db.objectStoreNames.contains("profileRedirects")) {
+        const redirects = db.createObjectStore("profileRedirects", { keyPath: "sourceUrl" });
+        redirects.createIndex("byCreatedAt", "createdAt", { unique: false });
+      }
+      if (!db.objectStoreNames.contains("identityResolutionSeen")) {
+        const seen = db.createObjectStore("identityResolutionSeen", { keyPath: "opaqueUrl" });
+        seen.createIndex("bySeenAt", "seenAt", { unique: false });
+      }
+      if (!db.objectStoreNames.contains("meta")) {
+        db.createObjectStore("meta", { keyPath: "key" });
+      }
+    };
+    request.onsuccess = (event) => {
+      _idbInstance = event.target.result;
+      _idbInstance.onclose = () => { _idbInstance = null; };
+      resolve(_idbInstance);
+    };
+    request.onerror = (event) => {
+      reject(event.target.error);
+    };
+  });
+}
+
+function idbGetAll(db, storeName) {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(storeName, "readonly");
+    const store = tx.objectStore(storeName);
+    const request = store.getAll();
+    request.onsuccess = () => resolve(request.result || []);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+function idbGet(db, storeName, key) {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(storeName, "readonly");
+    const store = tx.objectStore(storeName);
+    const request = store.get(key);
+    request.onsuccess = () => resolve(request.result || null);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+function idbPut(db, storeName, value) {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(storeName, "readwrite");
+    const store = tx.objectStore(storeName);
+    const request = store.put(value);
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+function idbDelete(db, storeName, key) {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(storeName, "readwrite");
+    const store = tx.objectStore(storeName);
+    const request = store.delete(key);
+    request.onsuccess = () => resolve();
+    request.onerror = () => reject(request.error);
+  });
+}
+
+function idbClear(db, storeName) {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(storeName, "readwrite");
+    const store = tx.objectStore(storeName);
+    const request = store.clear();
+    request.onsuccess = () => resolve();
+    request.onerror = () => reject(request.error);
+  });
+}
+
+function idbPutBatch(db, storeName, items) {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(storeName, "readwrite");
+    const store = tx.objectStore(storeName);
+    for (const item of items) {
+      store.put(item);
+    }
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+async function getIdbMeta(db, key) {
+  const record = await idbGet(db, "meta", key);
+  return record?.value ?? null;
+}
+
+async function setIdbMeta(db, key, value) {
+  await idbPut(db, "meta", { key, value });
+}
+
+async function isMigrated() {
+  try {
+    const db = await openDatabase();
+    const version = await getIdbMeta(db, "migrationVersion");
+    return Number(version) >= 1;
+  } catch (_error) {
+    return false;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Migration: chrome.storage.local → IndexedDB (one-time)
+// ---------------------------------------------------------------------------
+
+async function migrateFromChromeStorage() {
+  const db = await openDatabase();
+  const version = await getIdbMeta(db, "migrationVersion");
+  if (Number(version) >= 1) {
+    return;
+  }
+
+  const current = await chrome.storage.local.get([
     STORAGE_KEYS.people,
     STORAGE_KEYS.jobOutreach,
-    STORAGE_KEYS.tabPersonBindings,
-    STORAGE_KEYS.threadPersonBindings,
     STORAGE_KEYS.profileRedirects,
     STORAGE_KEYS.identityResolutionSeenOpaqueUrls
   ]);
 
-  const rawPeople = stored[STORAGE_KEYS.people] || {};
-  const rawPromptSettings = stored[STORAGE_KEYS.promptSettings] || defaultPromptSettings();
-  const rawPromptPackSettings = stored[STORAGE_KEYS.promptPackSettings] || defaultPromptPackSettings();
-  const legacyChatGptProjectUrl = stored[STORAGE_KEYS.chatGptProjectUrl] || DEFAULT_CHATGPT_PROJECT_URL;
+  const now = toIsoNow();
+
+  const people = current[STORAGE_KEYS.people] || {};
+  const peopleItems = Object.entries(people)
+    .map(([key, value]) => {
+      const normalized = normalizePersonRecord(value);
+      return normalized?.personId ? normalized : null;
+    })
+    .filter(Boolean);
+  if (peopleItems.length) {
+    await idbPutBatch(db, "people", peopleItems);
+  }
+
+  const jobOutreach = normalizeJobOutreachStore(current[STORAGE_KEYS.jobOutreach]);
+
+  const jobItems = Object.values(jobOutreach.jobsById || {}).filter((j) => j?.jobId);
+  if (jobItems.length) {
+    await idbPutBatch(db, "jobOutreachJobs", jobItems);
+  }
+
+  const runItems = Object.values(jobOutreach.runsById || {}).filter((r) => r?.runId);
+  if (runItems.length) {
+    await idbPutBatch(db, "jobOutreachRuns", runItems);
+  }
+
+  const redirects = current[STORAGE_KEYS.profileRedirects] || {};
+  const redirectItems = Object.entries(redirects).map(([sourceUrl, targetUrl]) => ({
+    sourceUrl,
+    targetUrl: normalizeWhitespace(targetUrl) || sourceUrl,
+    createdAt: now
+  }));
+  if (redirectItems.length) {
+    await idbPutBatch(db, "profileRedirects", redirectItems);
+  }
+
+  const seenUrls = current[STORAGE_KEYS.identityResolutionSeenOpaqueUrls] || {};
+  const seenItems = Object.entries(seenUrls).map(([opaqueUrl, value]) => ({
+    opaqueUrl,
+    seenAt: normalizeWhitespace(typeof value === "string" ? value : "") || now
+  }));
+  if (seenItems.length) {
+    await idbPutBatch(db, "identityResolutionSeen", seenItems);
+  }
+
+  await setIdbMeta(db, "jobOutreachCoordination", {
+    filterCache: jobOutreach.filterCache || {},
+    runOrder: jobOutreach.runOrder || [],
+    queue: jobOutreach.queue || [],
+    activeRunId: jobOutreach.activeRunId || ""
+  });
+
+  await setIdbMeta(db, "migrationVersion", 1);
+
+  await chrome.storage.local.remove([
+    STORAGE_KEYS.people,
+    STORAGE_KEYS.jobOutreach,
+    STORAGE_KEYS.profileRedirects,
+    STORAGE_KEYS.identityResolutionSeenOpaqueUrls
+  ]);
+}
+
+// ---------------------------------------------------------------------------
+// Cleanup engine
+// ---------------------------------------------------------------------------
+
+const CLEANUP_THRESHOLDS = {
+  peopleDeleteDays: 180,
+  profileStripDays: 60,
+  draftExpireDays: 30,
+  jobRunDeleteDays: 90,
+  jobRunStripDays: 30,
+  jobRunKeepPerJob: 5,
+  redirectDeleteDays: 365,
+  redirectMaxEntries: 10000,
+  redirectTargetEntries: 8000,
+  seenUrlDeleteDays: 180,
+  seenUrlMaxEntries: 5000,
+  seenUrlTargetEntries: 4000
+};
+
+async function estimateStoragePressure() {
+  try {
+    const estimate = await navigator.storage.estimate();
+    if (!estimate?.quota || !estimate?.usage) {
+      return 0;
+    }
+    return estimate.usage / estimate.quota;
+  } catch (_error) {
+    return 0;
+  }
+}
+
+function daysAgo(days) {
+  return new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+}
+
+function mostRecentTimestamp(...timestamps) {
+  let best = "";
+  for (const ts of timestamps) {
+    const s = normalizeWhitespace(ts);
+    if (s && s > best) {
+      best = s;
+    }
+  }
+  return best;
+}
+
+function isPersonProtected(personId, tabBindings) {
+  return Object.values(tabBindings || {}).includes(personId);
+}
+
+async function runCleanupPeople(db, thresholds, tabBindings) {
+  const allPeople = await idbGetAll(db, "people");
+  const deleteThreshold = daysAgo(thresholds.peopleDeleteDays);
+  const stripThreshold = daysAgo(thresholds.profileStripDays);
+  const draftThreshold = daysAgo(thresholds.draftExpireDays);
+  let deleted = 0;
+  let stripped = 0;
+
+  for (const person of allPeople) {
+    if (isPersonProtected(person.personId, tabBindings)) {
+      continue;
+    }
+
+    const lastActivity = mostRecentTimestamp(
+      person.system?.lastInteractionAt,
+      person.observedConversation?.lastMessageAt
+    );
+
+    if (!lastActivity || lastActivity < deleteThreshold) {
+      await idbDelete(db, "people", person.personId);
+      deleted++;
+      continue;
+    }
+
+    if (lastActivity < stripThreshold) {
+      const updated = { ...person };
+      if (updated.profileContext) {
+        updated.profileContext = {
+          ...updated.profileContext,
+          rawSnapshot: "",
+          recipientProfileMemory: "",
+          recipientSummaryMemory: "",
+          profileSummary: "",
+          latestProfileData: null,
+          latestActivitySnippets: [],
+          recentProfileChanges: "",
+          lastProfileSyncedAt: ""
+        };
+      }
+      // Clear entire draftWorkspace — contains messages, prompts, AI analysis, logic_metrics
+      updated.draftWorkspace = null;
+      updated.aiProfileAssessment = null;
+      updated.aiConversationAssessment = null;
+      // Clear root-level AI backup fields
+      updated.lastRecommendedAction = "";
+      updated.lastReasonWhyNow = "";
+      updated.lastLogicMetrics = null;
+      updated.lastWorkspace = null;
+      if (updated.observedConversation) {
+        updated.observedConversation = {
+          ...updated.observedConversation,
+          rawThreadText: "",
+          messages: (updated.observedConversation.messages || []).slice(-10)
+        };
+      }
+      if (updated.importedConversation) {
+        updated.importedConversation = {
+          ...updated.importedConversation,
+          rawThreadText: "",
+          messages: (updated.importedConversation.messages || []).slice(-10)
+        };
+      }
+      await idbPut(db, "people", updated);
+      stripped++;
+      continue;
+    }
+
+    if (person.draftWorkspace?.generatedAt && person.draftWorkspace?.is_stale) {
+      if (person.draftWorkspace.generatedAt < draftThreshold) {
+        await idbPut(db, "people", { ...person, draftWorkspace: null });
+        stripped++;
+      }
+    }
+  }
+  return { deleted, stripped };
+}
+
+async function runCleanupJobOutreachRuns(db, thresholds) {
+  const allRuns = await idbGetAll(db, "jobOutreachRuns");
+  const deleteThreshold = daysAgo(thresholds.jobRunDeleteDays);
+  const stripThreshold = daysAgo(thresholds.jobRunStripDays);
+  const terminalStatuses = new Set(["completed", "failed", "cancelled"]);
+  let deleted = 0;
+  let stripped = 0;
+
+  const terminalByJob = {};
+  for (const run of allRuns) {
+    if (!terminalStatuses.has(normalizeJobOutreachRunStatus(run.status))) {
+      continue;
+    }
+    const jobId = normalizeWhitespace(run.jobId || "");
+    if (!terminalByJob[jobId]) {
+      terminalByJob[jobId] = [];
+    }
+    terminalByJob[jobId].push(run);
+  }
+
+  for (const [, runs] of Object.entries(terminalByJob)) {
+    runs.sort((a, b) => (b.createdAt || "").localeCompare(a.createdAt || ""));
+    for (let i = 0; i < runs.length; i++) {
+      const run = runs[i];
+      const isProtected = i < thresholds.jobRunKeepPerJob;
+      if (!isProtected && run.createdAt && run.createdAt < deleteThreshold) {
+        await idbDelete(db, "jobOutreachRuns", run.runId);
+        deleted++;
+      } else if (run.createdAt && run.createdAt < stripThreshold) {
+        await idbPut(db, "jobOutreachRuns", {
+          ...run,
+          importedPeopleBySearch: {},
+          importedPeopleBySearchKey: {},
+          rankingInput: null,
+          rankingPlan: null,
+          searchPlan: null,
+          diagnostics: null
+        });
+        stripped++;
+      }
+    }
+  }
+  return { deleted, stripped };
+}
+
+async function runCleanupRedirects(db, thresholds) {
+  const all = await idbGetAll(db, "profileRedirects");
+  const deleteThreshold = daysAgo(thresholds.redirectDeleteDays);
+  let deleted = 0;
+
+  const old = all.filter((r) => r.createdAt && r.createdAt < deleteThreshold);
+  for (const r of old) {
+    await idbDelete(db, "profileRedirects", r.sourceUrl);
+    deleted++;
+  }
+
+  const remaining = all.length - deleted;
+  if (remaining > thresholds.redirectMaxEntries) {
+    const sorted = all
+      .filter((r) => !old.includes(r))
+      .sort((a, b) => (a.createdAt || "").localeCompare(b.createdAt || ""));
+    const toRemove = remaining - thresholds.redirectTargetEntries;
+    for (let i = 0; i < toRemove && i < sorted.length; i++) {
+      await idbDelete(db, "profileRedirects", sorted[i].sourceUrl);
+      deleted++;
+    }
+  }
+  return { deleted };
+}
+
+async function runCleanupSeenUrls(db, thresholds) {
+  const all = await idbGetAll(db, "identityResolutionSeen");
+  const deleteThreshold = daysAgo(thresholds.seenUrlDeleteDays);
+  let deleted = 0;
+
+  const old = all.filter((r) => r.seenAt && r.seenAt < deleteThreshold);
+  for (const r of old) {
+    await idbDelete(db, "identityResolutionSeen", r.opaqueUrl);
+    deleted++;
+  }
+
+  const remaining = all.length - deleted;
+  if (remaining > thresholds.seenUrlMaxEntries) {
+    const sorted = all
+      .filter((r) => !old.includes(r))
+      .sort((a, b) => (a.seenAt || "").localeCompare(b.seenAt || ""));
+    const toRemove = remaining - thresholds.seenUrlTargetEntries;
+    for (let i = 0; i < toRemove && i < sorted.length; i++) {
+      await idbDelete(db, "identityResolutionSeen", sorted[i].opaqueUrl);
+      deleted++;
+    }
+  }
+  return { deleted };
+}
+
+async function runCleanup() {
+  try {
+    const db = await openDatabase();
+    const migrated = await getIdbMeta(db, "migrationVersion");
+    if (Number(migrated) < 1) {
+      return;
+    }
+
+    const tabBindings = (await chrome.storage.local.get([STORAGE_KEYS.tabPersonBindings]))?.[STORAGE_KEYS.tabPersonBindings] || {};
+
+    const pressure = await estimateStoragePressure();
+    const isHighPressure = pressure >= 0.9;
+
+    const thresholds = { ...CLEANUP_THRESHOLDS };
+    if (isHighPressure) {
+      thresholds.peopleDeleteDays = Math.floor(thresholds.peopleDeleteDays / 2);
+      thresholds.profileStripDays = Math.floor(thresholds.profileStripDays / 2);
+      thresholds.draftExpireDays = Math.floor(thresholds.draftExpireDays / 2);
+      thresholds.jobRunDeleteDays = Math.floor(thresholds.jobRunDeleteDays / 2);
+      thresholds.jobRunStripDays = Math.floor(thresholds.jobRunStripDays / 2);
+      thresholds.jobRunKeepPerJob = 3;
+      thresholds.redirectDeleteDays = 30;
+      thresholds.seenUrlDeleteDays = 30;
+    }
+
+    const peopleResult = await runCleanupPeople(db, thresholds, tabBindings);
+    const runsResult = await runCleanupJobOutreachRuns(db, thresholds);
+    const redirectsResult = await runCleanupRedirects(db, thresholds);
+    const seenResult = await runCleanupSeenUrls(db, thresholds);
+
+    if (isHighPressure) {
+      const stillHighPressure = (await estimateStoragePressure()) >= 0.9;
+      if (stillHighPressure) {
+        const allPeople = await idbGetAll(db, "people");
+        for (const person of allPeople) {
+          if (isPersonProtected(person.personId, tabBindings)) {
+            continue;
+          }
+          if (
+            person.profileContext?.rawSnapshot ||
+            person.profileContext?.latestProfileData ||
+            person.draftWorkspace ||
+            person.aiProfileAssessment ||
+            person.aiConversationAssessment
+          ) {
+            const updated = { ...person };
+            updated.profileContext = {
+              ...updated.profileContext,
+              rawSnapshot: "",
+              recipientProfileMemory: "",
+              recipientSummaryMemory: "",
+              profileSummary: "",
+              latestProfileData: null,
+              latestActivitySnippets: [],
+              recentProfileChanges: "",
+              lastProfileSyncedAt: ""
+            };
+            updated.draftWorkspace = null;
+            updated.aiProfileAssessment = null;
+            updated.aiConversationAssessment = null;
+            updated.lastRecommendedAction = "";
+            updated.lastReasonWhyNow = "";
+            updated.lastLogicMetrics = null;
+            updated.lastWorkspace = null;
+            if (updated.observedConversation) {
+              updated.observedConversation = {
+                ...updated.observedConversation,
+                rawThreadText: ""
+              };
+            }
+            if (updated.importedConversation) {
+              updated.importedConversation = {
+                ...updated.importedConversation,
+                rawThreadText: ""
+              };
+            }
+            await idbPut(db, "people", updated);
+          }
+        }
+      }
+    }
+
+    await setIdbMeta(db, "lastCleanupAt", toIsoNow());
+
+    console.log("[Lumi] Cleanup complete:", {
+      pressure: Math.round(pressure * 100) + "%",
+      people: peopleResult,
+      runs: runsResult,
+      redirects: redirectsResult,
+      seen: seenResult
+    });
+  } catch (error) {
+    console.warn("[Lumi] Cleanup failed:", error);
+  }
+}
+
+let _cleanupPromise = null;
+
+function maybeScheduleCleanup() {
+  if (_cleanupPromise) {
+    return;
+  }
+  _cleanupPromise = (async () => {
+    try {
+      const db = await openDatabase();
+      const lastCleanup = await getIdbMeta(db, "lastCleanupAt");
+      const sixHoursAgo = daysAgo(0.25);
+      const shouldRun = !lastCleanup || lastCleanup < sixHoursAgo;
+      if (!shouldRun) {
+        const pressure = await estimateStoragePressure();
+        if (pressure < 0.9) {
+          return;
+        }
+      }
+      await runCleanup();
+    } catch (_error) {
+      // cleanup is best-effort
+    } finally {
+      _cleanupPromise = null;
+    }
+  })();
+}
+
+// ---------------------------------------------------------------------------
+// getStoredState — reads from IndexedDB (post-migration) or chrome.storage
+// ---------------------------------------------------------------------------
+
+async function getStoredState() {
+  const migrated = await isMigrated();
+
+  if (!migrated) {
+    const stored = await chrome.storage.local.get([
+      STORAGE_KEYS.myProfile,
+      STORAGE_KEYS.fixedTail,
+      STORAGE_KEYS.promptSettings,
+      STORAGE_KEYS.promptPackSettings,
+      STORAGE_KEYS.chatGptProjectUrl,
+      STORAGE_KEYS.people,
+      STORAGE_KEYS.jobOutreach,
+      STORAGE_KEYS.tabPersonBindings,
+      STORAGE_KEYS.threadPersonBindings,
+      STORAGE_KEYS.profileRedirects,
+      STORAGE_KEYS.identityResolutionSeenOpaqueUrls
+    ]);
+
+    const rawPeople = stored[STORAGE_KEYS.people] || {};
+    const rawPromptSettings = stored[STORAGE_KEYS.promptSettings] || defaultPromptSettings();
+    const rawPromptPackSettings = stored[STORAGE_KEYS.promptPackSettings] || defaultPromptPackSettings();
+    const legacyChatGptProjectUrl = stored[STORAGE_KEYS.chatGptProjectUrl] || DEFAULT_CHATGPT_PROJECT_URL;
+    const people = Object.fromEntries(
+      Object.entries(rawPeople)
+        .map(([key, value]) => {
+          const normalized = normalizePersonRecord(value);
+          return [normalized.personId || key, normalized];
+        })
+        .filter(([, value]) => Boolean(value?.personId))
+    );
+    return {
+      myProfile: stored[STORAGE_KEYS.myProfile] || defaultMyProfile(),
+      fixedTail: Object.prototype.hasOwnProperty.call(stored, STORAGE_KEYS.fixedTail)
+        ? normalizeFixedTail(stored[STORAGE_KEYS.fixedTail])
+        : FIXED_TAIL,
+      promptSettings: normalizePromptSettings({
+        ...rawPromptSettings,
+        llmEntryUrl: normalizeWhitespace(rawPromptSettings?.llmEntryUrl || "")
+          || (normalizeLlmProvider(rawPromptSettings?.llmProvider) === "chatgpt" ? legacyChatGptProjectUrl : "")
+      }),
+      promptPackSettings: normalizePromptPackSettings(rawPromptPackSettings),
+      chatGptProjectUrl: legacyChatGptProjectUrl,
+      people,
+      jobOutreach: normalizeJobOutreachStore(stored[STORAGE_KEYS.jobOutreach]),
+      tabPersonBindings: stored[STORAGE_KEYS.tabPersonBindings] || {},
+      threadPersonBindings: stored[STORAGE_KEYS.threadPersonBindings] || {},
+      profileRedirects: stored[STORAGE_KEYS.profileRedirects] || {},
+      identityResolutionSeenOpaqueUrls: stored[STORAGE_KEYS.identityResolutionSeenOpaqueUrls] || {}
+    };
+  }
+
+  // --- IndexedDB path (post-migration) ---
+  maybeScheduleCleanup();
+
+  const db = await openDatabase();
+  const [chromeData, allPeople, allRuns, allJobs, allRedirects, allSeen] = await Promise.all([
+    chrome.storage.local.get([
+      STORAGE_KEYS.myProfile,
+      STORAGE_KEYS.fixedTail,
+      STORAGE_KEYS.promptSettings,
+      STORAGE_KEYS.promptPackSettings,
+      STORAGE_KEYS.chatGptProjectUrl,
+      STORAGE_KEYS.tabPersonBindings,
+      STORAGE_KEYS.threadPersonBindings
+    ]),
+    idbGetAll(db, "people"),
+    idbGetAll(db, "jobOutreachRuns"),
+    idbGetAll(db, "jobOutreachJobs"),
+    idbGetAll(db, "profileRedirects"),
+    idbGetAll(db, "identityResolutionSeen")
+  ]);
+
   const people = Object.fromEntries(
-    Object.entries(rawPeople)
-      .map(([key, value]) => {
-        const normalized = normalizePersonRecord(value);
-        return [normalized.personId || key, normalized];
+    allPeople
+      .map((record) => {
+        const normalized = normalizePersonRecord(record);
+        return [normalized.personId, normalized];
       })
       .filter(([, value]) => Boolean(value?.personId))
   );
+
+  const runsById = Object.fromEntries(allRuns.filter((r) => r?.runId).map((r) => [r.runId, r]));
+  const jobsById = Object.fromEntries(allJobs.filter((j) => j?.jobId).map((j) => [j.jobId, j]));
+  const coordination = (await getIdbMeta(db, "jobOutreachCoordination")) || {};
+  const jobOutreach = normalizeJobOutreachStore({
+    jobsById,
+    runsById,
+    filterCache: coordination.filterCache || {},
+    runOrder: coordination.runOrder || [],
+    queue: coordination.queue || [],
+    activeRunId: coordination.activeRunId || ""
+  });
+
+  const profileRedirects = Object.fromEntries(
+    allRedirects.map((r) => [r.sourceUrl, r.targetUrl || r.sourceUrl])
+  );
+
+  const identityResolutionSeenOpaqueUrls = Object.fromEntries(
+    allSeen.map((r) => [r.opaqueUrl, r.seenAt || ""])
+  );
+
+  const rawPromptSettings = chromeData[STORAGE_KEYS.promptSettings] || defaultPromptSettings();
+  const rawPromptPackSettings = chromeData[STORAGE_KEYS.promptPackSettings] || defaultPromptPackSettings();
+  const legacyChatGptProjectUrl = chromeData[STORAGE_KEYS.chatGptProjectUrl] || DEFAULT_CHATGPT_PROJECT_URL;
+
   return {
-    myProfile: stored[STORAGE_KEYS.myProfile] || defaultMyProfile(),
-    fixedTail: Object.prototype.hasOwnProperty.call(stored, STORAGE_KEYS.fixedTail)
-      ? normalizeFixedTail(stored[STORAGE_KEYS.fixedTail])
+    myProfile: chromeData[STORAGE_KEYS.myProfile] || defaultMyProfile(),
+    fixedTail: Object.prototype.hasOwnProperty.call(chromeData, STORAGE_KEYS.fixedTail)
+      ? normalizeFixedTail(chromeData[STORAGE_KEYS.fixedTail])
       : FIXED_TAIL,
     promptSettings: normalizePromptSettings({
       ...rawPromptSettings,
@@ -2929,11 +3661,11 @@ async function getStoredState() {
     promptPackSettings: normalizePromptPackSettings(rawPromptPackSettings),
     chatGptProjectUrl: legacyChatGptProjectUrl,
     people,
-    jobOutreach: normalizeJobOutreachStore(stored[STORAGE_KEYS.jobOutreach]),
-    tabPersonBindings: stored[STORAGE_KEYS.tabPersonBindings] || {},
-    threadPersonBindings: stored[STORAGE_KEYS.threadPersonBindings] || {},
-    profileRedirects: stored[STORAGE_KEYS.profileRedirects] || {},
-    identityResolutionSeenOpaqueUrls: stored[STORAGE_KEYS.identityResolutionSeenOpaqueUrls] || {}
+    jobOutreach,
+    tabPersonBindings: chromeData[STORAGE_KEYS.tabPersonBindings] || {},
+    threadPersonBindings: chromeData[STORAGE_KEYS.threadPersonBindings] || {},
+    profileRedirects,
+    identityResolutionSeenOpaqueUrls
   };
 }
 
@@ -2995,7 +3727,17 @@ async function savePeople(people) {
       })
       .filter(([, value]) => Boolean(value?.personId))
   );
-  await chrome.storage.local.set({ [STORAGE_KEYS.people]: normalizedPeople });
+
+  if (await isMigrated()) {
+    const db = await openDatabase();
+    await idbClear(db, "people");
+    const items = Object.values(normalizedPeople).filter((p) => p?.personId);
+    if (items.length) {
+      await idbPutBatch(db, "people", items);
+    }
+  } else {
+    await chrome.storage.local.set({ [STORAGE_KEYS.people]: normalizedPeople });
+  }
 }
 
 function collectThreadUrlsForRecord(record) {
@@ -4171,11 +4913,26 @@ async function upsertPersonRecord(personRecord, stored) {
   const nextPeople = deduped.people;
   const nextTabPersonBindings = buildTabPersonBindings(nextPeople, workingStored.tabPersonBindings);
   const nextThreadPersonBindings = buildThreadPersonBindings(nextPeople, workingStored.threadPersonBindings);
-  await chrome.storage.local.set({
-    [STORAGE_KEYS.people]: nextPeople,
-    [STORAGE_KEYS.tabPersonBindings]: nextTabPersonBindings,
-    [STORAGE_KEYS.threadPersonBindings]: nextThreadPersonBindings
-  });
+
+  if (await isMigrated()) {
+    const db = await openDatabase();
+    await idbClear(db, "people");
+    const items = Object.values(nextPeople).filter((p) => p?.personId);
+    if (items.length) {
+      await idbPutBatch(db, "people", items);
+    }
+    await chrome.storage.local.set({
+      [STORAGE_KEYS.tabPersonBindings]: nextTabPersonBindings,
+      [STORAGE_KEYS.threadPersonBindings]: nextThreadPersonBindings
+    });
+  } else {
+    await chrome.storage.local.set({
+      [STORAGE_KEYS.people]: nextPeople,
+      [STORAGE_KEYS.tabPersonBindings]: nextTabPersonBindings,
+      [STORAGE_KEYS.threadPersonBindings]: nextThreadPersonBindings
+    });
+  }
+
   return {
     merged,
     people: nextPeople,
@@ -4983,6 +5740,31 @@ chrome.tabs.onRemoved.addListener((tabId) => {
       sourceTabProviderBindings.delete(key);
     }
   }
+  // Cancel and remove any generation jobs that were sourced from this tab.
+  for (const [requestId, job] of generationJobs.entries()) {
+    if (job?.sourceTabId === tabId || job?.workerTabId === tabId) {
+      generationJobs.delete(requestId);
+    }
+  }
+  // Cancel and remove any pending job outreach runs sourced from this tab.
+  for (const [requestId, run] of pendingJobOutreachRuns.entries()) {
+    if (run?.sourceTabId === tabId) {
+      pendingJobOutreachRuns.delete(requestId);
+    }
+  }
+  // If the closed tab was the active LinkedIn tab, promote the most recently
+  // seen remaining LinkedIn tab so the extension stays usable.
+  if (tabId === lastObservedLinkedInTabId) {
+    const remaining = Array.from(linkedInTabUrls.keys());
+    if (remaining.length > 0) {
+      lastObservedLinkedInTabId = remaining[remaining.length - 1];
+      lastObservedLinkedInTabUrl = linkedInTabUrls.get(lastObservedLinkedInTabId) || "";
+      syncAssistantActivationForKnownLinkedInTabs().catch(() => {});
+    } else {
+      lastObservedLinkedInTabId = -1;
+      lastObservedLinkedInTabUrl = "";
+    }
+  }
   chrome.storage.local.get([STORAGE_KEYS.tabPersonBindings]).then((stored) => {
     const existingBindings = stored?.[STORAGE_KEYS.tabPersonBindings] || {};
     if (!(String(tabId) in existingBindings)) {
@@ -5622,6 +6404,10 @@ function trimJobOutreachRuns(store, options = {}) {
 
 async function jobOutreachStoragePressure() {
   try {
+    if (await isMigrated()) {
+      const pressure = await estimateStoragePressure();
+      return pressure >= 0.85 ? "high" : "normal";
+    }
     const quotaBytes = 10 * 1024 * 1024;
     const bytesInUse = await chrome.storage.local.getBytesInUse(STORAGE_KEYS.jobOutreach);
     if (!Number.isFinite(bytesInUse) || bytesInUse <= 0) {
@@ -6570,6 +7356,22 @@ async function persistNormalizedJobOutreachStore(currentStore) {
   const normalizedStore = normalizeJobOutreachStore(currentStore);
   const pressure = await jobOutreachStoragePressure();
   let nextStore = trimJobOutreachRuns(normalizedStore, { pressure });
+
+  if (await isMigrated()) {
+    try {
+      await persistJobOutreachToIdb(nextStore);
+      return nextStore;
+    } catch (error) {
+      const message = String(error?.message || error || "");
+      if (!/quota/i.test(message)) {
+        throw error;
+      }
+      nextStore = trimJobOutreachRuns(normalizedStore, { pressure: "high" });
+      await persistJobOutreachToIdb(nextStore);
+      return nextStore;
+    }
+  }
+
   try {
     await chrome.storage.local.set({ [STORAGE_KEYS.jobOutreach]: nextStore });
     return nextStore;
@@ -6582,6 +7384,29 @@ async function persistNormalizedJobOutreachStore(currentStore) {
     await chrome.storage.local.set({ [STORAGE_KEYS.jobOutreach]: nextStore });
     return nextStore;
   }
+}
+
+async function persistJobOutreachToIdb(store) {
+  const db = await openDatabase();
+  const runItems = Object.values(store.runsById || {}).filter((r) => r?.runId);
+  const jobItems = Object.values(store.jobsById || {}).filter((j) => j?.jobId);
+
+  await idbClear(db, "jobOutreachRuns");
+  if (runItems.length) {
+    await idbPutBatch(db, "jobOutreachRuns", runItems);
+  }
+
+  await idbClear(db, "jobOutreachJobs");
+  if (jobItems.length) {
+    await idbPutBatch(db, "jobOutreachJobs", jobItems);
+  }
+
+  await setIdbMeta(db, "jobOutreachCoordination", {
+    filterCache: store.filterCache || {},
+    runOrder: store.runOrder || [],
+    queue: store.queue || [],
+    activeRunId: store.activeRunId || ""
+  });
 }
 
 async function persistJobOutreachRunState(runState, overrides = {}, options = {}) {
@@ -8163,6 +8988,10 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         );
         const jobOutreachLatestRun = latestJobOutreachRunForPage(pageContext, stored);
         const jobOutreachRuns = jobOutreachRunsForPage(pageContext, stored);
+        // Computed once and reused across all three sendResponse paths below
+        const cachedGenerationJobs = generationJobsSnapshot();
+        const cachedFilterCache = filterCacheSnapshot(stored);
+        const cachedAllPeople = Object.values(stored.people || {});
         const suppressPersonWorkflow = isPendingProfilePageContext(pageContext, stored);
         if (!hasSavedSenderProfile) {
           sendResponse({
@@ -8172,12 +9001,12 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
             promptSettings: stored.promptSettings,
             promptPackSettings: stored.promptPackSettings,
             chatGptProjectUrl: stored.chatGptProjectUrl,
-            allPeople: Object.values(stored.people || {}),
-            generationJobs: generationJobsSnapshot(),
+            allPeople: cachedAllPeople,
+            generationJobs: cachedGenerationJobs,
             pageContext,
             jobOutreachLatestRun,
             jobOutreachRuns,
-            jobOutreachFilterCache: filterCacheSnapshot(stored),
+            jobOutreachFilterCache: cachedFilterCache,
             activeTabId: pageContext?.tabId || null,
             backgroundObservedLinkedInTabId: lastObservedLinkedInTabId,
             backgroundObservedLinkedInTabUrl: lastObservedLinkedInTabUrl,
@@ -8200,12 +9029,12 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
             promptSettings: stored.promptSettings,
             promptPackSettings: stored.promptPackSettings,
             chatGptProjectUrl: stored.chatGptProjectUrl,
-            allPeople: Object.values(stored.people || {}),
-            generationJobs: generationJobsSnapshot(),
+            allPeople: cachedAllPeople,
+            generationJobs: cachedGenerationJobs,
             pageContext,
             jobOutreachLatestRun,
             jobOutreachRuns,
-            jobOutreachFilterCache: filterCacheSnapshot(stored),
+            jobOutreachFilterCache: cachedFilterCache,
             activeTabId: pageContext?.tabId || null,
             backgroundObservedLinkedInTabId: lastObservedLinkedInTabId,
             backgroundObservedLinkedInTabUrl: lastObservedLinkedInTabUrl,
@@ -8315,12 +9144,12 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
           promptSettings: stored.promptSettings,
           promptPackSettings: stored.promptPackSettings,
           chatGptProjectUrl: stored.chatGptProjectUrl,
-          allPeople: Object.values(stored.people || {}),
-          generationJobs: generationJobsSnapshot(),
+          allPeople: cachedAllPeople,
+          generationJobs: cachedGenerationJobs,
           pageContext,
           jobOutreachLatestRun,
           jobOutreachRuns,
-          jobOutreachFilterCache: filterCacheSnapshot(stored),
+          jobOutreachFilterCache: cachedFilterCache,
           activeTabId: pageContext?.tabId || null,
           backgroundObservedLinkedInTabId: lastObservedLinkedInTabId,
           backgroundObservedLinkedInTabUrl: lastObservedLinkedInTabUrl,

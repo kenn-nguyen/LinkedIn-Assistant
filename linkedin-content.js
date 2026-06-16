@@ -3802,14 +3802,14 @@
       }
       assistantLifecycleState.lastSignature = nextSignature;
       notifyContextChangedWhenActive();
-    }, 250);
+    }, 400);
   }
 
   function scheduleDetailPaneRefreshBurstWhenActive() {
     if (!assistantLifecycleState.active) {
       return;
     }
-    [0, 200, 500, 1000, 1800].forEach((delayMs) => {
+    [0, 800].forEach((delayMs) => {
       managedSetTimeout(() => {
         if (assistantLifecycleState.active && isSupportedMessagingPage()) {
           scheduleAssistantContextCheck();
@@ -3851,8 +3851,7 @@
     if (document.body) {
       assistantLifecycleState.observer.observe(document.body, {
         childList: true,
-        subtree: true,
-        characterData: true
+        subtree: true
       });
     }
 
@@ -3984,4 +3983,8 @@
     linkedInCommands.handleMessage(buildLinkedInCommandDeps(), message, sendResponse);
     return true;
   });
+
+  // Mark this tab as having the content script injected so the background
+  // can skip redundant re-injection on retries (prevents duplicate listeners).
+  window.__lumiAssistInjected = true;
 })();
