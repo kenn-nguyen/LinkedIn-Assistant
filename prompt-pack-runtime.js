@@ -1,9 +1,11 @@
 (function initPromptPackRuntime(global) {
   const APP_COMPAT_VERSION = 1;
   const DEFAULT_PROMPT_PACK_ID = "default";
+  // Also the set of prompt keys loaded from the pack manifest (see loadBuiltInPromptPack).
   const PROMPT_OVERRIDE_KEYS = Object.freeze([
     "relationship",
     "relationship_retry",
+    "email",
     "post_suggestions",
     "job_outreach_search_url",
     "job_outreach_ranking"

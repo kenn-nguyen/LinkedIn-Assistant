@@ -1,0 +1,18 @@
+{
+  "prompt_id": "email",
+  "contract_id": "email_draft_v1",
+  "validator": "validateWorkspaceResult",
+  "supported_placeholders": [
+    "recipient_full_name",
+    "current_objective",
+    "page_context",
+    "recipient_profile",
+    "person_note",
+    "conversation_context",
+    "sender_profile",
+    "strategy_guidance",
+    "extra_context",
+    "fixed_tail",
+    "draft_length_rule"
+  ]
+}

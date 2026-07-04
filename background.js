@@ -346,8 +346,10 @@ function rememberLinkedInTab(tabId, url) {
   linkedInTabUrls.set(tabId, normalizeWhitespace(url));
   lastObservedLinkedInTabId = tabId;
   lastObservedLinkedInTabUrl = normalizeWhitespace(url);
-  // Sync all tabs: only the newly focused tab becomes active, all others deactivate.
-  syncAssistantActivationForKnownLinkedInTabs().catch(() => {});
+  // Only sync this one tab — in-page SPA navigation should not deactivate
+  // other tabs. Full multi-tab sync happens only on real tab switches
+  // (onActivated) and sidepanel connect/disconnect.
+  syncAssistantActivationForTab(tabId).catch(() => {});
 }
 
 function isAssistantSessionActive() {
@@ -362,10 +364,23 @@ async function syncAssistantActivationForTab(tabId) {
   if (!isLinkedInUrl(tabUrl)) {
     return;
   }
-  await safeSendMessage(tabId, {
-    type: MESSAGE_TYPES.SET_ASSISTANT_ACTIVE,
-    active: isAssistantSessionActive()
-  });
+  await sendActivationMessage(tabId, isAssistantSessionActive());
+}
+
+// Send SET_ASSISTANT_ACTIVE without ever injecting content scripts.
+// Activation messages must not trigger injection — injecting mid-page on a
+// LinkedIn SPA tab can disrupt navigation and cause blank/grey pages.
+// If the content script is not present, the tab is already in the default
+// inactive state so there is nothing to do.
+async function sendActivationMessage(tabId, active) {
+  try {
+    await chrome.tabs.sendMessage(tabId, {
+      type: MESSAGE_TYPES.SET_ASSISTANT_ACTIVE,
+      active: Boolean(active)
+    });
+  } catch {
+    // Content script not present — tab is already inactive by default. Ignore.
+  }
 }
 
 async function syncAssistantActivationForKnownLinkedInTabs() {
@@ -375,10 +390,7 @@ async function syncAssistantActivationForKnownLinkedInTabs() {
   // and polling timers stop running in the background.
   const tasks = Array.from(linkedInTabUrls.keys()).map((tabId) => {
     const shouldBeActive = sessionActive && tabId === lastObservedLinkedInTabId;
-    return safeSendMessage(tabId, {
-      type: MESSAGE_TYPES.SET_ASSISTANT_ACTIVE,
-      active: shouldBeActive
-    }).catch(() => {});
+    return sendActivationMessage(tabId, shouldBeActive);
   });
   await Promise.all(tasks);
 }
@@ -3776,6 +3788,17 @@ function buildThreadPersonBindings(people, existingBindings) {
     });
   });
 
+  // Safety cap: if bindings somehow exceed 500 entries (e.g. heavy conversation history),
+  // drop the excess by keeping only the first 500.  In practice the count is 2× people
+  // count because collectThreadUrlsForRecord returns at most 2 URLs per person, so this
+  // guard only fires in extreme edge cases.
+  const bindingKeys = Object.keys(nextBindings);
+  if (bindingKeys.length > 500) {
+    const trimmed = {};
+    bindingKeys.slice(0, 500).forEach((k) => { trimmed[k] = nextBindings[k]; });
+    return trimmed;
+  }
+
   return nextBindings;
 }
 
@@ -3791,6 +3814,18 @@ function buildTabPersonBindings(people, existingBindings) {
       nextBindings[String(normalizedTabId)] = normalizedPersonId;
     }
   });
+
+  // Safety cap: Chrome tab IDs are session-scoped and increase monotonically, so old
+  // sessions leave stale entries (valid person, stale tab ID) until the person is deleted.
+  // If we somehow accumulate more than 200 entries, keep only the highest tab IDs
+  // (most recent session), which are the ones most likely to still be open.
+  const tabKeys = Object.keys(nextBindings);
+  if (tabKeys.length > 200) {
+    const sorted = tabKeys.sort((a, b) => Number(b) - Number(a)).slice(0, 200);
+    const trimmed = {};
+    sorted.forEach((k) => { trimmed[k] = nextBindings[k]; });
+    return trimmed;
+  }
 
   return nextBindings;
 }
@@ -5720,7 +5755,17 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
 chrome.tabs.onActivated.addListener(async (activeInfo) => {
   try {
     const tab = await chrome.tabs.get(activeInfo.tabId);
-    rememberLinkedInTab(tab.id, tab.url);
+    if (tab?.id && isLinkedInUrl(tab.url || "")) {
+      linkedInTabUrls.set(tab.id, normalizeWhitespace(tab.url));
+      lastObservedLinkedInTabId = tab.id;
+      lastObservedLinkedInTabUrl = normalizeWhitespace(tab.url);
+    } else if (tab?.id) {
+      // User switched to a non-LinkedIn tab — deactivate all LinkedIn tabs.
+      lastObservedLinkedInTabId = -1;
+      lastObservedLinkedInTabUrl = "";
+    }
+    // Real tab switch: sync activation state across all known LinkedIn tabs.
+    syncAssistantActivationForKnownLinkedInTabs().catch(() => {});
   } catch (_error) {
     // Ignore transient activation errors.
   }
@@ -5899,7 +5944,8 @@ async function executeGenerationJob(job) {
     job.extraContext,
     {
       draftCharacterLimit,
-      promptPackSettings: stored.promptPackSettings
+      promptPackSettings: stored.promptPackSettings,
+      channel: job.channel === "email" ? "email" : "relationship"
     }
   );
   generationTiming.draft_prompt_build_ms = roundMs(Date.now() - stepStartedAt);
@@ -6293,6 +6339,49 @@ function mergeJobOutreachRunWithJob(run, job) {
   };
 }
 
+const JOB_PAGE_CAPTURES_MAX = 50;
+
+function normalizeCapturedPerson(person) {
+  const profileUrl = normalizeLinkedInProfileUrl(person?.profileUrl || person?.profile_url || "");
+  if (!profileUrl) {
+    return null;
+  }
+  const relationshipContext = normalizeWhitespace(person?.relationshipContext || "");
+  const note = normalizeWhitespace(person?.note || "");
+  const aiInsight = normalizeWhitespace(person?.aiGeneratedInsight || note || relationshipContext || "");
+  return {
+    profileUrl,
+    avatarUrl: normalizeWhitespace(person?.avatarUrl || ""),
+    name: normalizeWhitespace(person?.name || ""),
+    headline: normalizeWhitespace(person?.headline || ""),
+    connectionDegree: normalizeWhitespace(person?.connectionDegree || ""),
+    relationshipContext,
+    note,
+    aiGeneratedInsight: aiInsight,
+    manual: Boolean(person?.manual),
+    capturedAt: normalizeWhitespace(person?.capturedAt) || toIsoNow(),
+    updatedAt: normalizeWhitespace(person?.updatedAt) || toIsoNow()
+  };
+}
+
+function normalizeJobCaptures(record) {
+  const source = record?.captures && typeof record.captures === "object" ? record.captures : {};
+  const seen = new Set();
+  const people = [];
+  (Array.isArray(source.people) ? source.people : []).forEach((person) => {
+    const normalized = normalizeCapturedPerson(person);
+    if (!normalized || seen.has(normalized.profileUrl)) {
+      return;
+    }
+    seen.add(normalized.profileUrl);
+    people.push(normalized);
+  });
+  return {
+    people: people.slice(-JOB_PAGE_CAPTURES_MAX),
+    updatedAt: normalizeWhitespace(source.updatedAt)
+  };
+}
+
 function normalizeJobOutreachStore(store) {
   const source = store && typeof store === "object" ? store : {};
   const jobsById = {};
@@ -6318,6 +6407,7 @@ function normalizeJobOutreachStore(store) {
           ? record.analytics.searchTermHistory.slice(-20)
           : []
       },
+      captures: normalizeJobCaptures(record),
       firstSeenAt: normalizeWhitespace(record?.firstSeenAt),
       updatedAt: normalizeWhitespace(record?.updatedAt)
     };
@@ -7019,6 +7109,168 @@ function compactJobOutreachHistoryEntry(run, searches, importedPeopleBySearch) {
   };
 }
 
+function resolveCaptureJobId(message) {
+  const explicit = normalizeWhitespace(message?.jobId);
+  if (explicit) {
+    return explicit;
+  }
+  return jobIdFromJob(normalizeJobOutreachJob(message?.job || {}));
+}
+
+function jobCapturesForJobId(store, jobId) {
+  if (!jobId) {
+    return [];
+  }
+  const record = normalizeJobOutreachStore(store).jobsById[jobId];
+  return record?.captures?.people || [];
+}
+
+function upsertJobPageCaptureInStore(store, job, person) {
+  const currentStore = normalizeJobOutreachStore(store);
+  const normalizedJob = normalizeJobOutreachJob(job || {});
+  const jobId = jobIdFromJob(normalizedJob);
+  if (!jobId) {
+    throw new Error("Open a LinkedIn job first.");
+  }
+  const normalizedPerson = normalizeCapturedPerson(person);
+  if (!normalizedPerson) {
+    throw new Error("Could not read this person's LinkedIn profile URL.");
+  }
+  const now = toIsoNow();
+  const existing = currentStore.jobsById[jobId] || {
+    jobId,
+    job: normalizedJob,
+    latestRun: null,
+    analytics: { totalSearchRuns: 0, lastSearchAt: "", searchTermHistory: [] },
+    captures: { people: [], updatedAt: "" },
+    firstSeenAt: now,
+    updatedAt: now
+  };
+  const people = Array.isArray(existing.captures?.people) ? existing.captures.people.slice() : [];
+  if (!people.some((entry) => entry.profileUrl === normalizedPerson.profileUrl)) {
+    people.push(normalizedPerson);
+  }
+  currentStore.jobsById[jobId] = {
+    ...existing,
+    jobId,
+    job: normalizeWhitespace(existing.job?.title) ? existing.job : normalizedJob,
+    captures: { people: people.slice(-JOB_PAGE_CAPTURES_MAX), updatedAt: now },
+    firstSeenAt: normalizeWhitespace(existing.firstSeenAt) || now,
+    updatedAt: now
+  };
+  return { store: currentStore, jobId };
+}
+
+function updateJobPageCaptureInStore(store, jobId, profileUrl, edits) {
+  const currentStore = normalizeJobOutreachStore(store);
+  const record = currentStore.jobsById[jobId];
+  if (!record) {
+    throw new Error("No captured people for this job.");
+  }
+  const normalizedUrl = normalizeLinkedInProfileUrl(profileUrl);
+  const now = toIsoNow();
+  const people = (record.captures?.people || []).map((entry) => {
+    if (entry.profileUrl !== normalizedUrl) {
+      return entry;
+    }
+    const note = edits?.note !== undefined ? normalizeWhitespace(edits.note) : entry.note;
+    const relationshipContext = edits?.relationshipContext !== undefined
+      ? normalizeWhitespace(edits.relationshipContext)
+      : entry.relationshipContext;
+    return {
+      ...entry,
+      name: edits?.name !== undefined ? normalizeWhitespace(edits.name) : entry.name,
+      headline: edits?.headline !== undefined ? normalizeWhitespace(edits.headline) : entry.headline,
+      connectionDegree: edits?.connectionDegree !== undefined ? normalizeWhitespace(edits.connectionDegree) : entry.connectionDegree,
+      note,
+      relationshipContext,
+      aiGeneratedInsight: note || relationshipContext || entry.aiGeneratedInsight,
+      updatedAt: now
+    };
+  });
+  currentStore.jobsById[jobId] = {
+    ...record,
+    captures: { people, updatedAt: now },
+    updatedAt: now
+  };
+  return { store: currentStore, jobId };
+}
+
+function removeJobPageCaptureFromStore(store, jobId, profileUrl) {
+  const currentStore = normalizeJobOutreachStore(store);
+  const record = currentStore.jobsById[jobId];
+  if (!record) {
+    return { store: currentStore, jobId };
+  }
+  const normalizedUrl = normalizeLinkedInProfileUrl(profileUrl);
+  const now = toIsoNow();
+  const people = (record.captures?.people || []).filter((entry) => entry.profileUrl !== normalizedUrl);
+  currentStore.jobsById[jobId] = {
+    ...record,
+    captures: { people, updatedAt: now },
+    updatedAt: now
+  };
+  return { store: currentStore, jobId };
+}
+
+async function broadcastJobPageCapturesChanged(jobId, people, sourceTabId) {
+  const payload = { type: MESSAGE_TYPES.JOB_PAGE_CAPTURES_CHANGED, jobId, captures: people };
+  try {
+    chrome.runtime.sendMessage(payload).catch(() => {});
+  } catch (_error) {}
+  if (typeof sourceTabId === "number") {
+    try {
+      chrome.tabs.sendMessage(sourceTabId, payload).catch(() => {});
+    } catch (_error) {}
+  }
+}
+
+async function captureJobPagePersonWorkflow(message) {
+  let stored = await getStoredState();
+  const { store, jobId } = upsertJobPageCaptureInStore(stored?.jobOutreach, message?.job, message?.person);
+  const nextStore = await persistNormalizedJobOutreachStore(store);
+  stored = { ...stored, jobOutreach: nextStore };
+  const people = nextStore.jobsById[jobId]?.captures?.people || [];
+  await broadcastJobPageCapturesChanged(jobId, people, message?.sourceTabId);
+  return { ok: true, jobId, captures: people };
+}
+
+async function updateJobPageCaptureWorkflow(message) {
+  const jobId = resolveCaptureJobId(message);
+  const profileUrl = normalizeWhitespace(message?.profileUrl);
+  if (!jobId || !profileUrl) {
+    throw new Error("Missing job or profile reference for this edit.");
+  }
+  let stored = await getStoredState();
+  const { store } = updateJobPageCaptureInStore(stored?.jobOutreach, jobId, profileUrl, message?.edits || {});
+  const nextStore = await persistNormalizedJobOutreachStore(store);
+  stored = { ...stored, jobOutreach: nextStore };
+  const people = nextStore.jobsById[jobId]?.captures?.people || [];
+  await broadcastJobPageCapturesChanged(jobId, people, message?.sourceTabId);
+  return { ok: true, jobId, captures: people };
+}
+
+async function removeJobPagePersonWorkflow(message) {
+  const jobId = resolveCaptureJobId(message);
+  const profileUrl = normalizeWhitespace(message?.profileUrl);
+  if (!jobId || !profileUrl) {
+    throw new Error("Missing job or profile reference for this removal.");
+  }
+  let stored = await getStoredState();
+  const { store } = removeJobPageCaptureFromStore(stored?.jobOutreach, jobId, profileUrl);
+  const nextStore = await persistNormalizedJobOutreachStore(store);
+  stored = { ...stored, jobOutreach: nextStore };
+  const people = nextStore.jobsById[jobId]?.captures?.people || [];
+  await broadcastJobPageCapturesChanged(jobId, people, message?.sourceTabId);
+  return { ok: true, jobId, captures: people };
+}
+
+async function getJobPageCapturesWorkflow(message) {
+  const stored = await getStoredState();
+  const jobId = resolveCaptureJobId(message);
+  return { ok: true, jobId, captures: jobCapturesForJobId(stored?.jobOutreach, jobId) };
+}
+
 async function saveJobOutreachLatestRun(stored, workflow) {
   const job = normalizeJobOutreachJob(workflow?.job || {});
   const jobId = jobIdFromJob(job);
@@ -7151,6 +7403,7 @@ async function saveJobOutreachLatestRun(stored, workflow) {
       lastSearchAt: now,
       searchTermHistory: history
     },
+    captures: normalizeJobCaptures(existing),
     firstSeenAt: normalizeWhitespace(existing.firstSeenAt) || now,
     updatedAt: now
   };
@@ -7244,8 +7497,13 @@ function normalizeJobOutreachSearches(searches) {
 }
 
 function searchNumberFromKey(searchKey) {
+  const normalized = normalizeWhitespace(searchKey).toUpperCase();
+  // Reserved key for people captured directly from a job page — sorts/keys after A/B/C.
+  if (normalized === "PAGE") {
+    return 4;
+  }
   const keys = jobOutreachAi?.SEARCH_KEYS || ["A", "B", "C"];
-  const index = keys.indexOf(normalizeWhitespace(searchKey).toUpperCase());
+  const index = keys.indexOf(normalized);
   return index >= 0 ? index + 1 : 1;
 }
 
@@ -8314,12 +8572,32 @@ async function importJobOutreachSearches(runState, progress) {
 
 async function finalizeJobOutreachRun(runState, progress) {
   throwIfJobOutreachCancelled(runState);
+  const sourceJobId = jobIdFromJob(runState.job);
   const importedSearches = runState.importedSearches
     .slice()
     .sort((left, right) => searchNumberFromKey(left.searchKey) - searchNumberFromKey(right.searchKey));
+  // Inject people captured directly from the job page as a "PAGE" pseudo-search so they
+  // rank alongside the keyword searches (A/B/C). No worker tab / search URL is involved.
+  const capturedPeople = jobCapturesForJobId(runState.stored?.jobOutreach, sourceJobId);
+  if (capturedPeople.length) {
+    importedSearches.push({
+      searchKey: "PAGE",
+      searchNumber: 4,
+      keywords: "From this job page",
+      searchUrl: "",
+      people: capturedPeople.map((person) => ({
+        name: person.name,
+        profileUrl: person.profileUrl,
+        connectionDegree: person.connectionDegree,
+        headline: person.headline,
+        avatarUrl: person.avatarUrl,
+        aiGeneratedInsight: person.aiGeneratedInsight || person.note || person.relationshipContext || "",
+        primaryAction: ""
+      }))
+    });
+  }
   const importedPeopleBySearch = {};
   const importedPeopleBySearchKey = {};
-  const sourceJobId = jobIdFromJob(runState.job);
   for (const search of importedSearches) {
     const attributedPeople = (Array.isArray(search.people) ? search.people : []).map((person) => ({
       ...person,
@@ -8549,6 +8827,15 @@ async function continueJobOutreachWorkflow(runState, progress) {
       manualAction: null,
       error: ""
     }, { removeFromPending: true });
+    // Broadcast completion so any open sidepanel can refresh from IndexedDB.
+    // sendResponse(result) only works for the original port — if the sidepanel was
+    // reopened while the job ran, this broadcast is the only way it learns the run finished.
+    await sendJobOutreachProgress(runState.requestId, runState.sourceTabId, {
+      text: "Ranked people ready.",
+      detail: `${(result.rankingPlan?.people || []).length || 0} ranked people returned.`,
+      progressPercent: 100,
+      status: "completed"
+    });
     runState.stored = await maybeStartNextQueuedJobOutreachRun(runState.stored);
     return result;
   } catch (error) {
@@ -8601,7 +8888,13 @@ async function runJobOutreachWorkflow(message) {
   const searches = normalizeJobOutreachSearches(message.searches)
     .map((search) => hydrateSearchFilters(search, filterCacheSnapshot(stored)));
   if (!searches.length) {
-    throw new Error("Add at least one search entry.");
+    // A run is still valid with zero keyword searches when the user has captured people
+    // directly from the job page — those are injected as the "PAGE" pseudo-search at
+    // finalize time and ranked on their own.
+    const capturedCount = jobCapturesForJobId(stored?.jobOutreach, jobIdFromJob(job)).length;
+    if (!capturedCount) {
+      throw new Error("Add at least one search entry or capture people from this job page.");
+    }
   }
 
   const promptSettings = normalizePromptSettings(stored.promptSettings || defaultPromptSettings());
@@ -8928,6 +9221,30 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
       if (message.type === MESSAGE_TYPES.OPEN_JOB_OUTREACH_WORKER_TAB) {
         const result = await openJobOutreachWorkerTab(message);
+        sendResponse(result);
+        return;
+      }
+
+      if (message.type === MESSAGE_TYPES.CAPTURE_JOB_PAGE_PERSON) {
+        const result = await captureJobPagePersonWorkflow({ ...message, sourceTabId: message.sourceTabId ?? _sender?.tab?.id });
+        sendResponse(result);
+        return;
+      }
+
+      if (message.type === MESSAGE_TYPES.UPDATE_JOB_PAGE_CAPTURE) {
+        const result = await updateJobPageCaptureWorkflow({ ...message, sourceTabId: message.sourceTabId ?? _sender?.tab?.id });
+        sendResponse(result);
+        return;
+      }
+
+      if (message.type === MESSAGE_TYPES.REMOVE_JOB_PAGE_PERSON) {
+        const result = await removeJobPagePersonWorkflow({ ...message, sourceTabId: message.sourceTabId ?? _sender?.tab?.id });
+        sendResponse(result);
+        return;
+      }
+
+      if (message.type === MESSAGE_TYPES.GET_JOB_PAGE_CAPTURES) {
+        const result = await getJobPageCapturesWorkflow(message);
         sendResponse(result);
         return;
       }

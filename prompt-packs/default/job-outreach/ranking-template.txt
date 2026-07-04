@@ -37,7 +37,21 @@ Do not recommend asking a named third party for an introduction or referral.
 If mutual-connection evidence exists, use it only as a weak warmth signal. Do not mention mutual names in approach_strategy.
 approach_strategy must describe direct outreach to the ranked person only.
 Any suggested outreach framing must stay professionally polite, even when it is warm, concise, or lightly conversational.
-Return JSON only. Do not include prose or markdown.
+
+approach_strategy must match the first-message ask intensity to best_use. This is critical: the approach_strategy is used as direct input into a message-drafting AI, so it must not ask for more than is appropriate for the very first cold message.
+
+Rules by best_use:
+- direct_referral_path:
+  - If the person is a recruiter or a hiring manager: May be transparent about the application. Suggest leading with the sender's strongest credibility signal or hardest metric, then one specific ask — a referral, an intro to the hiring team, or a brief call. One ask only.
+  - If the person is a peer or a non-hiring manager: Frame as a peer exchange, not a job ask. Suggest asking for a brief call around a specific shared industry challenge. Do not reveal the application.
+- hiring_context: Frame as a peer exchange between equals. Suggest asking for 15 minutes to discuss a specific challenge or decision they are clearly working on based on their visible role. One ask only. Do NOT suggest asking them to route the sender anywhere, name a team lead, or describe org structure. The goal is to start a peer conversation, not extract org information.
+- warm_entry_point: Shared institutional background (alumni network, school, geography) bypasses the "stranger danger" filter and significantly increases reply rates — use it explicitly. Suggest acknowledging the shared background warmly, then asking one easy question about their work or experience. No referral ask, no org navigation.
+- peer_team_insight: Frame as curiosity about their specific work. Suggest asking about their experience with a particular challenge or technology relevant to their visible role. One easy question. No ask for introductions or referrals.
+- low_value: Do not produce an approach_strategy that recommends reaching out.
+
+Never suggest revealing the sender is actively applying in the first message unless the person is a recruiter or a hiring manager on a direct_referral_path.
+Never suggest asking two questions in one message.
+Never suggest asking the person to "point you toward" someone else or name an internal contact. If the conversation goes well and the sender earns the person's trust, they will offer an introduction organically — do not ask for it in the first message.
 
 Contract: {{ranking_contract_version}}
 Required shape:

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Lumi Assist",
-  "version": "0.1.4",
+  "version": "0.1.8",
   "description": "Draft personalized LinkedIn outreach messages in Chrome using supported AI websites.",
   "permissions": [
     "activeTab",
@@ -53,8 +53,6 @@
         "linkedin-commands.js",
         "linkedin-content.js"
       ],
-      "all_frames": true,
-      "match_about_blank": true,
       "run_at": "document_idle"
     },
     {

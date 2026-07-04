@@ -104,6 +104,12 @@
     DISMISS_JOB_OUTREACH_RUN: "DISMISS_JOB_OUTREACH_RUN",
     OPEN_JOB_OUTREACH_WORKER_TAB: "OPEN_JOB_OUTREACH_WORKER_TAB",
     JOB_OUTREACH_PROGRESS: "JOB_OUTREACH_PROGRESS",
+    CAPTURE_JOB_PAGE_PERSON: "CAPTURE_JOB_PAGE_PERSON",
+    UPDATE_JOB_PAGE_CAPTURE: "UPDATE_JOB_PAGE_CAPTURE",
+    REMOVE_JOB_PAGE_PERSON: "REMOVE_JOB_PAGE_PERSON",
+    GET_JOB_PAGE_CAPTURES: "GET_JOB_PAGE_CAPTURES",
+    JOB_PAGE_CAPTURES_CHANGED: "JOB_PAGE_CAPTURES_CHANGED",
+    FORCE_JOB_PAGE_CAPTURE_SCAN: "FORCE_JOB_PAGE_CAPTURE_SCAN",
     GET_STORAGE_STATE: "GET_STORAGE_STATE",
     RESOLVE_PROFILE_IDENTITY: "RESOLVE_PROFILE_IDENTITY",
     READ_LATEST_CHATGPT_RESPONSE: "READ_LATEST_CHATGPT_RESPONSE",
@@ -2102,6 +2108,7 @@
       personNote: normalizeWhitespace(options?.personNote),
       userGoal: normalizeUserGoal(options?.userGoal),
       extraContext: normalizeWhitespace(options?.extraContext),
+      channel: options?.channel === "email" ? "email" : "relationship",
       draftCharacterLimit: Number.isFinite(Number(options?.draftCharacterLimit)) && Number(options?.draftCharacterLimit) > 0
         ? Math.floor(Number(options.draftCharacterLimit))
         : null
