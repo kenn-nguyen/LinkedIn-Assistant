@@ -13,6 +13,11 @@
       "template_path": "relationship/retry.txt",
       "contract_path": "relationship/contract.json"
     },
+    "email": {
+      "label": "Email draft",
+      "template_path": "email/template.txt",
+      "contract_path": "email/contract.json"
+    },
     "post_suggestions": {
       "label": "Post suggestions",
       "template_path": "post-suggestions/template.txt",

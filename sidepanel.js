@@ -190,6 +190,9 @@
     senderProfileProviderSelect: document.querySelector("#sender-profile-provider-select"),
     senderProfileOpenLink: document.querySelector("#sender-profile-open-link"),
     senderProfileUpdateNow: document.querySelector("#sender-profile-update-now"),
+    senderProfileContinueRow: document.querySelector("#sender-profile-continue-row"),
+    senderProfileRefresh: document.querySelector("#sender-profile-refresh"),
+    senderProfileContinue: document.querySelector("#sender-profile-continue"),
     senderProfileOpenSettings: document.querySelector("#sender-profile-open-settings"),
     personName: document.querySelector("#person-name"),
     personSubtitle: document.querySelector("#person-subtitle"),
@@ -201,6 +204,7 @@
     personCardEditor: document.querySelector("#person-card-editor"),
     settingsViewButton: document.querySelector("#settings-view-button"),
     nextActionButton: document.querySelector("#next-action-button"),
+    draftEmailButton: document.querySelector("#draft-email-button"),
     nextHelperButton: document.querySelector("#next-helper-button"),
     updateProfileButton: document.querySelector("#update-profile-button"),
     updateProfileMeta: document.querySelector("#update-profile-meta"),
@@ -670,85 +674,81 @@
   function renderSenderProfilePrompt() {
     const hasSavedProfile = hasSavedSenderProfile();
     const onSavedOwnProfilePage = isSavedOwnProfilePage();
-    const onPendingOwnProfilePage = isPendingOwnProfilePage();
-    const shouldShowPrompt = !hasSavedProfile || onSavedOwnProfilePage || onPendingOwnProfilePage;
+    const onAnyProfilePage = canCaptureCurrentProfilePage();
+    const dismissed = Boolean(state.senderProfileSetupDismissed);
+    const shouldShowPrompt = (!hasSavedProfile || onSavedOwnProfilePage) && !dismissed;
     state.showingSenderProfilePrompt = shouldShowPrompt;
     el.onboardingSection?.classList.toggle("hidden", !shouldShowPrompt);
     if (!shouldShowPrompt || !el.senderProfilePrompt) {
       return;
     }
-    const ownProfileUrl = normalizeWhitespace(el.senderProfileUrlInput?.value || configuredOwnProfileUrl());
-    const currentPageUrl = currentProfileUrl();
-    const normalizedOwnProfileUrl = ownProfileUrl.replace(/\/+$/, "");
-    const normalizedCurrentPageUrl = normalizeWhitespace(currentPageUrl).replace(/\/+$/, "");
-    const pastedUrlMatchesCurrentPage = Boolean(
-      normalizedOwnProfileUrl
-      && normalizedCurrentPageUrl
-      && normalizedOwnProfileUrl === normalizedCurrentPageUrl
-    );
-    const onAnyProfilePage = canCaptureCurrentProfilePage();
-    const canUseCurrentPage = onAnyProfilePage && (!ownProfileUrl || pastedUrlMatchesCurrentPage);
-    const hasConfiguredProfileUrl = Boolean(ownProfileUrl);
-    const canOpenTargetProfile = hasConfiguredProfileUrl && !pastedUrlMatchesCurrentPage;
-    let promptCopy = "";
-    let primaryLabel = "";
-    let primaryDisabled = false;
-    let secondaryLabel = "Go to profile";
-    let secondaryHidden = !hasConfiguredProfileUrl;
-    let secondaryDisabled = !hasConfiguredProfileUrl;
 
-    if (el.senderProfileUrlInput && document.activeElement !== el.senderProfileUrlInput) {
-      el.senderProfileUrlInput.value = ownProfileUrl;
+    // URL field is read-only: show current page URL when on a profile page,
+    // otherwise fall back to the previously saved URL.
+    const currentPageUrl = currentProfileUrl();
+    const savedUrl = configuredOwnProfileUrl();
+    const displayUrl = currentPageUrl || savedUrl || "";
+    if (el.senderProfileUrlInput) {
+      el.senderProfileUrlInput.value = displayUrl;
     }
     if (el.senderProfileNotesInput && document.activeElement !== el.senderProfileNotesInput) {
       el.senderProfileNotesInput.value = state.myProfile?.manualNotes || "";
     }
     if (el.senderProfileSettingsUrl && document.activeElement !== el.senderProfileSettingsUrl) {
-      el.senderProfileSettingsUrl.value = ownProfileUrl;
+      el.senderProfileSettingsUrl.value = savedUrl;
     }
 
-    if (onPendingOwnProfilePage) {
-      promptCopy = "Update this page to switch your saved profile.";
-      primaryLabel = "Update this page";
-      primaryDisabled = !canUpdateSenderProfileNow();
-    } else if (onSavedOwnProfilePage) {
-      promptCopy = hasSavedProfile
-        ? "Refresh your saved profile from this page."
-        : "You are on your profile. Save it once.";
-      primaryLabel = hasSavedProfile ? "Refresh my profile" : "Save my profile now";
-      primaryDisabled = !canUpdateSenderProfileNow();
-    } else if (canOpenTargetProfile) {
-      promptCopy = hasSavedProfile
-        ? "Open the pasted profile to switch your saved profile."
-        : "Open the pasted profile, then use this page.";
-      primaryLabel = onAnyProfilePage ? "Use this page" : "Update profile";
-      primaryDisabled = true;
-    } else if (canUseCurrentPage) {
-      promptCopy = "If this is your profile, use this page.";
-      primaryLabel = "Use this page";
-      primaryDisabled = !(canUpdateSenderProfileNow() || canUseCurrentPage);
+    const hasSavedUrl = Boolean(savedUrl);
+    let promptCopy = "";
+    let primaryLabel = "";
+    let primaryDisabled = false;
+    let secondaryHidden = true;
+    let secondaryDisabled = true;
+
+    if (onAnyProfilePage) {
+      // User is on a LinkedIn profile page — they can capture it.
+      if (onSavedOwnProfilePage) {
+        promptCopy = hasSavedProfile
+          ? "Your profile is saved. Continue to the dashboard, or refresh from this page."
+          : "You are on your profile page. Save it to get started.";
+        primaryLabel = hasSavedProfile ? "Refresh my profile" : "Save my profile";
+      } else {
+        promptCopy = "This is a LinkedIn profile page. Save it as your profile.";
+        primaryLabel = "Save my profile";
+      }
+      primaryDisabled = false;
     } else {
-      promptCopy = "Paste your profile URL and open it.";
-      primaryLabel = onAnyProfilePage ? "Update this page" : "Update profile";
-      primaryDisabled = !canUpdateSenderProfileNow();
+      // User is NOT on a LinkedIn profile page.
+      promptCopy = "Go to your LinkedIn profile page, then save it here.";
+      primaryLabel = hasSavedProfile ? "Refresh my profile" : "Save my profile";
+      primaryDisabled = true;
+      if (hasSavedUrl) {
+        secondaryHidden = false;
+        secondaryDisabled = false;
+      }
     }
 
-    if (onSavedOwnProfilePage && hasConfiguredProfileUrl) {
-      secondaryHidden = false;
-      secondaryDisabled = false;
-      secondaryLabel = "Go to profile";
-    } else if (canOpenTargetProfile) {
-      secondaryHidden = false;
-      secondaryDisabled = false;
-      secondaryLabel = "Go to profile";
+    // Show the "Continue / Refresh" row when the profile is already saved and
+    // the user is still on their own profile page. This gives them a clear path
+    // to the main dashboard without forcing a re-extraction.
+    const showContinueRow = hasSavedProfile && onSavedOwnProfilePage;
+    if (el.senderProfileContinueRow) {
+      el.senderProfileContinueRow.style.display = showContinueRow ? "" : "none";
+    }
+    // Hide the normal save/go-to-profile row when continue row is shown.
+    const saveRowHidden = showContinueRow;
+    if (el.senderProfileUpdateNow) {
+      el.senderProfileUpdateNow.parentElement?.classList.toggle("hidden", saveRowHidden);
     }
 
     el.senderProfileCopy.textContent = promptCopy;
-    el.senderProfileUpdateNow.disabled = primaryDisabled;
-    setButtonLabel(el.senderProfileUpdateNow, primaryLabel);
-    el.senderProfileOpenLink.disabled = secondaryDisabled;
-    el.senderProfileOpenLink.classList.toggle("hidden", secondaryHidden);
-    setButtonLabel(el.senderProfileOpenLink, secondaryLabel);
+    if (!showContinueRow) {
+      el.senderProfileUpdateNow.disabled = primaryDisabled;
+      setButtonLabel(el.senderProfileUpdateNow, primaryLabel);
+      el.senderProfileOpenLink.disabled = secondaryDisabled;
+      el.senderProfileOpenLink.classList.toggle("hidden", secondaryHidden);
+      setButtonLabel(el.senderProfileOpenLink, "Go to profile");
+    }
   }
 
   if (el.readLatestResponseButton) {
@@ -3091,6 +3091,12 @@
     renderNextStepEvidence(nextStep.evidence);
     applyRecommendationButton(el.nextActionButton, nextStep.primary);
     applyRecommendationButton(el.nextHelperButton, nextStep.helper);
+    // Offer the email alternative whenever drafting a message is the suggested action.
+    if (el.draftEmailButton) {
+      const canDraft = nextStep?.primary?.mode === "draft";
+      el.draftEmailButton.classList.toggle("hidden", !canDraft);
+      el.draftEmailButton.disabled = !canDraft;
+    }
     el.referralReadiness.innerHTML = referralMarkup || escapeHtml(referralRead);
     el.referralReadiness.classList.toggle("referral-readiness", Boolean(normalizeWhitespace(referralRead)));
     el.referralReadiness.classList.toggle("hidden", !normalizeWhitespace(referralRead));
@@ -3899,6 +3905,15 @@
       if (isBusy || document.hidden) {
         return;
       }
+      // Defer to observer-driven pushes: if the content script already signalled a context
+      // change within the last poll interval, this poll tick would be a redundant background
+      // wake-up + content-script query. Skip it. When the observer ISN'T pushing (e.g. the
+      // messaging UI is in an iframe the content script hasn't been injected into yet),
+      // lastNavigationSignalAt stays stale and the poll runs normally as a safety net.
+      const lastSignalAt = Date.parse(state.lastNavigationSignalAt || "") || 0;
+      if (lastSignalAt && Date.now() - lastSignalAt < MESSAGE_THREAD_POLL_MS) {
+        return;
+      }
       void refreshState({ preserveStatus: true, allowCached: true, suppressImportStatus: true });
     }, MESSAGE_THREAD_POLL_MS);
   }
@@ -4011,6 +4026,11 @@
     clearNavigationHold();
     const preserveStatus = Boolean(options?.preserveStatus);
     const hasSavedProfile = hasSavedSenderProfile();
+    // Reset the dismiss flag whenever the user navigates away from their own profile page,
+    // so the setup prompt reappears naturally the next time they return to it.
+    if (state.senderProfileSetupDismissed && !isSavedOwnProfilePage()) {
+      state.senderProfileSetupDismissed = false;
+    }
     const supported = Boolean(state.pageContext?.supported);
     const isTransientMessagingLoad = state.pageContext?.pageType === "linkedin-messaging"
       && /loading selected conversation/i.test(state.pageContext?.reason || "");
@@ -4020,7 +4040,7 @@
     const hasImportedConversation = Boolean(currentObservedConversation());
     const onOwnProfilePage = isSavedOwnProfilePage();
     const onPendingOwnProfilePage = isPendingOwnProfilePage();
-    const showSetupOnly = !hasSavedProfile || onPendingOwnProfilePage || onOwnProfilePage;
+    const showSetupOnly = (!hasSavedProfile || onPendingOwnProfilePage || onOwnProfilePage) && !state.senderProfileSetupDismissed;
     const currentJob = currentGenerationJob();
     const jobProgressText = normalizeWhitespace(currentJob?.progressText);
     const currentSourceTabId = preferredLinkedInTabId();
@@ -4704,8 +4724,11 @@
     }, 300);
   }
 
-  async function handleGenerate() {
-    setLoading(el.nextActionButton, "Drafting…", true);
+  async function handleGenerate(channel, button) {
+    const draftChannel = channel === "email" ? "email" : "relationship";
+    const loadingButton = button || el.nextActionButton;
+    const loadingLabel = "Drafting…";
+    setLoading(loadingButton, loadingLabel, true);
     state.manualRecovery = null;
     const requestId = makeRequestId();
     try {
@@ -4725,7 +4748,8 @@
         personNote: el.personNoteInput.value,
         userGoal: el.personGoalSelect.value,
         extraContext: el.extraContextInput.value,
-        draftCharacterLimit: selectedDraftCharacterLimit()
+        draftCharacterLimit: selectedDraftCharacterLimit(),
+        channel: draftChannel
       }));
       if (!response?.ok) {
         state.manualRecovery = response?.manualRecovery || null;
@@ -4746,38 +4770,19 @@
       setStatus(error.message || String(error), true);
       renderManualRecovery();
     } finally {
-      setLoading(el.nextActionButton, "Drafting…", false);
+      setLoading(loadingButton, loadingLabel, false);
       renderPageStatus({ preserveStatus: true });
     }
   }
 
   async function handleUpdateProfile(options) {
-    const allowCurrentPageCapture = Boolean(options?.allowCurrentPageCapture);
     const profileNeedsSetup = !hasSavedSenderProfile();
     const firstTimeSave = !normalizeWhitespace(state.myProfile?.rawSnapshot);
     const pendingOwnProfilePage = isPendingOwnProfilePage();
     const savedOwnProfilePage = isSavedOwnProfilePage();
     const shouldAutoSaveProfile = profileNeedsSetup || pendingOwnProfilePage || savedOwnProfilePage;
-    const targetProfileUrl = normalizeWhitespace(el.senderProfileUrlInput?.value || configuredOwnProfileUrl());
-    const pageProfileUrl = normalizeWhitespace(currentProfileUrl());
-    const hasDifferentTargetProfile = Boolean(
-      targetProfileUrl
-      && pageProfileUrl
-      && targetProfileUrl.replace(/\/+$/, "") !== pageProfileUrl.replace(/\/+$/, "")
-    );
-    if (hasDifferentTargetProfile) {
-      setStatus("Go to the pasted profile first.", false, "warning");
-      return;
-    }
     if (!canUpdateSenderProfileNow()) {
-      if (allowCurrentPageCapture && canCaptureCurrentProfilePage()) {
-        const pageUrl = currentProfileUrl();
-        syncOwnProfileUrlInputs(pageUrl);
-        renderPageStatus({ preserveStatus: true });
-      }
-    }
-    if (!canUpdateSenderProfileNow()) {
-      setStatus("Paste your LinkedIn profile URL and open that page first.", true);
+      setStatus("Go to your LinkedIn profile page first.", true);
       return;
     }
     setLoading(el.updateProfileButton, "Extracting…", true);
@@ -4862,9 +4867,13 @@
           el.senderContextDetails.open = false;
         }
         syncOwnProfileUrlInputs(state.myProfile?.ownProfileUrl || "");
+        if (firstTimeSave) {
+          // After the very first save, dismiss setup so the user lands on the main dashboard.
+          state.senderProfileSetupDismissed = true;
+        }
         await refreshState({ preserveStatus: true, suppressImportStatus: true });
         renderPageStatus({ preserveStatus: true });
-        setStatus(pendingOwnProfilePage ? "Profile switched." : "Sender context saved.", false);
+        setStatus(firstTimeSave ? "Profile saved! You're all set." : "Profile refreshed successfully.", false);
         return;
       }
       renderPageStatus();
@@ -5404,6 +5413,10 @@
     handleNextStepAction(el.nextActionButton);
   });
 
+  el.draftEmailButton?.addEventListener("click", () => {
+    handleGenerate("email", el.draftEmailButton);
+  });
+
   el.nextHelperButton?.addEventListener("click", () => {
     handleNextStepAction(el.nextHelperButton);
   });
@@ -5559,6 +5572,15 @@
   });
 
   el.senderProfileUpdateNow.addEventListener("click", () => {
+    handleUpdateProfile({ allowCurrentPageCapture: true });
+  });
+
+  el.senderProfileContinue?.addEventListener("click", () => {
+    state.senderProfileSetupDismissed = true;
+    renderPageStatus();
+  });
+
+  el.senderProfileRefresh?.addEventListener("click", () => {
     handleUpdateProfile({ allowCurrentPageCapture: true });
   });
 

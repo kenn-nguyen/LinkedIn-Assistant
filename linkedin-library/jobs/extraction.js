@@ -131,28 +131,35 @@
     if (!window.location.hostname.includes("linkedin.com")) {
       return false;
     }
-    const hasJobDom = Boolean(document.querySelector([
-      ...FIELD_SELECTORS.title,
-      ...FIELD_SELECTORS.company,
+    const path = window.location.pathname;
+    // A real job posting page.
+    if (/^\/jobs\/view\/\d+/i.test(path)) {
+      return true;
+    }
+    // Search-results pages (people / content / posts / etc.) are NOT job pages even though
+    // they contain generic <h1> headings and /company/ links. Never run job functions here.
+    if (/^\/search\//i.test(path)) {
+      return false;
+    }
+    // A selected job in the jobs collections/search layout (e.g. /jobs/search-results/?currentJobId=).
+    if (linkedInJobIdFromUrl(currentUrl())) {
+      return true;
+    }
+    // Otherwise require STRONG job-detail DOM — not the generic title/company selectors,
+    // which match feeds, search results, and profiles.
+    const hasStrongJobDom = Boolean(document.querySelector([
       ...JOB_DESCRIPTION_SELECTORS,
       ".jobs-details",
       ".jobs-details__main-content",
       ".jobs-search__job-details--wrapper",
-      "[data-job-id]"
+      "[data-job-id]",
+      '[data-testid="job-title"]',
+      '[data-test-id="job-details-job-title"]'
     ].join(",")));
-    if (/^\/jobs\/view\/\d+/i.test(window.location.pathname)) {
-      return true;
-    }
-    if (hasJobDom) {
-      return true;
-    }
-    if (!JOB_PAGE_PATH_PATTERN.test(window.location.pathname)) {
+    if (!JOB_PAGE_PATH_PATTERN.test(path)) {
       return false;
     }
-    if (linkedInJobIdFromUrl(currentUrl())) {
-      return true;
-    }
-    return hasJobDom;
+    return hasStrongJobDom;
   }
 
   function visibleText(node) {
@@ -597,10 +604,249 @@
     };
   }
 
+  // ---------------------------------------------------------------------------
+  // Job-page person cards ("People who can help" / "People you can reach out to")
+  // ---------------------------------------------------------------------------
+  // These cards share the people-search card shape (an <a href="/in/…"> wrapping
+  // name + degree + subtitle) but are sparser and carry their highest-value signal
+  // — the relationship context (works-at-company / alum / in-network) — in a sibling
+  // section heading or a trailing line, not in the basic fields. We parse them in
+  // place (no people-search executed) using structural/textual heuristics rather than
+  // LinkedIn's hashed class names, which churn.
+
+  const PERSON_RELATIONSHIP_PATTERN = /(connections? who work|alumni who work|school alum|alum from|attended\s+|works?\s+(?:at|here)|in your network|mutual)/i;
+
+  function personCardVisibleText(node) {
+    return node ? normalizeWhitespace(node.textContent || "") : "";
+  }
+
+  function personCardProfileUrl(href) {
+    const raw = absoluteUrl(href);
+    if (!raw) {
+      return "";
+    }
+    try {
+      const parsed = new URL(raw, window.location.origin);
+      const match = parsed.pathname.match(/^\/in\/([^/?#]+)\/?$/i);
+      if (!match) {
+        return "";
+      }
+      const canonical = `${parsed.origin}/in/${match[1]}/`;
+      return typeof shared.normalizeLinkedInProfileUrl === "function"
+        ? shared.normalizeLinkedInProfileUrl(canonical)
+        : canonical;
+    } catch (_error) {
+      const match = raw.match(/linkedin\.com\/in\/([^/?#]+)/i);
+      return match ? `https://www.linkedin.com/in/${match[1]}/` : "";
+    }
+  }
+
+  function compactPersonName(text) {
+    return normalizeWhitespace(text)
+      .replace(/\s*•\s*(?:1st|2nd|3rd\+?|[0-9]+(?:st|nd|rd|th))\b.*$/i, "")
+      .replace(/\b(?:Verified|Premium)\b/gi, "")
+      .trim();
+  }
+
+  function looksLikePersonName(text) {
+    const normalized = compactPersonName(text);
+    return Boolean(
+      normalized
+      && normalized.length <= 80
+      && !/(current:|past:|mutual connection|followers|send a message|invite |connect|follow|message)/i.test(normalized)
+    );
+  }
+
+  function personCardConnectionDegree(scope) {
+    const text = personCardVisibleText(scope);
+    const match = text.match(/(?:^|\s|•)(1st|2nd|3rd\+?|[0-9]+(?:st|nd|rd|th))\b/i);
+    return normalizeWhitespace(match?.[1] || "");
+  }
+
+  function personCardAction(cardAnchor) {
+    // The Message/Connect control is a sibling of the card anchor — walk up to a row
+    // container and look there.
+    let container = cardAnchor;
+    for (let depth = 0; depth < 3 && container?.parentElement; depth += 1) {
+      container = container.parentElement;
+      const controls = Array.from(container.querySelectorAll("a[href], button"));
+      const match = controls.find((control) => {
+        const label = normalizeWhitespace(control.getAttribute("aria-label") || personCardVisibleText(control));
+        const href = normalizeWhitespace(control.getAttribute("href") || "");
+        return /send a message|invite .* connect|^connect$|follow/i.test(label)
+          || /\/messaging\/compose\//i.test(href);
+      });
+      if (match) {
+        const aria = normalizeWhitespace(match.getAttribute("aria-label") || "");
+        const text = normalizeWhitespace(personCardVisibleText(match));
+        const href = normalizeWhitespace(match.getAttribute("href") || "");
+        if (/send a message/i.test(aria) || /\/messaging\/compose\//i.test(href)) {
+          return "Message";
+        }
+        if (/invite .* connect/i.test(aria) || /^connect$/i.test(text)) {
+          return "Connect";
+        }
+        if (/follow/i.test(aria || text)) {
+          return "Follow";
+        }
+        return text || "";
+      }
+    }
+    return "";
+  }
+
+  function personCardAvatar(cardAnchor) {
+    const image = cardAnchor.querySelector("img[src]");
+    return image ? absoluteUrl(image.getAttribute("src") || image.src || "") : "";
+  }
+
+  function personCardScopes(root) {
+    const scopes = [];
+    const main = (root && root !== document) ? root : document.querySelector("main");
+    if (main) {
+      scopes.push(main);
+    }
+    Array.from(document.querySelectorAll("dialog[open]")).forEach((dialog) => {
+      if (!scopes.includes(dialog)) {
+        scopes.push(dialog);
+      }
+    });
+    if (!scopes.length) {
+      scopes.push(document);
+    }
+    return scopes;
+  }
+
+  function findJobPagePersonCards(root) {
+    const anchors = [];
+    const seen = new Set();
+    personCardScopes(root).forEach((scope) => {
+      Array.from(scope.querySelectorAll('a[href*="/in/"]')).forEach((anchor) => {
+        if (seen.has(anchor)) {
+          return;
+        }
+        // The outer card anchor wraps the avatar figure; the inner name anchor does not.
+        if (!anchor.querySelector("figure, img")) {
+          return;
+        }
+        if (!personCardProfileUrl(anchor.getAttribute("href") || anchor.href)) {
+          return;
+        }
+        seen.add(anchor);
+        anchors.push(anchor);
+      });
+    });
+    return anchors;
+  }
+
+  function sectionHeadingText(el) {
+    // A heading block may wrap a title + sub-line in nested <p>s (e.g. "School alumni who
+    // work at Intuit" + "Attended Yale …"). Join them with a space; fall back to textContent.
+    const blocks = Array.from(el.querySelectorAll("h1, h2, h3, h4, p"))
+      .map((node) => normalizeWhitespace(node.textContent || ""))
+      .filter(Boolean);
+    return blocks.length ? blocks.join(" ") : normalizeWhitespace(el.textContent || "");
+  }
+
+  function isLikelySectionHeading(el) {
+    // A section heading labels a group of people; it must NOT itself be a person card/row.
+    if (!el || el.querySelector?.('a[href*="/in/"]')) {
+      return false;
+    }
+    const text = sectionHeadingText(el);
+    if (!text || text.length > 120) {
+      return false;
+    }
+    if (/^[•·]\s*\d/.test(text)) {
+      return false; // a connection-degree line, not a heading
+    }
+    return /[A-Za-z]/.test(text);
+  }
+
+  function nearestSectionHeadingText(cardAnchor) {
+    // Walk up from the card and, at each level, scan preceding siblings for the closest
+    // section heading. This keeps the heading scoped to the card's OWN section (e.g. "Meet
+    // the hiring team") instead of bleeding in a heading from an unrelated section above
+    // it (e.g. "… in your network" from the "People you can reach out to" block).
+    let node = cardAnchor;
+    for (let depth = 0; node && depth < 6; depth += 1) {
+      let sib = node.previousElementSibling;
+      while (sib) {
+        if (isLikelySectionHeading(sib)) {
+          return sectionHeadingText(sib);
+        }
+        sib = sib.previousElementSibling;
+      }
+      node = node.parentElement;
+    }
+    return "";
+  }
+
+  function personCardRelationshipContext(cardAnchor) {
+    // 1. A trailing relationship line inside the card itself (inline "People you can
+    //    reach out to" cards), e.g. "School alum from Yale School of Management".
+    const innerLines = Array.from(cardAnchor.querySelectorAll("p"))
+      .map(personCardVisibleText)
+      .filter(Boolean);
+    const trailing = innerLines.find((text) => PERSON_RELATIONSHIP_PATTERN.test(text) && !/^•/.test(text));
+    if (trailing) {
+      return trailing;
+    }
+    // 2. Otherwise the nearest section heading scoped to this card's section
+    //    ("Meet the hiring team", "Connections who work at Intuit", …).
+    return nearestSectionHeadingText(cardAnchor);
+  }
+
+  function extractJobPagePersonCard(cardAnchor) {
+    if (!cardAnchor || typeof cardAnchor.querySelector !== "function") {
+      return null;
+    }
+    const profileUrl = personCardProfileUrl(cardAnchor.getAttribute("href") || cardAnchor.href);
+    if (!profileUrl) {
+      return null;
+    }
+    const nameAnchor = cardAnchor.querySelector('a[href*="/in/"]');
+    const nameFromAnchor = compactPersonName(personCardVisibleText(nameAnchor));
+    const nameFromAlt = compactPersonName(cardAnchor.querySelector("img[alt]")?.getAttribute("alt") || "");
+    const name = looksLikePersonName(nameFromAnchor) ? nameFromAnchor : nameFromAlt;
+    if (!name) {
+      return null;
+    }
+    const connectionDegree = personCardConnectionDegree(cardAnchor);
+    const relationshipContext = personCardRelationshipContext(cardAnchor);
+    const innerLines = Array.from(cardAnchor.querySelectorAll("p"))
+      .map(personCardVisibleText)
+      .filter(Boolean);
+    const headline = innerLines.find((text) => {
+      if (compactPersonName(text) === name) {
+        return false;
+      }
+      if (/^•?\s*(?:1st|2nd|3rd\+?|[0-9]+(?:st|nd|rd|th))\b/i.test(text)) {
+        return false;
+      }
+      if (text === relationshipContext || PERSON_RELATIONSHIP_PATTERN.test(text)) {
+        return false;
+      }
+      return text !== "--" && text !== "—";
+    }) || "";
+    return {
+      name,
+      profileUrl,
+      avatarUrl: personCardAvatar(cardAnchor),
+      connectionDegree,
+      headline,
+      primaryAction: personCardAction(cardAnchor),
+      relationshipContext,
+      aiGeneratedInsight: relationshipContext
+    };
+  }
+
   globalThis.LinkedInAssistantJobExtraction = {
     isSupportedJobPage,
     extractJobPageContext,
     normalizeJobUrl,
-    linkedInJobIdFromUrl
+    linkedInJobIdFromUrl,
+    findJobPagePersonCards,
+    extractJobPagePersonCard
   };
 })();

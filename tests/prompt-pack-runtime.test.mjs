@@ -11,6 +11,8 @@ function loadPromptPackAssets() {
     "prompt-packs/default/relationship/template.txt",
     "prompt-packs/default/relationship/retry.txt",
     "prompt-packs/default/relationship/contract.json",
+    "prompt-packs/default/email/template.txt",
+    "prompt-packs/default/email/contract.json",
     "prompt-packs/default/post-suggestions/template.txt",
     "prompt-packs/default/post-suggestions/contract.json",
     "prompt-packs/default/job-outreach/search-url-template.txt",

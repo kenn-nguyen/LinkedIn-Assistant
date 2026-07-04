@@ -11,24 +11,46 @@ function loadDefaultKeywordBuilder() {
   return match[0];
 }
 
-test("defaultKeywordForCurrentJob adds quoted Vietnamese phrase for Kenn search A", () => {
-  const functionSource = loadDefaultKeywordBuilder();
-  const context = vm.createContext({
+function buildDefaultKeywordContext(title) {
+  return vm.createContext({
     normalizeWhitespace(value) {
       return String(value || "").replace(/\s+/g, " ").trim();
     },
+    stripKeywordChars(value) {
+      return String(value || "").replace(/[^\p{L}\p{N}\s"]+/gu, " ");
+    },
+    sanitizeKeyword(value) {
+      return String(value || "").replace(/[^\p{L}\p{N}\s"]+/gu, " ").replace(/\s+/g, " ").trim();
+    },
     currentJob() {
-      return { title: "Staff Product Manager" };
+      return { title };
     },
     senderProfileSlug() {
       return "kenn-nguyen";
     }
   });
+}
+
+test("defaultKeywordForCurrentJob keeps a quoted Vietnamese phrase for Kenn search A", () => {
+  const functionSource = loadDefaultKeywordBuilder();
+  const context = buildDefaultKeywordContext("Staff Product Manager");
   const defaultKeywordForCurrentJob = vm.runInContext(
     `(() => { ${functionSource}; return defaultKeywordForCurrentJob; })()`,
     context
   );
 
+  // Quotes (exact-phrase operator) survive sanitization; other punctuation is stripped.
   assert.equal(defaultKeywordForCurrentJob(0), `"Vietnamese" Staff Product Manager`);
   assert.equal(defaultKeywordForCurrentJob(1), "Staff Product Manager");
+});
+
+test("defaultKeywordForCurrentJob strips punctuation but keeps quotes, Vietnamese letters and digits", () => {
+  const functionSource = loadDefaultKeywordBuilder();
+  const context = buildDefaultKeywordContext("Kỹ sư Backend (Java/Go) - Level 3!");
+  const defaultKeywordForCurrentJob = vm.runInContext(
+    `(() => { ${functionSource}; return defaultKeywordForCurrentJob; })()`,
+    context
+  );
+
+  assert.equal(defaultKeywordForCurrentJob(0), `"Vietnamese" Kỹ sư Backend Java Go Level 3`);
 });

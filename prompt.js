@@ -361,6 +361,15 @@
       "- Help the user manage this relationship well over time and increase the chance of a credible referral or useful introduction later.",
       "- Do not optimize for sending a message at all costs. Optimize for relationship quality, timing, and expected return.",
       "",
+      "Reading the current conversation (do this first):",
+      "- Weight the most recent messages most. The latest exchange and its tone are the truest read of where things stand; let recency override older intent or your original plan.",
+      "- An open or unanswered topic is a candidate to continue, not an obligation. Weigh it against the latest signal.",
+      "- Treat a dropped ask as a soft no: if the recipient ignored a question or ask, replied briefly and closed it off, changed the subject, or went quiet right after a specific ask, do not re-raise that ask. Ease off, lighten, change the angle, or wait.",
+      "- Continue a thread the recipient is actively engaged in (especially if they asked you something) before introducing any new ask.",
+      "- Match their energy: warm and responsive lets you go one small step further; terse or quiet means keep it light, low-demand, or step back. Never escalate faster than they invite.",
+      "- Read silence by type: silence after a casual exchange is neutral and can be re-entered later with a fresh reason; silence right after a specific ask usually means give space, not nudge.",
+      "- The user goal is a compass for direction, not a script for this message. Often the best move toward it is to add value, be patient, or recommend wait rather than push the ask now.",
+      "",
       "Case handling guidance:",
       "- First outreach to a non-connection: keep it light, relevant, and easy to answer. Focus on starting a real exchange, not extracting help immediately.",
       "- Connected but little or no conversation history: do not treat connection status alone as warmth. Re-engage with a specific reason or relevant trigger.",
@@ -561,6 +570,34 @@
       { label: "Page title", value: workspaceContext?.title },
       { label: "Page URL", value: workspaceContext?.pageUrl }
     ]);
+
+    // Email channel: same context, different medium. Reuses the workspace validator by
+    // emitting the same minimal JSON (recommended_action + reason_why_now + messages[]).
+    if (options?.channel === "email") {
+      const emailPrompt = promptPackRuntime.applyTemplate(
+        promptPackRuntime.getBuiltInTemplate("email", options?.promptPackSettings),
+        {
+          recipient_full_name: profile.fullName || personRecord?.fullName || "Recipient",
+          current_objective: buildCurrentObjectiveText(personRecord, profile, logicMetrics),
+          page_context: pageContextText || "No page context available.",
+          recipient_profile: recipientText || "No recipient profile data available.",
+          person_note: personRecord?.personNote || "No saved person note.",
+          conversation_context: formatConversationContext(conversation, ownFullName) || "No visible conversation context.",
+          sender_profile: myProfileText || "No saved sender profile available.",
+          strategy_guidance: settings.strategyGuidance || "No additional custom strategy guidance.",
+          extra_context: normalizeWhitespace(extraContext) || "No additional user context for this draft.",
+          fixed_tail: normalizeFixedTail(fixedTail),
+          draft_length_rule: draftLengthRule(options)
+        }
+      );
+      return {
+        flowType: "email",
+        prompt: emailPrompt,
+        recipientText,
+        logicMetrics,
+        relationshipTriage
+      };
+    }
 
     const prompt = promptPackRuntime.applyTemplate(template, {
       recipient_full_name: profile.fullName || personRecord?.fullName || "Recipient",

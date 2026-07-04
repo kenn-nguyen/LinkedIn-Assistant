@@ -191,6 +191,11 @@
     overlay.style.justifyContent = "center";
     overlay.style.background = "rgba(245, 240, 232, 0.78)";
     overlay.style.backdropFilter = "blur(4px)";
+    // The backdrop div itself must NEVER intercept clicks — only the card in the center
+    // should be interactive.  Without this, if the overlay gets stuck in display:flex for
+    // any reason (failed message delivery, content-script restart, etc.) ALL LinkedIn clicks
+    // are silently swallowed even though the user can see the page behind the tinted overlay.
+    overlay.style.pointerEvents = "none";
 
     const card = document.createElement("div");
     card.style.maxWidth = "440px";
@@ -202,6 +207,9 @@
     card.style.boxShadow = "0 18px 50px rgba(21, 43, 77, 0.18)";
     card.style.fontFamily = "\"Aptos\", \"Segoe UI\", sans-serif";
     card.style.color = "#152b4d";
+    // Re-enable pointer events on the card so text is selectable and the card itself
+    // doesn't feel dead — only the transparent backdrop is click-through.
+    card.style.pointerEvents = "auto";
 
     const title = document.createElement("div");
     title.id = "linkedin-assistant-page-activity-overlay-title";
@@ -237,11 +245,13 @@
       message.textContent = normalizeWhitespace(messageText) || "The app is syncing this page.";
     }
     overlay.style.display = "flex";
-    if (Number(autoHideMs) > 0) {
-      pageActivityOverlayHideTimer = window.setTimeout(() => {
-        hidePageActivityOverlay();
-      }, Number(autoHideMs));
-    }
+    // Always set a hard-cap auto-hide of 30 s as a safety net so the overlay can never
+    // be stuck forever if the explicit HIDE_PAGE_ACTIVITY_OVERLAY message is lost (e.g.
+    // the message was dropped because the content script restarted mid-flight).
+    const safetyTimeoutMs = Number(autoHideMs) > 0 ? Math.min(Number(autoHideMs), 30000) : 30000;
+    pageActivityOverlayHideTimer = window.setTimeout(() => {
+      hidePageActivityOverlay();
+    }, safetyTimeoutMs);
   }
 
   function hidePageActivityOverlay() {
@@ -3751,18 +3761,50 @@
     });
   }
 
+  // Cheap structural fingerprint of the page that does NOT force layout: it only reads
+  // window.location, querySelectorAll().length, and .textContent (none of which trigger a
+  // synchronous reflow, unlike getComputedStyle / getBoundingClientRect / .innerText used
+  // by the full currentContextSignature()).  We compute this first on every debounced
+  // MutationObserver tick and only fall through to the expensive full extraction when this
+  // lightweight fingerprint actually changed — so LinkedIn's constant background DOM churn
+  // (feed virtualization, badge updates, ads) no longer triggers 100+ forced reflows per tick.
+  function currentCheapContextFingerprint() {
+    const href = window.location.href;
+    let messageMarker = "";
+    if (isSupportedMessagingPage()) {
+      const bubbles = document.querySelectorAll(
+        "[data-event-urn], .msg-s-event-listitem, .msg-s-message-list__event"
+      );
+      const lastBubble = bubbles.length ? bubbles[bubbles.length - 1] : null;
+      const lastBody = lastBubble?.querySelector?.(".msg-s-event-listitem__body") || lastBubble;
+      messageMarker = `${bubbles.length}:${(lastBody?.textContent || "").length}`;
+    }
+    let profileMarker = "";
+    if (isSupportedProfilePage()) {
+      const heading = document.querySelector("main h1");
+      profileMarker = (heading?.textContent || "").trim();
+    }
+    return `${href}::${messageMarker}::${profileMarker}`;
+  }
+
   const assistantLifecycleState = {
     active: false,
     observer: null,
     debounceTimer: null,
     managedTimeouts: new Set(),
     lastSignature: "",
+    lastCheapFingerprint: "",
+    visibilityHandler: null,
     clickHandler: null,
     doubleClickHandler: null,
     popstateHandler: null,
     hashchangeHandler: null,
     originalPushState: null,
-    originalReplaceState: null
+    originalReplaceState: null,
+    clickTraceLastSentAt: 0,
+    jobCaptureUrls: new Set(),
+    jobCaptureScanTimer: null,
+    jobCaptureHydratedKey: ""
   };
 
   function managedSetTimeout(callback, delayMs) {
@@ -3796,6 +3838,14 @@
     window.clearTimeout(assistantLifecycleState.debounceTimer);
     assistantLifecycleState.debounceTimer = window.setTimeout(() => {
       assistantLifecycleState.debounceTimer = null;
+      // Cheap, no-reflow gate first. If the lightweight fingerprint is unchanged, skip the
+      // expensive full extraction entirely — this is what spares the LinkedIn main thread
+      // from constant forced reflows during background feed churn.
+      const cheapFingerprint = currentCheapContextFingerprint();
+      if (cheapFingerprint === assistantLifecycleState.lastCheapFingerprint) {
+        return;
+      }
+      assistantLifecycleState.lastCheapFingerprint = cheapFingerprint;
       const nextSignature = currentContextSignature();
       if (!nextSignature || nextSignature === assistantLifecycleState.lastSignature) {
         return;
@@ -3818,12 +3868,184 @@
     });
   }
 
+  // ---------------------------------------------------------------------------
+  // Job-page "+ Add" capture buttons
+  // ---------------------------------------------------------------------------
+  const JOB_CAPTURE_MARKER = "lumiJobAdd";
+
+  function jobForCapture() {
+    const context = extractJobPageContext();
+    return {
+      jobId: normalizeWhitespace(context?.job?.jobId || context?.jobId || ""),
+      title: normalizeWhitespace(context?.job?.title || context?.title || ""),
+      company: normalizeWhitespace(context?.job?.company || context?.company || ""),
+      location: normalizeWhitespace(context?.job?.location || context?.location || ""),
+      sourceUrl: normalizeWhitespace(context?.job?.jobUrl || context?.pageUrl || window.location.href),
+      datePosted: normalizeWhitespace(context?.job?.datePosted || ""),
+      description: normalizeWhitespace(context?.job?.description || "")
+    };
+  }
+
+  function renderJobAddButtonState(button, isAdded) {
+    if (!button) {
+      return;
+    }
+    button.textContent = isAdded ? "✓ Added" : "+ Add";
+    button.dataset.lumiAdded = isAdded ? "1" : "0";
+    // Lumi Assist theme accent colors (matches the side panel).
+    button.style.background = isAdded ? "#6f0f32" : "#941644";
+    button.title = isAdded ? "Remove from job-outreach evaluation" : "Add to job-outreach evaluation";
+  }
+
+  function createJobAddButton(profileUrl) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.setAttribute("data-lumi-add-button", "1");
+    button.dataset.lumiUrl = profileUrl;
+    button.style.position = "absolute";
+    button.style.top = "6px";
+    button.style.right = "6px";
+    button.style.zIndex = "20";
+    button.style.padding = "2px 8px";
+    button.style.fontSize = "11px";
+    button.style.fontWeight = "600";
+    button.style.lineHeight = "1.4";
+    button.style.color = "#fff";
+    button.style.border = "none";
+    button.style.borderRadius = "12px";
+    button.style.cursor = "pointer";
+    button.style.boxShadow = "0 1px 3px rgba(0,0,0,0.25)";
+    button.style.pointerEvents = "auto";
+    renderJobAddButtonState(button, assistantLifecycleState.jobCaptureUrls.has(profileUrl));
+    button.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const isAdded = button.dataset.lumiAdded === "1";
+      const type = isAdded ? MESSAGE_TYPES.REMOVE_JOB_PAGE_PERSON : MESSAGE_TYPES.CAPTURE_JOB_PAGE_PERSON;
+      const job = jobForCapture();
+      const cardAnchor = button.closest('a[href*="/in/"]') || button.parentElement;
+      const person = globalThis.LinkedInAssistantJobExtraction?.extractJobPagePersonCard?.(cardAnchor) || null;
+      const payload = isAdded ? { type, job, profileUrl } : { type, job, person };
+      if (!isAdded && !payload.person) {
+        return;
+      }
+      // Optimistic flip; reconcile from the response.
+      renderJobAddButtonState(button, !isAdded);
+      chrome.runtime.sendMessage(payload).then((response) => {
+        if (response?.ok && Array.isArray(response.captures)) {
+          applyJobCaptureUrls(response.captures);
+        } else {
+          renderJobAddButtonState(button, isAdded);
+        }
+      }).catch(() => {
+        renderJobAddButtonState(button, isAdded);
+      });
+    }, true);
+    return button;
+  }
+
+  function injectJobPagePersonAddButtons(options) {
+    const force = Boolean(options && options.force);
+    const extraction = globalThis.LinkedInAssistantJobExtraction;
+    // Force mode (triggered by the side panel's "Show + Add buttons" control) bypasses the
+    // active/visibility gates so it works even if activation messaging raced or the tab was
+    // briefly backgrounded.
+    if (!force && (!assistantLifecycleState.active || document.hidden)) {
+      return;
+    }
+    if (!isSupportedJobPage() || !extraction?.findJobPagePersonCards) {
+      return;
+    }
+    const cards = extraction.findJobPagePersonCards(document);
+    cards.forEach((cardAnchor) => {
+      if (cardAnchor.dataset[JOB_CAPTURE_MARKER]) {
+        return;
+      }
+      const parsed = extraction.extractJobPagePersonCard?.(cardAnchor);
+      const profileUrl = normalizeWhitespace(parsed?.profileUrl || "");
+      if (!profileUrl) {
+        return;
+      }
+      cardAnchor.dataset[JOB_CAPTURE_MARKER] = "1";
+      if (window.getComputedStyle(cardAnchor).position === "static") {
+        cardAnchor.style.position = "relative";
+      }
+      cardAnchor.appendChild(createJobAddButton(profileUrl));
+    });
+  }
+
+  function applyJobCaptureUrls(captures) {
+    const urls = (Array.isArray(captures) ? captures : [])
+      .map((person) => normalizeWhitespace(person?.profileUrl || ""))
+      .filter(Boolean);
+    assistantLifecycleState.jobCaptureUrls = new Set(urls);
+    document.querySelectorAll("button[data-lumi-add-button]").forEach((button) => {
+      renderJobAddButtonState(button, assistantLifecycleState.jobCaptureUrls.has(button.dataset.lumiUrl || ""));
+    });
+  }
+
+  function hydrateJobPageCaptureState() {
+    if (!isSupportedJobPage()) {
+      return;
+    }
+    chrome.runtime.sendMessage({ type: MESSAGE_TYPES.GET_JOB_PAGE_CAPTURES, job: jobForCapture() })
+      .then((response) => {
+        if (response?.ok) {
+          applyJobCaptureUrls(response.captures);
+        }
+      })
+      .catch(() => {});
+  }
+
+  // Cheap job identity from the URL (no DOM read) so we re-fetch captured state once per
+  // job when navigating between job pages within the same session.
+  function currentJobCaptureKey() {
+    const match = window.location.href.match(/(?:currentJobId=|\/jobs\/view\/)(\d+)/i);
+    return match ? match[1] : window.location.pathname;
+  }
+
+  function hydrateJobPageCapturesIfJobChanged(force) {
+    if (!isSupportedJobPage()) {
+      return;
+    }
+    const jobKey = currentJobCaptureKey();
+    if (!force && jobKey && jobKey === assistantLifecycleState.jobCaptureHydratedKey) {
+      return;
+    }
+    assistantLifecycleState.jobCaptureHydratedKey = jobKey;
+    hydrateJobPageCaptureState();
+  }
+
+  function scheduleJobPageCaptureScan(delayMs) {
+    if (!assistantLifecycleState.active || !isSupportedJobPage()) {
+      return;
+    }
+    window.clearTimeout(assistantLifecycleState.jobCaptureScanTimer);
+    assistantLifecycleState.jobCaptureScanTimer = window.setTimeout(() => {
+      assistantLifecycleState.jobCaptureScanTimer = null;
+      hydrateJobPageCapturesIfJobChanged(false);
+      injectJobPagePersonAddButtons();
+    }, Math.max(0, Number(delayMs) || 0));
+  }
+
+  function removeInjectedJobAddButtons() {
+    window.clearTimeout(assistantLifecycleState.jobCaptureScanTimer);
+    assistantLifecycleState.jobCaptureScanTimer = null;
+    document.querySelectorAll("button[data-lumi-add-button]").forEach((button) => button.remove());
+    document.querySelectorAll("[data-lumi-job-add]").forEach((node) => {
+      delete node.dataset[JOB_CAPTURE_MARKER];
+    });
+    assistantLifecycleState.jobCaptureUrls = new Set();
+    assistantLifecycleState.jobCaptureHydratedKey = "";
+  }
+
   function startContextChangeNotifications() {
     if (assistantLifecycleState.active) {
       return;
     }
     assistantLifecycleState.active = true;
     assistantLifecycleState.lastSignature = currentContextSignature();
+    assistantLifecycleState.lastCheapFingerprint = "";
 
     [0, 300, 1000].forEach((delayMs) => {
       managedSetTimeout(() => {
@@ -3834,6 +4056,20 @@
         notifyContextChangedWhenActive();
       }, delayMs);
     });
+
+    // Job-page "+ Add" capture buttons: hydrate the captured state once, then scan a
+    // couple of times as the page settles. No continuous observer — popup cards are
+    // caught by the click-triggered scan below.
+    managedSetTimeout(() => {
+      if (assistantLifecycleState.active) {
+        hydrateJobPageCapturesIfJobChanged(true);
+      }
+    }, 400);
+    [600, 1600].forEach((delayMs) => managedSetTimeout(() => {
+      if (assistantLifecycleState.active) {
+        injectJobPagePersonAddButtons();
+      }
+    }, delayMs));
 
     assistantLifecycleState.observer = new MutationObserver(() => {
       if (
@@ -3846,6 +4082,13 @@
       ) {
         scheduleAssistantContextCheck();
       }
+      // Auto-inject "+ Add" buttons as job-page person cards render (navigation, lazy
+      // load, popup open) without needing to reopen the panel. Debounced (single timer)
+      // so it runs once after mutations settle; the dataset-guard makes re-scans cheap and
+      // prevents our own injected buttons from re-triggering work.
+      if (isSupportedJobPage()) {
+        scheduleJobPageCaptureScan(500);
+      }
     });
 
     if (document.body) {
@@ -3853,6 +4096,46 @@
         childList: true,
         subtree: true
       });
+    }
+
+    // Pause the observer while the tab is not visible (user switched apps or tabs).
+    // LinkedIn's feed still mutates the DOM in the background — watching it burns CPU
+    // and battery for zero benefit. Reconnect with a short delay when the tab comes
+    // back so LinkedIn can finish its own re-render before we trigger a context check.
+    assistantLifecycleState.visibilityHandler = () => {
+      if (!assistantLifecycleState.active) {
+        return;
+      }
+      if (document.hidden) {
+        assistantLifecycleState.observer?.disconnect();
+        window.clearTimeout(assistantLifecycleState.debounceTimer);
+        assistantLifecycleState.debounceTimer = null;
+      } else {
+        // Tab is visible again — reconnect observer, then check context after a
+        // short pause so LinkedIn finishes re-rendering before we read the DOM.
+        if (assistantLifecycleState.observer && document.body) {
+          assistantLifecycleState.observer.observe(document.body, {
+            childList: true,
+            subtree: true
+          });
+        }
+        managedSetTimeout(() => {
+          if (assistantLifecycleState.active) {
+            assistantLifecycleState.lastSignature = "";
+            // Also clear the cheap fingerprint so the forced re-check below isn't
+            // short-circuited by the no-reflow gate in scheduleAssistantContextCheck().
+            assistantLifecycleState.lastCheapFingerprint = "";
+            scheduleAssistantContextCheck();
+            scheduleJobPageCaptureScan(200);
+          }
+        }, 600);
+      }
+    };
+    document.addEventListener("visibilitychange", assistantLifecycleState.visibilityHandler);
+    // If the tab is already hidden when the assistant starts (e.g. background injection),
+    // disconnect immediately so we don't waste cycles until the user switches back.
+    if (document.hidden) {
+      assistantLifecycleState.observer?.disconnect();
     }
 
     assistantLifecycleState.clickHandler = (event) => {
@@ -3866,14 +4149,30 @@
 
       const clickedAnchor = target.closest("a[href]");
       const clickHref = normalizeWhitespace(clickedAnchor?.href || "");
-      const clickText = normalizeWhitespace(visibleText(clickedAnchor || target));
+      // Only call visibleText (which forces layout via getComputedStyle) when there is an
+      // anchor — for bare clicks on non-link elements the text is not useful and the cost
+      // is not worth it.
+      const clickText = clickedAnchor ? normalizeWhitespace(visibleText(clickedAnchor)) : "";
       globalThis.LinkedInAssistantPostExtraction?.rememberPotentialDiscussionClick?.(target);
-      chrome.runtime.sendMessage({
-        type: MESSAGE_TYPES.LINKEDIN_CLICK_TRACE,
-        href: window.location.href,
-        clickHref,
-        clickText
-      }).catch(() => {});
+      // Throttle the IPC call to at most once every 500 ms.  Every click fires this handler
+      // (capture phase, whole page) so on fast clicking or dragging this can flood the
+      // service-worker message queue unnecessarily.
+      const now = Date.now();
+      if (now - assistantLifecycleState.clickTraceLastSentAt >= 500) {
+        assistantLifecycleState.clickTraceLastSentAt = now;
+        chrome.runtime.sendMessage({
+          type: MESSAGE_TYPES.LINKEDIN_CLICK_TRACE,
+          href: window.location.href,
+          clickHref,
+          clickText
+        }).catch(() => {});
+      }
+
+      // A click on a job page may open the "people who can help" popup (or expand a
+      // section) — rescan shortly after to inject "+ Add" on any newly-rendered cards.
+      if (isSupportedJobPage()) {
+        scheduleJobPageCaptureScan(350);
+      }
 
       if (!isSupportedMessagingPage()) {
         return;
@@ -3943,6 +4242,10 @@
     window.clearTimeout(assistantLifecycleState.debounceTimer);
     assistantLifecycleState.debounceTimer = null;
     clearManagedAssistantTimeouts();
+    if (assistantLifecycleState.visibilityHandler) {
+      document.removeEventListener("visibilitychange", assistantLifecycleState.visibilityHandler);
+      assistantLifecycleState.visibilityHandler = null;
+    }
     if (assistantLifecycleState.clickHandler) {
       document.removeEventListener("click", assistantLifecycleState.clickHandler, true);
       assistantLifecycleState.clickHandler = null;
@@ -3967,6 +4270,7 @@
       history.replaceState = assistantLifecycleState.originalReplaceState;
       assistantLifecycleState.originalReplaceState = null;
     }
+    removeInjectedJobAddButtons();
     hidePageActivityOverlay();
   }
 
@@ -3978,6 +4282,23 @@
         stopContextChangeNotifications();
       }
       sendResponse({ ok: true, active: Boolean(message.active) });
+      return true;
+    }
+    if (message?.type === MESSAGE_TYPES.JOB_PAGE_CAPTURES_CHANGED) {
+      // Captures changed elsewhere (e.g. removed from the sidepanel) — re-sync button states.
+      applyJobCaptureUrls(message.captures || []);
+      sendResponse?.({ ok: true });
+      return true;
+    }
+    if (message?.type === MESSAGE_TYPES.FORCE_JOB_PAGE_CAPTURE_SCAN) {
+      // Manual re-scan from the side panel — runs even if the assistant wasn't marked active.
+      const supported = isSupportedJobPage();
+      if (supported) {
+        hydrateJobPageCapturesIfJobChanged(true);
+        injectJobPagePersonAddButtons({ force: true });
+      }
+      const buttonCount = document.querySelectorAll("button[data-lumi-add-button]").length;
+      sendResponse?.({ ok: true, supported, buttonCount });
       return true;
     }
     linkedInCommands.handleMessage(buildLinkedInCommandDeps(), message, sendResponse);

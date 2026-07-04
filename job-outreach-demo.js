@@ -51,6 +51,12 @@
     pendingRunEntries: [],
     loadedSavedRunId: "",
     profileSchoolPrefillLocked: false,
+    jobPageCaptures: [],
+    jobPageCaptureEditingUrl: "",
+    jobPageManualError: "",
+    jobPageManualFormOpen: false,
+    showAddButtonsResetTimer: null,
+    searchEditorOpen: false,
     initialized: false
   };
 
@@ -70,6 +76,8 @@
       jobLink: getNode("job-demo-job-link"),
       jobRefresh: getNode("job-demo-refresh"),
       jobSubtitle: getNode("job-demo-job-subtitle"),
+      hiringPostsLink: getNode("job-demo-hiring-posts-link"),
+      showAddButtons: getNode("job-demo-show-add-buttons"),
       searchEntries: getNode("job-demo-search-entries"),
       searchPanel: getNode("job-demo-search-panel"),
       strategySummary: getNode("job-demo-strategy-summary"),
@@ -89,6 +97,7 @@
       activityBanner: getNode("job-demo-activity-banner"),
       activityTitle: getNode("job-demo-activity-title"),
       activityLink: getNode("job-demo-activity-link"),
+      cancelActivityRun: getNode("job-demo-cancel-activity-run"),
       manualOverlay: getNode("job-demo-manual-overlay"),
       manualEyebrow: getNode("job-demo-manual-eyebrow"),
       manualTitle: getNode("job-demo-manual-title"),
@@ -97,6 +106,7 @@
       manualFilters: getNode("job-demo-manual-filters"),
       openWorkerTab: getNode("job-demo-open-worker-tab"),
       resumeRun: getNode("job-demo-resume-run"),
+      cancelManualAction: getNode("job-demo-cancel-manual-action"),
       progressFill: getNode("job-demo-progress-fill"),
       rankPanel: getNode("job-demo-rank-panel"),
       rankTitle: getNode("job-demo-rank-title"),
@@ -1072,15 +1082,31 @@
     );
   }
 
+  // Keyword boxes (Search A/B/C) only allow letters (including Vietnamese / accented
+  // letters), digits, and spaces — punctuation and symbols are stripped so the search
+  // stays focused on plain terms.
+  function stripKeywordChars(text) {
+    // Keep letters (incl. Vietnamese / accented), digits, spaces, and the double-quote
+    // (a valid LinkedIn exact-phrase operator, e.g. "Vietnamese"). Replace runs of other
+    // disallowed characters with a space so separated words (e.g. "Java/Go") don't merge.
+    return String(text || "").replace(/[^\p{L}\p{N}\s"]+/gu, " ");
+  }
+
+  function sanitizeKeyword(text) {
+    return normalizeWhitespace(stripKeywordChars(text));
+  }
+
+  const SEARCH_C_PREFILL_KEYWORD = "talent acquisition hr product";
+
   function defaultKeywordForCurrentJob(searchIndex = 0) {
     const title = normalizeWhitespace(currentJob().title);
     if (!title) {
       return "";
     }
     if (Number(searchIndex) === 0 && senderProfileSlug() === "kenn-nguyen" && !/\bvietnamese\b/i.test(title)) {
-      return `"Vietnamese" ${title}`;
+      return sanitizeKeyword(`"Vietnamese" ${title}`);
     }
-    return title;
+    return sanitizeKeyword(title);
   }
 
   function defaultFiltersForCurrentContext() {
@@ -1116,7 +1142,12 @@
     return true;
   }
 
+  // People captured directly from a job page are a reserved 4th source ("PAGE"/number 4)
+  // that ranks alongside the keyword searches A/B/C without being a keyword entry.
   function searchLabel(index) {
+    if (Number(index) === 3) {
+      return "PAGE";
+    }
     return searchLabels[index] || String(index + 1);
   }
 
@@ -1124,6 +1155,9 @@
     const text = normalizeWhitespace(value).toUpperCase();
     if (!text) {
       return "";
+    }
+    if (/\bPAGE\b/.test(text) || text === "4") {
+      return "PAGE";
     }
     const letterMatch = text.match(/\b([ABC])\b/) || text.match(/SEARCH\s*([ABC])/);
     if (letterMatch && searchLabels.includes(letterMatch[1])) {
@@ -1138,8 +1172,15 @@
 
   function sourceNumberFromSearchKey(value) {
     const key = normalizeSearchKey(value);
+    if (key === "PAGE") {
+      return 4;
+    }
     const index = searchLabels.indexOf(key);
     return index >= 0 ? index + 1 : 0;
+  }
+
+  function jobPageSourceLabel() {
+    return "Job page";
   }
 
   function jobAi() {
@@ -1226,6 +1267,36 @@
     ].map(normalizeWhitespace).filter(Boolean).join(" · ");
   }
 
+  function buildHiringPostsSearchUrl(job) {
+    const company = normalizeWhitespace(job.company).replace(/"/g, "");
+    if (!company) {
+      return "";
+    }
+    // Position with only letters/digits/spaces (no quotes/punctuation), per request.
+    const position = normalizeWhitespace(String(job.title || "").replace(/[^\p{L}\p{N}\s]+/gu, " "));
+    // "<company>" "hiring" <position> — newest first, content type "jobs", no date limit.
+    const keywords = [`"${company}"`, `"hiring"`, position].filter(Boolean).join(" ");
+    return "https://www.linkedin.com/search/results/content/"
+      + `?keywords=${encodeURIComponent(keywords)}`
+      + "&origin=FACETED_SEARCH"
+      + `&sortBy=${encodeURIComponent('["date_posted"]')}`
+      + `&contentType=${encodeURIComponent('["jobs"]')}`;
+  }
+
+  function renderHiringPostsLink(job) {
+    if (!nodes.hiringPostsLink) {
+      return;
+    }
+    const url = buildHiringPostsSearchUrl(job);
+    if (url) {
+      nodes.hiringPostsLink.href = url;
+      nodes.hiringPostsLink.classList.remove("hidden");
+    } else {
+      nodes.hiringPostsLink.removeAttribute("href");
+      nodes.hiringPostsLink.classList.add("hidden");
+    }
+  }
+
   function renderJob() {
     const job = currentJob();
     nodes.jobLink.textContent = job.title || (hasRecognizedJob(job) ? `LinkedIn job ${job.jobId || ""}`.trim() : "No LinkedIn job detected");
@@ -1244,6 +1315,7 @@
       nodes.jobSubtitle.textContent = subtitle;
       nodes.jobSubtitle.classList.toggle("hidden", !subtitle);
     }
+    renderHiringPostsLink(job);
   }
 
   function renderEntries() {
@@ -1292,7 +1364,7 @@
       const index = Number(input.dataset.entry);
       const field = input.dataset.field;
       if (next[index]) {
-        next[index][field] = input.value;
+        next[index][field] = field === "text" ? sanitizeKeyword(input.value) : input.value;
       }
     });
     state.entries = next;
@@ -1757,7 +1829,9 @@
 
   function shouldKeepSearchEditorOpenForCurrentPage() {
     const run = currentPageJobOutreachRun();
-    return !run || isCurrentPageSearchBusy(run);
+    // Keep the editor open while the user is actively editing it, so background re-renders
+    // (capturing people, navigation refresh) don't snap it shut and cause flashing.
+    return Boolean(!run || isCurrentPageSearchBusy(run) || state.searchEditorOpen);
   }
 
   function currentPageSearchDraftEntries() {
@@ -1810,6 +1884,7 @@
   }
 
   function openSearchEditor() {
+    state.searchEditorOpen = true;
     resetSearchDraftToCurrentDefault();
     nodes.searchError?.classList.remove("is-visible");
     setStrategyCollapsed(false, state.lastRunEntries);
@@ -1829,6 +1904,7 @@
         return;
       }
     }
+    state.searchEditorOpen = false;
     resetSearchDraftToCurrentDefault();
     nodes.searchError?.classList.remove("is-visible");
     setStrategyCollapsed(true, state.lastRunEntries);
@@ -1991,14 +2067,38 @@
 
   function applySelectedRunSnapshot() {
     const run = activeResultsRun();
+    // Always check the current page run for an active/awaiting interaction,
+    // regardless of whether a completed results run exists.
+    const currentPageRun = currentPageJobOutreachRun();
+    const interactionRun = isJobOutreachRunActiveStatus(currentPageRun?.status) || currentPageRun?.manualAction
+      ? currentPageRun
+      : run || null;
+
     if (!run) {
       state.lastRunEntries = [];
       state.importedPeopleBySearch = {};
       state.lastSearchPlan = null;
       state.lastRankingPlan = null;
+      state.lastRankingAiInput = null;
       state.rankings = {};
       state.activeTab = "overall";
-      clearManualAction();
+      // Do NOT clear the manual action when there is an awaiting interaction run.
+      // The run is paused (awaiting_user_action) — it just has no completed results yet.
+      if (interactionRun?.manualAction) {
+        state.activeRunId = interactionRun.runId;
+        state.activeWorkerTabId = interactionRun.workerTabId || interactionRun.manualAction?.workerTabId || null;
+        // Repopulate pendingRunEntries from persisted searches so that
+        // resumePausedSearch works even after the sidepanel reloads.
+        if (!state.pendingRunEntries.length && Array.isArray(interactionRun.searches)) {
+          state.pendingRunEntries = interactionRun.searches
+            .map(entryFromPersistedSearch)
+            .filter((entry) => entry.text || entry.url);
+        }
+        setManualAction(interactionRun.manualAction, { focus: false });
+      } else {
+        state.activeRunId = "";
+        clearManualAction();
+      }
       return false;
     }
     const entries = (Array.isArray(run.searches) ? run.searches : [])
@@ -2011,13 +2111,16 @@
     state.lastRankingAiInput = run.rankingInput || null;
     state.rankings = mergeRankingPlanIntoRankings(entries, buildRankings(entries), state.lastRankingPlan);
     state.activeTab = firstPopulatedRankingTab(state.rankings, state.activeTab || "overall");
-    const currentPageRun = currentPageJobOutreachRun();
-    const interactionRun = isJobOutreachRunActiveStatus(currentPageRun?.status) || currentPageRun?.manualAction
-      ? currentPageRun
-      : run;
     state.activeRunId = isJobOutreachRunActiveStatus(interactionRun?.status) ? interactionRun.runId : "";
     state.activeWorkerTabId = interactionRun?.workerTabId || interactionRun?.manualAction?.workerTabId || null;
     if (interactionRun?.manualAction) {
+      // Repopulate pendingRunEntries from persisted searches so that
+      // resumePausedSearch works even after the sidepanel reloads.
+      if (!state.pendingRunEntries.length && Array.isArray(interactionRun.searches)) {
+        state.pendingRunEntries = interactionRun.searches
+          .map(entryFromPersistedSearch)
+          .filter((entry) => entry.text || entry.url);
+      }
       setManualAction(interactionRun.manualAction, { focus: false });
     } else {
       clearManualAction();
@@ -2057,6 +2160,9 @@
         nodes.activityLink.classList.add("hidden");
         nodes.activityLink.removeAttribute("href");
       }
+      if (nodes.cancelActivityRun) {
+        nodes.cancelActivityRun.classList.add("hidden");
+      }
     };
     if (!run) {
       hideRunPanel();
@@ -2092,6 +2198,13 @@
             nodes.activityLink.removeAttribute("href");
           }
         }
+        // Show a cancel button so the user can break out of a stuck run
+        // (e.g. awaiting_user_action) when they are on a different page.
+        if (nodes.cancelActivityRun) {
+          const canCancel = isJobOutreachRunActiveStatus(status);
+          nodes.cancelActivityRun.classList.toggle("hidden", !canCancel);
+          nodes.cancelActivityRun.dataset.cancelRunId = canCancel ? run.runId : "";
+        }
         nodes.activityBanner.classList.remove("hidden");
       }
       renderSearchActionButton();
@@ -2124,9 +2237,19 @@
 
   function renderSelectedRunPanels() {
     const hasRun = applySelectedRunSnapshot();
+    const hasCaptures = jobPageCaptureCount() > 0;
     if (!hasRun) {
       nodes.resultsSearchLinks?.classList.add("hidden");
-      nodes.rankPanel?.classList.add("hidden");
+      if (hasCaptures) {
+        // Even before any run, surface the Job page tab so captured people can be curated.
+        if (!["overall", "1", "2", "3", "4"].includes(state.activeTab) || !hasAnyRankingPeople(state.rankings)) {
+          state.activeTab = "4";
+        }
+        nodes.rankPanel?.classList.remove("hidden");
+        renderRankings();
+      } else {
+        nodes.rankPanel?.classList.add("hidden");
+      }
       renderRunStatusPanel();
       renderSearchActionButton();
       return;
@@ -2135,6 +2258,10 @@
     const resultsRun = activeResultsRun();
     const canShowResults = normalizeJobOutreachRunStatus(resultsRun?.status) === "completed" && hasAnyRankingPeople(state.rankings);
     if (canShowResults) {
+      nodes.rankPanel?.classList.remove("hidden");
+      renderRankings();
+    } else if (hasCaptures) {
+      // Surface the Job page tab so captured people can be curated before/independent of results.
       nodes.rankPanel?.classList.remove("hidden");
       renderRankings();
     } else {
@@ -2539,6 +2666,16 @@
       const people = rankedPeopleForEntry(entry);
       rankings[String(entry.index + 1)] = people;
     });
+    // Source 4 ("PAGE") holds people captured directly from the job page once a run has
+    // ranked them. They are not a keyword entry, so populate from importedPeopleBySearch
+    // directly so the Best tab can include them.
+    const pageImported = state.importedPeopleBySearch["4"] || [];
+    if (pageImported.length) {
+      rankings["4"] = pageImported
+        .map((person, personIndex) => normalizePersonForRanking(person, 4, personIndex + 1))
+        .sort((left, right) => rankScore(right) - rankScore(left))
+        .map((person, index) => ({ ...person, rank: index + 1 }));
+    }
     rankings.overall = [];
     return rankings;
   }
@@ -2592,6 +2729,10 @@
       .map((person, index) => ({ ...person, rank: index + 1 }));
   }
 
+  function jobPageCaptureCount() {
+    return (state.jobPageCaptures || []).length;
+  }
+
   function renderRankTabs() {
     const tabLabels = [
       ["overall", "Best"],
@@ -2599,11 +2740,16 @@
       ["2", "B"],
       ["3", "C"]
     ];
+    const captureCount = jobPageCaptureCount();
+    const pageRankedCount = (state.rankings["4"] || []).length;
+    const showPageTab = captureCount > 0 || pageRankedCount > 0;
     nodes.rankTabs.innerHTML = tabLabels.map(([key, label]) => {
       const count = (state.rankings[key] || []).length;
       const disabled = key !== "overall" && !count;
       return `<button class="job-demo-tab ${state.activeTab === key ? "is-active" : ""}" data-job-demo-tab="${key}" type="button" ${disabled ? "disabled" : ""}>${label}${count ? ` (${count})` : ""}</button>`;
-    }).join("");
+    }).concat(showPageTab
+      ? [`<button class="job-demo-tab ${state.activeTab === "4" ? "is-active" : ""}" data-job-demo-tab="4" type="button">Job page${captureCount ? ` (${captureCount})` : ""}</button>`]
+      : []).join("");
   }
 
   function renderResultMeta(person) {
@@ -2613,7 +2759,87 @@
       .join("");
   }
 
+  function renderJobPageCaptureRow(person) {
+    const url = escapeHtml(person.profileUrl);
+    const isEditing = state.jobPageCaptureEditingUrl === person.profileUrl;
+    const manualBadge = person.manual ? `<span class="job-demo-capture-badge">manual</span>` : "";
+    const avatar = person.avatarUrl
+      ? `<img src="${escapeHtml(person.avatarUrl)}" alt="${escapeHtml(person.name || "")}">`
+      : `<span class="job-demo-avatar-fallback">${escapeHtml((person.name || "?").slice(0, 1))}</span>`;
+    if (isEditing) {
+      return `
+      <article class="job-demo-capture-card is-editing" data-capture-url="${url}">
+        <div class="job-demo-capture-top">
+          <div class="job-demo-result-avatar">${avatar}</div>
+          <div class="job-demo-capture-fields">
+            <input class="job-demo-capture-input" data-capture-field="name" value="${escapeHtml(person.name || "")}" placeholder="Name" />
+            <input class="job-demo-capture-input" data-capture-field="headline" value="${escapeHtml(person.headline || "")}" placeholder="Headline / role" />
+            <input class="job-demo-capture-input" data-capture-field="connectionDegree" value="${escapeHtml(person.connectionDegree || "")}" placeholder="Degree (1st/2nd/3rd)" />
+            <textarea class="job-demo-capture-input job-demo-capture-note" data-capture-field="note" rows="2" placeholder="Note / how you know them">${escapeHtml(person.note || person.relationshipContext || "")}</textarea>
+          </div>
+        </div>
+        <div class="job-demo-capture-actions">
+          <a class="job-demo-capture-url" href="${url}" target="_blank" rel="noreferrer">View profile</a>
+          <div class="job-demo-capture-buttons">
+            <button class="link-button" type="button" data-capture-cancel="${url}">Cancel</button>
+            <button class="primary-button job-demo-capture-save" type="button" data-capture-save="${url}">Save</button>
+          </div>
+        </div>
+      </article>`;
+    }
+    const note = normalizeWhitespace(person.note || person.relationshipContext || "");
+    const metaParts = [person.connectionDegree, person.headline].filter(Boolean).map(escapeHtml).join(" · ");
+    return `
+    <article class="job-demo-capture-card" data-capture-url="${url}">
+      <div class="job-demo-capture-top">
+        <div class="job-demo-result-avatar">${avatar}</div>
+        <div class="job-demo-capture-copy">
+          <p class="job-demo-capture-name-line">
+            <a class="job-demo-person-name" href="${url}" target="_blank" rel="noreferrer">${escapeHtml(person.name || person.profileUrl)}</a>${manualBadge}
+          </p>
+          ${metaParts ? `<p class="job-demo-capture-meta">${metaParts}</p>` : ""}
+          ${note ? `<p class="job-demo-capture-note-line"><strong>Note:</strong> ${escapeHtml(note)}</p>` : ""}
+        </div>
+        <div class="job-demo-capture-row-buttons">
+          <button class="icon-button" type="button" data-capture-edit="${url}" aria-label="Edit" title="Edit">✎</button>
+          <button class="icon-button" type="button" data-capture-remove="${url}" aria-label="Remove" title="Remove">✕</button>
+        </div>
+      </div>
+    </article>`;
+  }
+
+  function renderJobPageCaptureList() {
+    const people = state.jobPageCaptures || [];
+    const errorHtml = state.jobPageManualError
+      ? `<p class="job-demo-capture-error">${escapeHtml(state.jobPageManualError)}</p>`
+      : "";
+    // The manual-add form is collapsed by default — most of the time people are captured
+    // via the "+ Add" buttons on the job page, so this stays out of the way until needed.
+    const manualBlock = state.jobPageManualFormOpen
+      ? `
+      <form class="job-demo-capture-add" data-capture-add-form>
+        <div class="job-demo-capture-add-head">
+          <p class="job-demo-capture-add-title">Add someone manually</p>
+          <button class="link-button" type="button" data-capture-add-cancel>Close</button>
+        </div>
+        <input class="job-demo-capture-input" data-capture-add-field="profileUrl" placeholder="LinkedIn profile URL (https://www.linkedin.com/in/…)" />
+        <input class="job-demo-capture-input" data-capture-add-field="name" placeholder="Name (optional)" />
+        <textarea class="job-demo-capture-input job-demo-capture-note" data-capture-add-field="note" rows="2" placeholder="Note / how you know them (optional)"></textarea>
+        ${errorHtml}
+        <button class="primary-button" type="submit" data-capture-add-submit>Add person</button>
+      </form>`
+      : `<button class="job-demo-capture-add-toggle link-button" type="button" data-capture-add-toggle>+ Add someone manually</button>`;
+    const list = people.length
+      ? people.map(renderJobPageCaptureRow).join("")
+      : `<div class="job-demo-empty">No people captured from this job page yet. Use the “+ Add” button on a person card${state.jobPageManualFormOpen ? " or the form above" : ", or add one manually"}.</div>`;
+    nodes.rankList.innerHTML = `<div class="job-demo-capture-panel">${manualBlock}${list}</div>`;
+  }
+
   function renderRankList() {
+    if (state.activeTab === "4") {
+      renderJobPageCaptureList();
+      return;
+    }
     const people = state.rankings[state.activeTab] || [];
     if (!people.length) {
       const emptyText = state.activeTab === "overall"
@@ -2861,12 +3087,13 @@
       nodes.runSummary.textContent = hasRecognizedJob() ? "Job details needed." : "Job needed.";
       return;
     }
-    if (!rawEntries.length) {
-      nodes.searchError.textContent = "Add a keyword.";
+    if (!rawEntries.length && !jobPageCaptureCount()) {
+      nodes.searchError.textContent = "Add a keyword, or capture people from this job page.";
       nodes.searchError.classList.add("is-visible");
-      nodes.runSummary.textContent = "Search needs a keyword.";
+      nodes.runSummary.textContent = "Search needs a keyword or captured people.";
       return;
     }
+    state.searchEditorOpen = false;
     clearRunTimers();
     setSearchButtonsDisabled(true);
     nodes.rankPanel.classList.add("hidden");
@@ -2974,6 +3201,11 @@
     state.lastRunEntries = [];
     state.lastSearchPlan = null;
     state.lastRankingPlan = null;
+    state.jobPageCaptures = [];
+    state.jobPageCaptureEditingUrl = "";
+    state.jobPageManualError = "";
+    state.jobPageManualFormOpen = false;
+    state.searchEditorOpen = false;
     state.activeTab = "overall";
     state.activeRunId = "";
     state.activeWorkerTabId = null;
@@ -2999,6 +3231,7 @@
     if (nodes.searchEntries) {
       renderEntries();
     }
+    refreshJobPageCaptures();
   }
 
   function clearEntries() {
@@ -3032,6 +3265,185 @@
     return Object.values(state.rankings)
       .flat()
       .find((person) => person.profileUrl === url);
+  }
+
+  function applyJobPageCaptures(captures) {
+    state.jobPageCaptures = Array.isArray(captures) ? captures : [];
+    if (jobPageCaptureCount() && !state.rankings["4"]) {
+      // keep tab visible
+    }
+    if (state.activeTab === "4" || jobPageCaptureCount()) {
+      renderSelectedRunPanels();
+    }
+  }
+
+  function refreshJobPageCaptures() {
+    const messageTypes = globalThis.LinkedInAssistantShared?.MESSAGE_TYPES || {};
+    if (!messageTypes.GET_JOB_PAGE_CAPTURES || !globalThis.chrome?.runtime?.sendMessage) {
+      return;
+    }
+    const job = currentJob();
+    if (!job.jobId && !job.sourceUrl) {
+      return;
+    }
+    chrome.runtime.sendMessage({ type: messageTypes.GET_JOB_PAGE_CAPTURES, job })
+      .then((response) => {
+        if (response?.ok) {
+          applyJobPageCaptures(response.captures);
+        }
+      })
+      .catch(() => {});
+  }
+
+  async function resolveLinkedInTabId() {
+    if (typeof state.activeTabId === "number") {
+      return state.activeTabId;
+    }
+    if (!globalThis.chrome?.tabs?.query) {
+      return null;
+    }
+    try {
+      const tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+      const tab = tabs?.[0];
+      return tab?.id ?? null;
+    } catch (_error) {
+      return null;
+    }
+  }
+
+  function flashShowAddButtons(label) {
+    if (!nodes.showAddButtons) {
+      return;
+    }
+    nodes.showAddButtons.textContent = label;
+    window.clearTimeout(state.showAddButtonsResetTimer);
+    state.showAddButtonsResetTimer = window.setTimeout(() => {
+      if (nodes.showAddButtons) {
+        nodes.showAddButtons.textContent = "↻ Show + Add buttons";
+      }
+    }, 2500);
+  }
+
+  async function forceShowJobPageAddButtons() {
+    const messageTypes = globalThis.LinkedInAssistantShared?.MESSAGE_TYPES || {};
+    const tabId = await resolveLinkedInTabId();
+    if (!messageTypes.FORCE_JOB_PAGE_CAPTURE_SCAN || typeof tabId !== "number" || !globalThis.chrome?.tabs?.sendMessage) {
+      flashShowAddButtons("Open the LinkedIn job tab first");
+      return;
+    }
+    try {
+      const response = await chrome.tabs.sendMessage(tabId, { type: messageTypes.FORCE_JOB_PAGE_CAPTURE_SCAN });
+      if (!response?.ok) {
+        flashShowAddButtons("Couldn’t reach the page");
+      } else if (!response.supported) {
+        flashShowAddButtons("Not on a job page");
+      } else {
+        flashShowAddButtons(response.buttonCount ? `Showing ${response.buttonCount} ✓` : "No person cards found");
+      }
+    } catch (_error) {
+      flashShowAddButtons("Couldn’t reach the page");
+    }
+  }
+
+  async function dispatchCaptureMutation(message) {
+    const messageTypes = globalThis.LinkedInAssistantShared?.MESSAGE_TYPES || {};
+    if (!globalThis.chrome?.runtime?.sendMessage) {
+      return;
+    }
+    try {
+      // Pass the LinkedIn tab id so the background can notify the content script to refresh
+      // the on-page "+ Add" / "✓ Added" buttons (e.g. flip a button back after a remove).
+      const response = await chrome.runtime.sendMessage({ sourceTabId: state.activeTabId || null, ...message });
+      if (response?.ok) {
+        applyJobPageCaptures(response.captures);
+      }
+    } catch (_error) {
+      // ignore — sidepanel may be closing
+    }
+  }
+
+  function jobPageCaptureCardEdits(card) {
+    const read = (field) => normalizeWhitespace(card.querySelector(`[data-capture-field="${field}"]`)?.value || "");
+    return {
+      name: read("name"),
+      headline: read("headline"),
+      connectionDegree: read("connectionDegree"),
+      note: read("note")
+    };
+  }
+
+  function handleJobPageCaptureListClick(event) {
+    const messageTypes = globalThis.LinkedInAssistantShared?.MESSAGE_TYPES || {};
+    if (event.target.closest("[data-capture-add-toggle]")) {
+      state.jobPageManualFormOpen = true;
+      state.jobPageManualError = "";
+      renderRankList();
+      return true;
+    }
+    if (event.target.closest("[data-capture-add-cancel]")) {
+      state.jobPageManualFormOpen = false;
+      state.jobPageManualError = "";
+      renderRankList();
+      return true;
+    }
+    const editBtn = event.target.closest("[data-capture-edit]");
+    if (editBtn) {
+      state.jobPageCaptureEditingUrl = editBtn.dataset.captureEdit;
+      renderRankList();
+      return true;
+    }
+    const cancelBtn = event.target.closest("[data-capture-cancel]");
+    if (cancelBtn) {
+      state.jobPageCaptureEditingUrl = "";
+      renderRankList();
+      return true;
+    }
+    const saveBtn = event.target.closest("[data-capture-save]");
+    if (saveBtn) {
+      const url = saveBtn.dataset.captureSave;
+      const card = saveBtn.closest("[data-capture-url]");
+      const edits = card ? jobPageCaptureCardEdits(card) : {};
+      state.jobPageCaptureEditingUrl = "";
+      dispatchCaptureMutation({ type: messageTypes.UPDATE_JOB_PAGE_CAPTURE, job: currentJob(), profileUrl: url, edits });
+      return true;
+    }
+    const removeBtn = event.target.closest("[data-capture-remove]");
+    if (removeBtn) {
+      dispatchCaptureMutation({ type: messageTypes.REMOVE_JOB_PAGE_PERSON, job: currentJob(), profileUrl: removeBtn.dataset.captureRemove });
+      return true;
+    }
+    return false;
+  }
+
+  function handleJobPageManualAddSubmit(event) {
+    const form = event.target.closest("[data-capture-add-form]");
+    if (!form) {
+      return false;
+    }
+    event.preventDefault();
+    const messageTypes = globalThis.LinkedInAssistantShared?.MESSAGE_TYPES || {};
+    const read = (field) => normalizeWhitespace(form.querySelector(`[data-capture-add-field="${field}"]`)?.value || "");
+    const rawUrl = read("profileUrl");
+    const normalizeProfileUrl = globalThis.LinkedInAssistantShared?.normalizeLinkedInProfileUrl;
+    const profileUrl = normalizeProfileUrl ? normalizeProfileUrl(rawUrl) : rawUrl;
+    if (!profileUrl || !/\/in\//i.test(profileUrl)) {
+      state.jobPageManualError = "Enter a valid LinkedIn profile URL (https://www.linkedin.com/in/…).";
+      renderRankList();
+      return true;
+    }
+    state.jobPageManualError = "";
+    state.jobPageManualFormOpen = false;
+    dispatchCaptureMutation({
+      type: messageTypes.CAPTURE_JOB_PAGE_PERSON,
+      job: currentJob(),
+      person: {
+        profileUrl,
+        name: read("name"),
+        note: read("note"),
+        manual: true
+      }
+    });
+    return true;
   }
 
   function dispatchOpenMessages(profileUrl) {
@@ -3098,6 +3510,26 @@
       }
     });
     nodes.resumeRun?.addEventListener("click", resumePausedSearch);
+    nodes.cancelManualAction?.addEventListener("click", async () => {
+      state.pendingRunEntries = [];
+      await cancelSearchEditor();
+    });
+    nodes.cancelActivityRun?.addEventListener("click", async () => {
+      const runId = normalizeWhitespace(nodes.cancelActivityRun?.dataset?.cancelRunId);
+      if (!runId) {
+        return;
+      }
+      state.pendingRunEntries = [];
+      try {
+        const response = await cancelBackgroundJobOutreach(runId);
+        if (response) {
+          applyJobOutreachCommandResponse(response);
+        }
+      } catch (error) {
+        nodes.searchError.textContent = error?.message || String(error);
+        nodes.searchError.classList.add("is-visible");
+      }
+    });
     nodes.manualFilters?.addEventListener("click", (event) => {
       const button = event.target.closest("[data-job-demo-remove-manual-filter]");
       if (!button || button.disabled) {
@@ -3118,12 +3550,22 @@
       });
       window.dispatchEvent(event);
     });
+    if (nodes.showAddButtons) {
+      nodes.showAddButtons.addEventListener("click", () => {
+        forceShowJobPageAddButtons();
+      });
+    }
     nodes.addSearch.addEventListener("click", () => {
       readEntriesFromDom();
       if (state.entries.length >= 3) {
         return;
       }
-      state.entries = [...state.entries, defaultSearchEntryForCurrentJob(state.entries.length)];
+      const newIndex = state.entries.length;
+      // Search C (index 2) is prefilled to focus on talent acquisition / HR contacts.
+      const newEntry = newIndex === 2
+        ? defaultSearchEntry(sanitizeKeyword(SEARCH_C_PREFILL_KEYWORD), defaultFiltersForCurrentContext())
+        : defaultSearchEntryForCurrentJob(newIndex);
+      state.entries = [...state.entries, newEntry];
       syncAllEntryCriteria();
       renderEntries();
     });
@@ -3224,6 +3666,23 @@
       }
     });
     nodes.searchEntries.addEventListener("input", (event) => {
+      const keywordInput = event.target.closest('[data-field="text"]');
+      if (keywordInput) {
+        // Live-strip disallowed characters from the keyword box while preserving the caret.
+        const original = keywordInput.value;
+        const sanitized = stripKeywordChars(original);
+        if (sanitized !== original) {
+          const caret = Number(keywordInput.selectionStart) || 0;
+          const caretPos = stripKeywordChars(original.slice(0, caret)).length;
+          keywordInput.value = sanitized;
+          try {
+            keywordInput.setSelectionRange(caretPos, caretPos);
+          } catch (_error) {
+            // Some input types disallow setSelectionRange — ignore.
+          }
+        }
+        return;
+      }
       const input = event.target.closest("[data-job-demo-filter-input]");
       if (input) {
         updateFilterSuggestionsForInput(input);
@@ -3287,15 +3746,29 @@
       renderRankList();
     });
     nodes.rankList.addEventListener("click", (event) => {
+      if (handleJobPageCaptureListClick(event)) {
+        return;
+      }
       const button = event.target.closest("[data-job-demo-open-messages]");
       if (!button) {
         return;
       }
       dispatchOpenMessages(button.dataset.jobDemoOpenMessages);
     });
+    nodes.rankList.addEventListener("submit", (event) => {
+      handleJobPageManualAddSubmit(event);
+    });
     if (globalThis.chrome?.runtime?.onMessage) {
       chrome.runtime.onMessage.addListener((message) => {
         const messageTypes = globalThis.LinkedInAssistantShared?.MESSAGE_TYPES || {};
+        if (message?.type === messageTypes.JOB_PAGE_CAPTURES_CHANGED) {
+          const currentJobId = normalizeWhitespace(currentJob().jobId);
+          // Only adopt the change if it targets the job currently in view (or jobId is unknown).
+          if (!message.jobId || !currentJobId || message.jobId === currentJobId || message.jobId.endsWith(currentJobId)) {
+            applyJobPageCaptures(message.captures || []);
+          }
+          return;
+        }
         if (message?.type !== messageTypes.JOB_OUTREACH_PROGRESS) {
           return;
         }
@@ -3321,6 +3794,22 @@
         }
         renderRunRegistry();
         renderSelectedRunPanels();
+        // When the run reaches a terminal state, the progress message only carries lightweight
+        // fields — rankingPlan, searches, and importedPeopleBySearch live in IndexedDB only.
+        // Fetch the full run data so the "Best" tab can render without a sidepanel reload.
+        const terminalStatuses = ["completed", "failed", "cancelled"];
+        const status = normalizeJobOutreachRunStatus(normalizeWhitespace(message?.status));
+        if (terminalStatuses.includes(status) && messageTypes.GET_STORAGE_STATE && globalThis.chrome?.runtime?.sendMessage) {
+          chrome.runtime.sendMessage({ type: messageTypes.GET_STORAGE_STATE }).then((response) => {
+            if (response?.jobOutreachRuns) {
+              applyRuntimeJobOutreachRuns(response.jobOutreachRuns);
+              renderRunRegistry();
+              renderSelectedRunPanels();
+            }
+          }).catch(() => {
+            // Sidepanel may already be closing — ignore.
+          });
+        }
       });
     }
   }
@@ -3364,6 +3853,7 @@
     if (changed && nodes.searchEntries) {
       renderEntries();
     }
+    refreshJobPageCaptures();
     return true;
   }
 

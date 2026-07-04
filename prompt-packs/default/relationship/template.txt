@@ -68,7 +68,7 @@ Do these tasks:
    - draft_advice_ask
    - draft_referral_ask
    - wait
-4. Explain briefly why this is the right action now in about 35-50 words.
+4. Explain briefly why this is the right action now in about 35-50 words. In reason_why_now, name what you read from the latest exchange - for example an open question to answer, or that they did not engage a prior ask so you are easing off.
 5. Say whether it is appropriate to ask for a referral now.
 6. Score referral readiness even if the answer is 'not yet'. Return a referral_readiness object with a total score out of 100 and four subscores out of 25 each:
    - relationship_trust_25

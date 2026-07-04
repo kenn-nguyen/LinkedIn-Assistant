@@ -25,6 +25,9 @@
             <button id="job-demo-open-worker-tab" type="button" class="secondary-button">Open LinkedIn tab</button>
             <button id="job-demo-resume-run" type="button">Continue</button>
           </div>
+          <div class="job-demo-manual-dismiss-row">
+            <button id="job-demo-cancel-manual-action" type="button" class="link-button">Cancel this search</button>
+          </div>
         </div>
       </div>
       <div id="top-toolbar" class="top-toolbar hidden">
@@ -92,6 +95,10 @@
                 </button>
               </div>
               <p id="job-demo-job-subtitle" class="job-demo-subtitle-line"></p>
+              <div class="job-demo-job-quicklinks">
+                <a id="job-demo-hiring-posts-link" class="job-demo-hiring-posts-link hidden" href="#" target="_blank" rel="noreferrer" title="Search LinkedIn posts where this team talks about hiring (newest first)">🔎 Find hiring posts</a>
+                <button id="job-demo-show-add-buttons" class="job-demo-show-add-buttons link-button" type="button" title="Re-scan the LinkedIn job page and show the “+ Add” buttons on each person card">↻ Show + Add buttons</button>
+              </div>
             </div>
           </div>
         </section>
@@ -137,6 +144,7 @@
         <div id="job-demo-activity-banner" class="job-demo-activity-banner hidden" aria-live="polite">
           <p id="job-demo-activity-title" class="job-demo-activity-title"></p>
           <a id="job-demo-activity-link" class="job-demo-activity-link hidden" href="#" target="_blank" rel="noreferrer"></a>
+          <button id="job-demo-cancel-activity-run" type="button" class="link-button job-demo-activity-cancel hidden">Cancel</button>
         </div>
 
         <section id="job-demo-rank-panel" class="panel job-demo-results-panel hidden">
@@ -190,10 +198,11 @@
           <label class="inline-field">
             Personal notes about you
             <textarea id="sender-profile-notes-input" rows="3" placeholder="Optional notes about your goals, style, or constraints"></textarea>
+            <span class="field-hint">Example: I prefer a warm, direct tone. I'm targeting senior PMs at Series B startups.</span>
           </label>
           <label class="inline-field">
             Your LinkedIn profile URL
-            <input id="sender-profile-url-input" type="url" placeholder="https://www.linkedin.com/in/your-profile/">
+            <input id="sender-profile-url-input" type="url" placeholder="Navigate to your LinkedIn profile page" readonly>
           </label>
           <label class="inline-field">
             AI provider
@@ -204,7 +213,11 @@
           </label>
           <div class="button-row compact-row">
             <button id="sender-profile-open-link" type="button" class="secondary-button">Go to profile</button>
-            <button id="sender-profile-update-now" type="button" class="secondary-button">Update profile</button>
+            <button id="sender-profile-update-now" type="button" class="primary-button">Save my profile</button>
+          </div>
+          <div class="button-row compact-row" id="sender-profile-continue-row" style="display:none;">
+            <button id="sender-profile-refresh" type="button" class="secondary-button">Refresh profile</button>
+            <button id="sender-profile-continue" type="button" class="primary-button">Continue →</button>
           </div>
         </div>
       </section>
@@ -232,7 +245,8 @@
           </label>
         </div>
         <div class="button-row">
-          <button id="next-action-button" type="button">Draft message</button>
+          <button id="next-action-button" type="button">Message</button>
+          <button id="draft-email-button" type="button" class="ghost-button hidden" title="Draft an outreach email instead of a LinkedIn message">Email</button>
           <button id="next-helper-button" type="button" class="ghost-button hidden">Open profile</button>
         </div>
         <div class="feedback-stack">

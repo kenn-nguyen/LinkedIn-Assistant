@@ -175,6 +175,12 @@ body {
   margin-top: 4px;
 }
 
+.job-demo-manual-dismiss-row {
+  display: flex;
+  justify-content: center;
+  margin-top: 6px;
+}
+
 .panel-loading-spinner {
   width: 16px;
   height: 16px;
@@ -511,6 +517,28 @@ h2 {
 .identity-resolution-prompt .meta-text {
   margin-bottom: 8px;
   line-height: 1.4;
+}
+
+/* Hint text below form fields */
+.field-hint {
+  font-size: 11px;
+  color: rgba(var(--text-rgb, 0,0,0), 0.45);
+  line-height: 1.4;
+  margin-top: -2px;
+}
+
+/* Read-only URL display field */
+input[readonly] {
+  background: rgba(var(--accent-rgb), 0.04);
+  color: rgba(var(--text-rgb, 0,0,0), 0.55);
+  cursor: default;
+  user-select: text;
+}
+
+input[readonly]:focus {
+  outline: none;
+  box-shadow: none;
+  border-color: rgba(var(--accent-rgb), 0.2);
 }
 
 .inline-field {
@@ -1040,6 +1068,39 @@ input:focus {
   color: var(--muted);
   font-size: 11px;
   line-height: 1.45;
+}
+
+.job-demo-job-quicklinks {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 14px;
+  margin-top: 6px;
+}
+
+.job-demo-hiring-posts-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--accent-strong);
+  text-decoration: none;
+}
+
+.job-demo-hiring-posts-link:hover {
+  text-decoration: underline;
+}
+
+.job-demo-show-add-buttons {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--accent-strong);
+  padding: 0;
+}
+
+.job-demo-show-add-buttons:hover {
+  text-decoration: underline;
 }
 
 .job-demo-section-heading {
@@ -1784,6 +1845,16 @@ input:focus {
   text-underline-offset: 2px;
 }
 
+.job-demo-activity-cancel {
+  margin-top: 4px;
+  font-size: 11px;
+  opacity: 0.7;
+}
+
+.job-demo-activity-cancel:hover {
+  opacity: 1;
+}
+
 .job-demo-results-panel h2 {
   font-size: 14px;
   margin-bottom: 12px;
@@ -2025,6 +2096,141 @@ input:focus {
   color: var(--muted);
   font-size: 12px;
   line-height: 1.4;
+}
+
+/* Job-page capture list (Tab 4) */
+.job-demo-capture-panel {
+  display: grid;
+  gap: 8px;
+}
+
+.job-demo-capture-add {
+  display: grid;
+  gap: 6px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: rgba(var(--surface-strong-rgb), 0.7);
+}
+
+.job-demo-capture-add-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.job-demo-capture-add-title {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--ink, #152b4d);
+}
+
+.job-demo-capture-add-toggle {
+  align-self: flex-start;
+  font-size: 12px;
+  padding: 2px 0;
+}
+
+.job-demo-capture-input {
+  width: 100%;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(var(--white-rgb), 0.8);
+  font-size: 12px;
+  font-family: inherit;
+  color: inherit;
+  box-sizing: border-box;
+}
+
+.job-demo-capture-note {
+  resize: vertical;
+}
+
+.job-demo-capture-error {
+  margin: 0;
+  color: #b3261e;
+  font-size: 11px;
+}
+
+.job-demo-capture-card {
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: rgba(var(--surface-strong-rgb), 0.9);
+}
+
+.job-demo-capture-card.is-editing {
+  background: rgba(var(--white-rgb), 0.6);
+}
+
+.job-demo-capture-top {
+  display: flex;
+  gap: 9px;
+  align-items: flex-start;
+}
+
+.job-demo-capture-copy,
+.job-demo-capture-fields {
+  flex: 1;
+  min-width: 0;
+}
+
+.job-demo-capture-fields {
+  display: grid;
+  gap: 5px;
+}
+
+.job-demo-capture-name-line {
+  margin: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.job-demo-capture-meta,
+.job-demo-capture-note-line {
+  margin: 3px 0 0;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--muted);
+}
+
+.job-demo-capture-badge {
+  font-size: 9px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: rgba(10, 102, 194, 0.14);
+  color: #0a66c2;
+}
+
+.job-demo-capture-row-buttons {
+  display: flex;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.job-demo-capture-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.job-demo-capture-buttons {
+  display: flex;
+  gap: 6px;
+}
+
+.job-demo-capture-url {
+  font-size: 11px;
 }
 
 .settings-readonly-url {

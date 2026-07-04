@@ -363,7 +363,7 @@
     return {
       job: compactJobForRanking(input?.job || {}),
       myProfile: compactMyProfileForRanking(input?.myProfile || null),
-      searches: toArray(input?.searches).slice(0, 3).map((search, index) => ({
+      searches: toArray(input?.searches).slice(0, 4).map((search, index) => ({
         searchKey: normalizeWhitespace(search?.searchKey || SEARCH_KEYS[index] || String(index + 1)),
         searchNumber: Number(search?.searchNumber || index + 1),
         keywords: normalizeWhitespace(search?.keywords),

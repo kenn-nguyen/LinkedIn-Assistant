@@ -11,6 +11,8 @@ function assetMap() {
     "prompt-packs/default/relationship/template.txt",
     "prompt-packs/default/relationship/retry.txt",
     "prompt-packs/default/relationship/contract.json",
+    "prompt-packs/default/email/template.txt",
+    "prompt-packs/default/email/contract.json",
     "prompt-packs/default/post-suggestions/template.txt",
     "prompt-packs/default/post-suggestions/contract.json",
     "prompt-packs/default/job-outreach/search-url-template.txt",
@@ -122,6 +124,33 @@ test("relationship and post prompt builders load text from the default prompt pa
   assert.match(post.prompt, /Any tone used must stay professionally polite/i);
   assert.doesNotMatch(relationship.prompt, /{{recipient_profile}}/);
   assert.doesNotMatch(post.prompt, /{{post_context}}/);
+});
+
+test("email channel builds an email prompt from the same context with no unresolved placeholders", async () => {
+  const { prompts } = await loadPromptModule();
+
+  const email = prompts.buildWorkspacePrompt(
+    {
+      pageType: "linkedin-profile",
+      title: "Arushi Singh",
+      pageUrl: "https://www.linkedin.com/in/arushi-singh/",
+      person: { fullName: "Arushi Singh", headline: "Senior Product Manager at Uber" },
+      conversation: { recentMessages: [] }
+    },
+    { personId: "arushi-singh", fullName: "Arushi Singh", personNote: "Met at Yale" },
+    { fullName: "Kenn Nguyen", ownProfileUrl: "https://www.linkedin.com/in/kenn-nguyen/" },
+    prompts.FIXED_TAIL,
+    prompts.defaultPromptSettings(),
+    "",
+    { channel: "email" }
+  );
+
+  assert.equal(email.flowType, "email");
+  assert.match(email.prompt, /outreach EMAIL/);
+  assert.match(email.prompt, /Subject:/);
+  assert.match(email.prompt, /"recommended_action": "draft_first_message"/);
+  // No template placeholder left unresolved.
+  assert.doesNotMatch(email.prompt, /\{\{[a-z_]+\}\}/);
 });
 
 test("job outreach prompt builders load search and ranking templates from the default pack", async () => {
