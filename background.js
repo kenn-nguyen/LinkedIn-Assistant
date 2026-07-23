@@ -82,6 +82,12 @@ const LINKEDIN_CONTENT_SCRIPT_FILES = [
   "linkedin-commands.js",
   "linkedin-content.js"
 ];
+// On-demand injection: the LinkedIn content scripts (~355 KB) are NOT injected
+// declaratively. The service worker injects them into the focused LinkedIn tab only
+// while the side panel is open, and only AFTER the tab has finished loading (+ a short
+// settle delay) so the parse never competes with LinkedIn's first render.
+const INJECT_SETTLE_MS = 400;
+const pendingActivationTabs = new Set();
 const lastProviderTabIds = {
   chatgpt: null,
   gemini: null
@@ -267,12 +273,17 @@ chrome.runtime.onConnect.addListener((port) => {
     return;
   }
   sidePanelSessionPorts.add(port);
+  // Resolve the focused tab first so on-demand injection targets the right LinkedIn tab,
+  // then sync activation (which injects that tab once it has finished loading).
   getActiveTab().then((tab) => {
     if (tab?.id && isLinkedInUrl(tab.url || "")) {
       rememberLinkedInTab(tab.id, tab.url);
+      lastObservedLinkedInTabId = tab.id;
+      lastObservedLinkedInTabUrl = normalizeWhitespace(tab.url);
     }
-  }).catch(() => {});
-  syncAssistantActivationForKnownLinkedInTabs().catch(() => {});
+  }).catch(() => {}).finally(() => {
+    syncAssistantActivationForKnownLinkedInTabs().catch(() => {});
+  });
   port.onDisconnect.addListener(() => {
     sidePanelSessionPorts.delete(port);
     syncAssistantActivationForKnownLinkedInTabs().catch(() => {});
@@ -383,14 +394,52 @@ async function sendActivationMessage(tabId, active) {
   }
 }
 
+// Ensure the focused LinkedIn tab has the content scripts injected and is activated.
+// Deferred until the page is fully loaded (status === "complete") + a settle delay; if
+// the page is still loading, the tab is queued and the onUpdated "complete" hook finishes.
+async function ensureActivatedLinkedInTab(tabId) {
+  if (!Number.isInteger(tabId) || tabId < 0 || !isAssistantSessionActive()) {
+    return;
+  }
+  let tab = null;
+  try {
+    tab = await chrome.tabs.get(tabId);
+  } catch {
+    return;
+  }
+  if (!tab || !isLinkedInUrl(tab.url || "")) {
+    return;
+  }
+  if (tab.status !== "complete") {
+    // Let the page render first; onUpdated(complete) will re-drive activation.
+    pendingActivationTabs.add(tabId);
+    return;
+  }
+  pendingActivationTabs.delete(tabId);
+  await delay(INJECT_SETTLE_MS);
+  // Re-validate after the settle delay: session may have closed or focus moved.
+  if (!isAssistantSessionActive() || tabId !== lastObservedLinkedInTabId) {
+    return;
+  }
+  try {
+    await injectContentScriptsForTab(tab);
+  } catch {
+    // Injection can fail on restricted/edge pages — nothing to activate then.
+    return;
+  }
+  await sendActivationMessage(tabId, true);
+}
+
 async function syncAssistantActivationForKnownLinkedInTabs() {
   const sessionActive = isAssistantSessionActive();
-  // Only the most recently focused LinkedIn tab is activated.
+  // Only the most recently focused LinkedIn tab is activated (injected on demand).
   // All other open LinkedIn tabs are deactivated so their MutationObservers
   // and polling timers stop running in the background.
   const tasks = Array.from(linkedInTabUrls.keys()).map((tabId) => {
-    const shouldBeActive = sessionActive && tabId === lastObservedLinkedInTabId;
-    return sendActivationMessage(tabId, shouldBeActive);
+    if (sessionActive && tabId === lastObservedLinkedInTabId) {
+      return ensureActivatedLinkedInTab(tabId);
+    }
+    return sendActivationMessage(tabId, false);
   });
   await Promise.all(tasks);
 }
@@ -717,8 +766,10 @@ async function injectContentScriptsForTab(tab) {
     if (await isContentScriptAlreadyInjected(tab.id)) {
       return;
     }
+    // Top frame only. Message frames get lazy per-frame injection via
+    // sendLinkedInMessageToFrame when a messaging surface is actually read.
     await chrome.scripting.executeScript({
-      target: { tabId: tab.id, allFrames: true },
+      target: { tabId: tab.id },
       files: LINKEDIN_CONTENT_SCRIPT_FILES
     });
     return;
@@ -5749,6 +5800,16 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   if (changeInfo.url || changeInfo.status === "loading" || changeInfo.status === "complete") {
     notifyPageContextChanged(tabId, changeInfo.url || tab.url);
   }
+  // On-demand injection: a full (re)load drops the in-page content script, so re-drive
+  // activation once the page has finished loading — but only for the focused LinkedIn tab
+  // while the side panel is open. This is what defers injection until after render.
+  if (changeInfo.status === "loading") {
+    pendingActivationTabs.delete(tabId);
+  } else if (changeInfo.status === "complete"
+    && isAssistantSessionActive()
+    && (tabId === lastObservedLinkedInTabId || pendingActivationTabs.has(tabId))) {
+    ensureActivatedLinkedInTab(tabId).catch(() => {});
+  }
   maybeResolvePendingProfileIdentityHandoff(tabId, changeInfo.url || tab.url).catch(() => {});
 });
 
@@ -5774,6 +5835,7 @@ chrome.tabs.onActivated.addListener(async (activeInfo) => {
 chrome.tabs.onRemoved.addListener((tabId) => {
   clearMessagingReload(tabId);
   linkedInTabUrls.delete(tabId);
+  pendingActivationTabs.delete(tabId);
   clearPendingProfileIdentityHandoff(tabId);
   const removedProviderBinding = providerTabBindings.get(tabId) || null;
   if (removedProviderBinding?.provider && typeof removedProviderBinding?.sourceTabId === "number") {
